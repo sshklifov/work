@@ -1,10 +1,11 @@
 " vim: set sw=2 ts=2 sts=2 foldmethod=marker:
 
-let g:default_host = "p10"
-let g:host = "p10"
-let g:build_type = "Debug"
-let g:sdk = "p10"
-let g:sdk_dir = "/opt/aisys/obsidian_" .. g:sdk
+for var in ['g:default_host', 'g:host', 'g:build_type', 'g:sdk', 'g:sdk_dir']
+  if !exists(var)
+    echoerr "work.vim: Must define " .. var
+    finish
+  endif
+endfor
 
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
@@ -254,6 +255,15 @@ function! s:ToClipboardApp(app)
 endfunction
 
 command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>, v:true)
+
+function s:TryCall(what, ...)
+  let Partial = function(a:what, a:000)
+  try
+    call Partial()
+  catch
+    echo v:exception
+  endtry
+endfunction
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
 nnoremap <silent> <leader>rv <cmd>call <SID>TryCall('s:ToClipboardApp', "/var/tmp/Debug/application/obsidian-video")<CR>
