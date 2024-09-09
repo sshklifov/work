@@ -1,12 +1,5 @@
 " vim: set sw=2 ts=2 sts=2 foldmethod=marker:
 
-for var in ['g:default_host', 'g:host', 'g:build_type', 'g:sdk', 'g:sdk_dir']
-  if !exists(var)
-    echoerr "work.vim: Must define " .. var
-    finish
-  endif
-endfor
-
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function s:ObsidianMake(...)
