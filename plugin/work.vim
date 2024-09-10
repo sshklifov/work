@@ -239,7 +239,39 @@ function! s:DebugApp(exe, run)
     let opts['br'] = s:GetDebugLoc()
   endif
   let opts['ssh'] = g:host
-  call s:Debug(opts)
+  " Part of main init.vim
+  call Debug(opts)
+endfunction
+
+function! s:GetDebugLoc()
+  let basename = expand("%:t")
+  let lnum = line(".")
+  return printf("%s:%d", basename, lnum)
+endfunction
+
+function! s:OnMasterStop(job, data, event)
+  if !exists('s:interrupt')
+    call nvim_echo([['SSH master died!', 'ErrorMsg']], v:true, #{})
+  endif
+endfunction
+
+function! s:StartMaster()
+  if exists('s:master_job_id')
+    let s:interrupt = 1
+    if jobstop(s:master_job_id)
+      call jobwait([s:master_job_id])
+    endif
+    unlet s:interrupt
+  endif
+  let opts = #{on_exit: function('s:OnMasterStop')}
+  let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:host]
+  let s:master_job_id = jobstart(cmd, opts)
+  if s:master_job_id > 0
+    echo "SSH Master running..."
+  else
+    echoerr "Failed to start SSH master!"
+  endif
+  return s:master_job_id
 endfunction
 
 function! ChangeHost(host, check)
@@ -257,6 +289,7 @@ function! ChangeHost(host, check)
   exe printf("command! -nargs=1 Attach call s:RemoteAttach('%s', <q-args>)", g:host)
   exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call s:Sshfs('%s', <q-args>)", g:host)
   exe printf("command! -nargs=0 Scp call s:Scp('%s')", g:host)
+  call s:StartMaster()
 endfunction
 
 function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
@@ -276,7 +309,7 @@ function! s:ToClipboardApp(app)
   echom printf("Copied to clipboard: '%s'.", cmd)
 endfunction
 
-command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>, v:true)
+command! -nargs=? -complete=customlist,ChangeHostCompl Host call ChangeHost(<q-args>, v:true)
 
 function s:TryCall(what, ...)
   let Partial = function(a:what, a:000)
