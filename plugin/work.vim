@@ -1,5 +1,34 @@
 " vim: set sw=2 ts=2 sts=2 foldmethod=marker:
 
+""""""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! s:BranchName()
+  let dict = FugitiveExecute(["branch", "--show-current"])
+  if dict['exit_status'] != 0
+    return ''
+  endif
+  return dict['stdout'][0]
+endfunction
+
+function! s:BranchIssueNumber()
+  let branch = s:BranchName()
+  return matchstr(branch, 'SW-[0-9]\{4\}')
+endfunction
+
+function! s:OnNewCommit()
+  setlocal spell
+  setlocal tw=90
+  setlocal cc=91
+  let issue = s:BranchIssueNumber()
+  if empty(getline(1)) && !empty(issue)
+    call setline(1, issue .. ': ')
+    startinsert!
+  endif
+endfunction
+
+autocmd FileType gitcommit call s:OnNewCommit()
+"}}}
+
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function s:ObsidianMake(...)
