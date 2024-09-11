@@ -266,15 +266,12 @@ function! s:StartMaster()
   let opts = #{on_exit: function('s:OnMasterStop')}
   let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:host]
   let s:master_job_id = jobstart(cmd, opts)
-  if s:master_job_id > 0
-    echo "SSH Master running..."
-  else
+  if s:master_job_id <= 0
     echoerr "Failed to start SSH master!"
   endif
-  return s:master_job_id
 endfunction
 
-function! ChangeHost(host, check)
+function! ChangeHostNoMessage(host, check)
   let host = empty(a:host) ? g:default_host : a:host
   if a:check
     call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
@@ -290,6 +287,13 @@ function! ChangeHost(host, check)
   exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call s:Sshfs('%s', <q-args>)", g:host)
   exe printf("command! -nargs=0 Scp call s:Scp('%s')", g:host)
   call s:StartMaster()
+endfunction
+
+function! ChangeHost(host, check)
+  call ChangeHostNoMessage(a:host, a:check)
+  if s:master_job_id > 0
+    echo "SSH Master running..."
+  endif
 endfunction
 
 function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
