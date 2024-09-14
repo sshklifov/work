@@ -2,16 +2,8 @@
 
 """"""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:BranchName()
-  let dict = FugitiveExecute(["branch", "--show-current"])
-  if dict['exit_status'] != 0
-    return ''
-  endif
-  return dict['stdout'][0]
-endfunction
-
 function! s:BranchIssueNumber()
-  let branch = s:BranchName()
+  let branch = init#BranchName()
   return matchstr(branch, 'SW-[0-9]\{4\}')
 endfunction
 
@@ -206,7 +198,7 @@ function s:MakeNiceApp(exe)
   let cmd = printf("cp --preserve=timestamps %s %s && setcap cap_sys_nice+ep %s", a:exe, dst, dst)
   let msg = systemlist(["ssh", g:host, cmd])
   if v:shell_error
-    call s:ShowErrors(msg)
+    call init#ShowErrors(msg)
     throw "Failed to prepare " . a:exe
   endif
   return dst
@@ -233,20 +225,14 @@ function! s:PrepareApp(exe)
   endif
 endfunction
 
-function! s:DebugApp(exe, run)
+function! work#DebugApp(exe, run)
   let opts = s:PrepareApp(a:exe)
   if a:run
-    let opts['br'] = s:GetDebugLoc()
+    let opts['br'] = init#GetDebugLoc()
   endif
   let opts['ssh'] = g:host
   " Part of main init.vim
-  call Debug(opts)
-endfunction
-
-function! s:GetDebugLoc()
-  let basename = expand("%:t")
-  let lnum = line(".")
-  return printf("%s:%d", basename, lnum)
+  call init#Debug(opts)
 endfunction
 
 function! s:OnMasterStop(job, data, event)
@@ -281,11 +267,11 @@ function! ChangeHostNoMessage(host, check)
     endif
   endif
   let g:host = host
-  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call s:TryCall('s:DebugApp', <q-args>, v:false)")
-  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call s:TryCall('s:DebugApp', <q-args>, v:true)")
-  exe printf("command! -nargs=1 Attach call s:RemoteAttach('%s', <q-args>)", g:host)
-  exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call s:Sshfs('%s', <q-args>)", g:host)
-  exe printf("command! -nargs=0 Scp call s:Scp('%s')", g:host)
+  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#DebugApp', <q-args>, v:false)")
+  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
+  exe printf("command! -nargs=1 Attach call init#RemoteAttach('%s', <q-args>)", g:host)
+  exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:host)
+  exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:host)
   call s:StartMaster()
 endfunction
 
@@ -306,7 +292,7 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-function! s:ToClipboardApp(app)
+function! work#ToClipboardApp(app)
   let opts = s:PrepareApp(a:app)
   let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
   let @+ = cmd
@@ -315,19 +301,10 @@ endfunction
 
 command! -nargs=? -complete=customlist,ChangeHostCompl Host call ChangeHost(<q-args>, v:true)
 
-function s:TryCall(what, ...)
-  let Partial = function(a:what, a:000)
-  try
-    call Partial()
-  catch
-    echo v:exception
-  endtry
-endfunction
-
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
-nnoremap <silent> <leader>rv <cmd>call <SID>TryCall('s:ToClipboardApp', "/var/tmp/Debug/application/obsidian-video")<CR>
-nnoremap <silent> <leader>rs <cmd>call <SID>TryCall('s:ToClipboardApp', "/var/tmp/Debug/application/rtsp-server")<CR>
-nnoremap <silent> <leader>rb <cmd>call <SID>TryCall('s:ToClipboardApp', "/var/tmp/Debug/bin/badge_and_face")<CR>
+nnoremap <silent> <leader>rv <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/obsidian-video")<CR>
+nnoremap <silent> <leader>rs <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/rtsp-server")<CR>
+nnoremap <silent> <leader>rb <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/bin/badge_and_face")<CR>
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
@@ -435,7 +412,11 @@ function! s:InstallMender()
   endfor
   split
   enew
-  call termopen(printf("scp %s %s:/tmp/image.mender", most_recent_image, g:host))
+  let output = systemlist(["scp", most_recent_image, g:host .. ":/tmp/image.mender"])
+  if v:shell_error
+    return init#ShowErrors(output)
+  endif
+  call termopen(["ssh", g:host, "mender install /tmp/image.mender && reboot"])
   startinsert
 endfunction
 
@@ -489,7 +470,7 @@ function! s:HostDebugSyms(pat)
   let remote_dir = g:host . ":/usr/lib/.debug"
   let msg = systemlist(printf("rsync -lt %s %s", join(files), remote_dir))
   if v:shell_error
-    call s:ShowErrors(msg)
+    call init#ShowErrors(msg)
   else
     botr split
     enew
@@ -505,7 +486,7 @@ command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
 
 """"""""""""""""""""""""""""AI distro"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:FetchAI()
+function! work#FetchAI()
   let targets = [
         \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
         \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
@@ -514,7 +495,7 @@ function! s:FetchAI()
   echo "Fetching from origin..."
 
   e ~/aidistro/repo
-  call s:WorkTreeCleanOrThrow()
+  call init#WorkTreeCleanOrThrow()
 
   let dict = FugitiveExecute(["checkout", "master"])
   let dict = FugitiveExecute(["pull", "origin", "master"])
@@ -535,7 +516,7 @@ function! s:FetchAI()
   for [repo, branch, bitbake] in targets
     " Find new hash
     exe "e " .. repo
-    let new_hash = s:HashOrThrow("origin/" .. branch)
+    let new_hash = init#HashOrThrow("origin/" .. branch)
     " Find old hash
     let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
     call jobwait([id])
@@ -557,7 +538,7 @@ function! s:FetchAI()
   quit
 endfunction
 
-function! s:CommitAI()
+function! work#CommitAI()
   let targets = [
         \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
         \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
@@ -601,7 +582,7 @@ function! s:CommitAI()
   throw "Unexpected failure, fixme!"
 endfunction
 
-function! s:PushAI()
+function! work#PushAI()
   e ~/aidistro/repo
   let dict = FugitiveExecute(["push", "origin", "HEAD"])
   if dict['exit_status'] != 0
@@ -611,9 +592,9 @@ function! s:PushAI()
   echo "URL copied to clipboard!"
 endfunction
 
-function! s:FinishAI()
+function! work#FinishAI()
   e ~/aidistro/repo
-  let branch = s:CheckedBranchOrThrow()
+  let branch = init#CheckedBranchOrThrow()
   let dict = FugitiveExecute(["checkout", "master"])
   if dict['exit_status'] != 0
     throw "Failed to checkout master"
@@ -631,8 +612,8 @@ function! s:FinishAI()
   echo "Finished!"
 endfunction
 
-command! -nargs=0 AIFetch call s:TryCall("s:FetchAI")
-command! -nargs=0 AICommit call s:TryCall("s:CommitAI")
-command! -nargs=0 AIPush call s:TryCall("s:PushAI")
-command! -nargs=0 AIFinish call s:TryCall("s:FinishAI")
+command! -nargs=0 AIFetch call init#TryCall("work#FetchAI")
+command! -nargs=0 AICommit call init#TryCall("work#CommitAI")
+command! -nargs=0 AIPush call init#TryCall("work#PushAI")
+command! -nargs=0 AIFinish call init#TryCall("work#FinishAI")
 " }}}
