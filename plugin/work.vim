@@ -215,6 +215,9 @@ function! s:PrepareApp(exe)
     let nice_exe = s:MakeNiceApp(a:exe)
     let nice_exe ..= " --noauth"
     return #{exe: nice_exe, user: "rtsp-server"}
+  elseif a:exe =~ "focus-tool$"
+    let nice_exe = s:MakeNiceApp(a:exe)
+    return #{exe: nice_exe, user: "rock-video"}
   elseif a:exe =~ "badge_and_face$"
     let nice_exe = s:MakeNiceApp(a:exe)
     return #{exe: nice_exe, user: "badge_and_face"}
@@ -235,23 +238,14 @@ function! work#DebugApp(exe, run)
   call init#Debug(opts)
 endfunction
 
-function! s:OnMasterStop(job, data, event)
-  if !exists('s:interrupt')
-    call nvim_echo([['SSH master died!', 'ErrorMsg']], v:true, #{})
-  endif
-endfunction
-
 function! s:StartMaster()
   if exists('s:master_job_id')
-    let s:interrupt = 1
     if jobstop(s:master_job_id)
       call jobwait([s:master_job_id])
     endif
-    unlet s:interrupt
   endif
-  let opts = #{on_exit: function('s:OnMasterStop')}
   let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:host]
-  let s:master_job_id = jobstart(cmd, opts)
+  let s:master_job_id = jobstart(cmd, #{})
   if s:master_job_id <= 0
     echoerr "Failed to start SSH master!"
   endif
@@ -269,7 +263,7 @@ function! ChangeHostNoMessage(host, check)
   let g:host = host
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#DebugApp', <q-args>, v:false)")
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
-  exe printf("command! -nargs=1 Attach call init#RemoteAttach('%s', <q-args>)", g:host)
+  exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:host)
   exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:host)
   exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:host)
   call s:StartMaster()
@@ -303,6 +297,7 @@ command! -nargs=? -complete=customlist,ChangeHostCompl Host call ChangeHost(<q-a
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
 nnoremap <silent> <leader>rv <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/obsidian-video")<CR>
+nnoremap <silent> <leader>rf <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/focus-tool")<CR>
 nnoremap <silent> <leader>rs <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/rtsp-server")<CR>
 nnoremap <silent> <leader>rb <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/bin/badge_and_face")<CR>
 "}}}
@@ -319,7 +314,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "InstallSdk", "InstallMender", "HostDebugSyms"]
+        \ "InstallSdk", "InstallMender", "FakeSdk", "HostDebugSyms"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -412,46 +407,27 @@ function! s:InstallMender()
   endfor
   split
   enew
-  let output = systemlist(["scp", most_recent_image, g:host .. ":/tmp/image.mender"])
-  if v:shell_error
-    return init#ShowErrors(output)
-  endif
-  call termopen(["ssh", g:host, "mender install /tmp/image.mender && reboot"])
+  let cmds = []
+  call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:host))
+  call add(cmds, printf("ssh %s mender install /tmp/image.mender", g:host))
+  call add(cmds, "echo Reboot required!")
+
+  call termopen(join(cmds, ";"))
   startinsert
 endfunction
 
-" function! s:UpdateLocal(with_what)
-"   let cmds = []
-"   if has_key(a:with_what, 'libalcatraz')
-"     call add(cmds, printf("sudo cp -v ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
-"     call add(cmds, printf("sudo cp -v -r ~/libalcatraz/include/alcatraz/* %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/", g:sdk_dir))
-"   endif
-"   if has_key(a:with_what, 'mpp')
-"     call add(cmds, printf("sudo cp -v ~/mpp/Debug/mpp/librockchip_mpp.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
-"   endif
-"   if !empty(cmds)
-"     split
-"     enew
-"     call termopen(join(cmds, ";"))
-"     startinsert
-"   endif
-" endfunction
-
-" function! s:UpdateRemote(with_what)
-"   let cmds = []
-"   if has_key(a:with_what, 'libalcatraz')
-"     call add(cmds, printf("scp ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s:/usr/lib", g:host))
-"   endif
-"   if has_key(a:with_what, 'mpp')
-"     call add(cmds, printf("scp ~/mpp/Debug/mpp/librockchip_mpp.so* %s:/usr/lib", g:host))
-"   endif
-"   if !empty(cmds)
-"     split
-"     enew
-"     call termopen(join(cmds, ";"))
-"     startinsert
-"   endif
-" endfunction
+function! s:FakeSdk()
+  let cmds = []
+  call add(cmds, printf("sudo cp -v ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
+  call add(cmds, printf("sudo cp -v -r ~/libalcatraz/include/alcatraz/* %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/", g:sdk_dir))
+  call add(cmds, printf("scp ~/libalcatraz/Debug/alcatraz/libalcatraz.so.* %s:/usr/lib", g:host))
+  if !empty(cmds)
+    split
+    enew
+    call termopen(join(cmds, ";"))
+    startinsert
+  endif
+endfunction
 
 function! s:HostDebugSyms(pat)
   let dir = g:sdk_dir .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
@@ -612,8 +588,20 @@ function! work#FinishAI()
   echo "Finished!"
 endfunction
 
-command! -nargs=0 AIFetch call init#TryCall("work#FetchAI")
-command! -nargs=0 AICommit call init#TryCall("work#CommitAI")
-command! -nargs=0 AIPush call init#TryCall("work#PushAI")
-command! -nargs=0 AIFinish call init#TryCall("work#FinishAI")
+function! s:AI(qarg)
+  if a:qarg == "0"
+    call init#TryCall("work#FetchAI")
+  elseif a:qarg == "1"
+    call init#TryCall("work#CommitAI")
+  elseif a:qarg == "2"
+    call init#TryCall("work#PushAI")
+  elseif a:qarg == "3"
+    call init#TryCall("work#FinishAI")
+  else
+    echo "WTF you on about?"
+  endif
+endfunction
+
+command! -nargs=1 AI call s:AI(<q-args>)
+cabbr Ai AI
 " }}}
