@@ -418,8 +418,8 @@ endfunction
 
 function! s:FakeSdk()
   let cmds = []
-  call add(cmds, printf("sudo cp -v ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
-  call add(cmds, printf("sudo cp -v -r ~/libalcatraz/include/alcatraz/* %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/", g:sdk_dir))
+  call add(cmds, printf("sudo rsync -lv ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
+  call add(cmds, printf("sudo rsync -av ~/libalcatraz/include/alcatraz %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", g:sdk_dir))
   call add(cmds, printf("scp ~/libalcatraz/Debug/alcatraz/libalcatraz.so.* %s:/usr/lib", g:host))
   if !empty(cmds)
     split
