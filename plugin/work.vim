@@ -314,7 +314,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "InstallSdk", "InstallMender", "FakeSdk", "HostDebugSyms"]
+        \ "InstallSdk", "InstallMender", "FakeSdk", "HostDebugSyms", "PlotTrace"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -455,6 +455,31 @@ function! s:HostDebugSyms(pat)
     set nomodified
     echo "Debug symbols installed!"
   endif
+endfunction
+
+function! s:PlotTrace(name)
+  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-trace/", g:host))
+  if empty(trace_txt)
+    echo "No trace"
+    return
+  endif
+  let trace_txt = trace_txt[0]
+  let parse_input = "~/Downloads/tracing/input/" .. a:name
+  let parse_output = printf("~/Downloads/tracing/output/%s",  a:name)
+  let plot_input = printf("~/Downloads/tracing/output/%s/%s", a:name, fnamemodify(trace_txt, ":r"))
+  let plot_output = "~/Downloads/tracing/plot/" .. a:name
+
+  let cmds = []
+  call add(cmds, "mkdir -p " .. parse_input)
+  call add(cmds, "mkdir -p " .. plot_output)
+  call add(cmds, printf("scp %s:/tmp/obsidian-trace/%s %s", g:host, trace_txt, parse_input))
+  call add(cmds, "source ~/tracing_venv/bin/activate")
+  call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
+  call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
+  botr split
+  lcd ~/libalcatraz/tracing/scripts
+  enew
+  call termopen(join(cmds, " && "), #{})
 endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
