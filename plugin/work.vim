@@ -247,7 +247,7 @@ endfunction
 
 function s:ToClipboard(arg)
   let app = printf("/var/tmp/%s/%s", g:build_type, a:arg)
-  call init#TryCall('work#ToClipboardApp', app)
+  call init#TryCall('work#ToClipboard', app)
 endfunction
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
@@ -544,20 +544,27 @@ function! s:FakeImage()
   for [repo, branch, bitbake] in targets
     " Find new hash
     exe "e " .. repo
-    let new_hash = init#HashOrThrow("HEAD")
+    call init#WorkTreeCleanOrThrow()
+
+    " Check if unpushed
+    let new_branch = init#BranchName()
+    let new_hash = init#HashOrThrow(new_branch)
+    if new_hash != init#HashOrThrow("origin/" .. new_branch)
+      throw "You have unpushed changes in " .. repo
+    endif
+
     " Find old hash
     let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
     call jobwait([id])
     if search("SRCREV") == 0
-      throw "Failed to find bitbake file"
+      throw "Failed to find SRCREV"
     endif
-    normal 0f"vi"y
-    let old_hash = @0
-    " Compare and exchange
-    if new_hash != old_hash
-      exe printf("substitute /%s/%s/", old_hash, new_hash)
-      write
+    call setline('.', 'SRCREV ?= "' .. new_hash .. '"')
+    if search("SRCBRANCH") == 0
+      throw "Failed to find SRCBRANCH"
     endif
+    call setline('.', 'SRCBRANCH ?= "' .. new_branch .. '"')
+    write
   endfor
   " Display changes
   e ~/aidistro/repo
