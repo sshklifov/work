@@ -494,6 +494,47 @@ function! s:PlotTrace(name)
   call termopen(join(cmds, " && "), #{})
 endfunction
 
+function! s:BarfPlotTrace(name)
+  let trace_txt = systemlist(printf("ssh %s ls -t /tmp | grep debug-info-", g:host))
+  if empty(trace_txt)
+    echo "No trace"
+    return
+  endif
+  let trace_txt = trace_txt[0]
+
+  echo "Removing extra columns from file..."
+  let parse_input = "~/Downloads/bf_tracing/input/" .. a:name
+  let parse_output = printf("~/Downloads/bf_tracing/output/%s",  a:name)
+  let plot_input = printf("~/Downloads/bf_tracing/output/%s/%s", a:name, fnamemodify(trace_txt, ":r"))
+  let plot_output = "~/Downloads/bf_tracing/plot/" .. a:name
+
+  let cmds = []
+  call add(cmds, "mkdir -p " .. parse_input)
+  call add(cmds, "mkdir -p " .. plot_output)
+  call add(cmds, printf("scp %s:/tmp/%s %s", g:host, trace_txt, parse_input))
+  let output = systemlist(join(cmds, ";"))
+  if v:shell_error
+    call init#ShowErrors(output)
+    throw "Failed to obtain debug info"
+  endif
+
+  let local_txt = expand(printf("%s/%s", parse_input, trace_txt))
+  let lines = readfile(local_txt)
+  call filter(lines, 'v:val =~# " frame_id:\\| start_timestamp:\\| end_timestamp:\\|^a\\|^$"')
+  call writefile(lines, local_txt)
+  " Clear message status
+  echo
+
+  let cmds = []
+  call add(cmds, "source ~/tracing_venv/bin/activate")
+  call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
+  call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
+  botr split
+  lcd ~/libalcatraz/tracing/scripts
+  enew
+  call termopen(join(cmds, " && "), #{})
+endfunction
+
 function! s:FakeImage()
   let targets = [
         \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
