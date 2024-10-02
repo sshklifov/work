@@ -238,6 +238,24 @@ function! work#DebugApp(exe, run)
   call init#Debug(opts)
 endfunction
 
+function! work#ToClipboard(app)
+  let opts = s:PrepareApp(a:app)
+  let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
+  let @+ = cmd
+  echom printf("Copied to clipboard: '%s'.", cmd)
+endfunction
+
+function s:ToClipboard(arg)
+  let app = printf("/var/tmp/%s/%s", g:build_type, a:arg)
+  call init#TryCall('work#ToClipboardApp', app)
+endfunction
+
+nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
+nnoremap <silent> <leader>rv <cmd>call <SID>ToClipboard("application/obsidian-video")<CR>
+nnoremap <silent> <leader>rf <cmd>call <SID>ToClipboard("application/focus-tool")<CR>
+nnoremap <silent> <leader>rs <cmd>call <SID>ToClipboard("application/rtsp-server")<CR>
+nnoremap <silent> <leader>rb <cmd>call <SID>ToClipboard("bin/badge_and_face")<CR>
+
 function! s:StartMaster()
   if exists('s:master_job_id')
     if jobstop(s:master_job_id)
@@ -286,26 +304,17 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-function! work#ToClipboardApp(app)
-  let opts = s:PrepareApp(a:app)
-  let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
-  let @+ = cmd
-  echom printf("Copied to clipboard: '%s'.", cmd)
-endfunction
-
 command! -nargs=? -complete=customlist,ChangeHostCompl Host call ChangeHost(<q-args>, v:true)
-
-nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
-nnoremap <silent> <leader>rv <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/obsidian-video")<CR>
-nnoremap <silent> <leader>rf <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/focus-tool")<CR>
-nnoremap <silent> <leader>rs <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/application/rtsp-server")<CR>
-nnoremap <silent> <leader>rb <cmd>call init#TryCall('work#ToClipboardApp', "/var/tmp/Debug/bin/badge_and_face")<CR>
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
 function s:Do(cmd, ...)
   let Partial = function("s:" .. a:cmd, a:000)
-  call Partial()
+  try
+    call Partial()
+  catch
+    echo v:exception
+  endtry
 endfunction
 
 function! DoCompl(ArgLead, CmdLine, CursorPos)
@@ -314,7 +323,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "InstallSdk", "InstallMender", "FakeSdk", "HostDebugSyms", "PlotTrace"]
+        \ "InstallSdk", "InstallMender", "FakeSdk", "FakeImage",
+        \ "HostDebugSyms", "PlotTrace", "BarfPlotTrace"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -418,9 +428,11 @@ endfunction
 
 function! s:FakeSdk()
   let cmds = []
-  call add(cmds, printf("sudo rsync -lv ~/libalcatraz/Debug/alcatraz/libalcatraz.so* %s/sysroots/armv8a-aisys-linux/usr/lib/", g:sdk_dir))
-  call add(cmds, printf("sudo rsync -av ~/libalcatraz/include/alcatraz %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", g:sdk_dir))
-  call add(cmds, printf("scp ~/libalcatraz/Debug/alcatraz/libalcatraz.so.* %s:/usr/lib", g:host))
+  let repo_dir = $HOME .. "/libalcatraz"
+  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so.*", repo_dir, g:build_type)
+  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:sdk_dir))
+  call add(cmds, printf("sudo rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:sdk_dir))
+  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:host))
   if !empty(cmds)
     split
     enew
@@ -480,6 +492,39 @@ function! s:PlotTrace(name)
   lcd ~/libalcatraz/tracing/scripts
   enew
   call termopen(join(cmds, " && "), #{})
+endfunction
+
+function! s:FakeImage()
+  let targets = [
+        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
+        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
+        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
+
+  for [repo, branch, bitbake] in targets
+    " Find new hash
+    exe "e " .. repo
+    let new_hash = init#HashOrThrow("HEAD")
+    " Find old hash
+    let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
+    call jobwait([id])
+    if search("SRCREV") == 0
+      throw "Failed to find bitbake file"
+    endif
+    normal 0f"vi"y
+    let old_hash = @0
+    " Compare and exchange
+    if new_hash != old_hash
+      exe printf("substitute /%s/%s/", old_hash, new_hash)
+      write
+    endif
+  endfor
+  " Display changes
+  e ~/aidistro/repo
+  G
+  exe "normal \<C-w>w"
+  q
+  " Run docker in split
+  call s:RunDocker()
 endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
