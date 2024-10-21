@@ -627,6 +627,33 @@ function! s:FakeImage()
   call s:RunDocker()
 endfunction
 
+function! s:ReverseImage()
+  let targets = [
+        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
+        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
+        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
+
+  for [repo, branch, bitbake] in targets
+    " Find hash
+    sp
+    let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
+    call jobwait([id])
+    if search("SRCREV") == 0
+      throw "Failed to find SRCREV"
+    endif
+    let hash = matchstr(getline('.'), '\x\{10,}')
+    q
+    " Checkout hash
+    exe "tabnew " .. repo
+    let dict = FugitiveExecute(['checkout', hash])
+    if dict['exit_status'] != 0
+      call init#ShowErrors(dict['stdout'])
+      throw "Failed to checkout in " .. repo
+    endif
+    exe "G log"
+  endfor
+endfunction
+
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
 "}}}
 
