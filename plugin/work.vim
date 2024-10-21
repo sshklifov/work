@@ -37,24 +37,24 @@ function s:ObsidianMake(...)
   endif
 
   let common_flags = join([
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:sdk_dir),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:sdk_dir),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", s:sdk_dir),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", s:sdk_dir),
         \ "-O0 -ggdb -U_FORTIFY_SOURCE"])
   let cxxflags = "export CXXFLAGS=" . string(common_flags)
   let cflags = "export CFLAGS=" . string(common_flags)
 
   let dir = printf("cd %s", FugitiveWorkTree())
-  let env = printf("source %s/environment-setup-armv8a-aisys-linux", g:sdk_dir)
+  let env = printf("source %s/environment-setup-armv8a-aisys-linux", s:sdk_dir)
 
   if repo == 'camera_engine_rkaiq'
-    let cmake = printf("cmake -S. -B%s -DCMAKE_BUILD_TYPE=%s", g:build_type, g:build_type)
-    let cmake .= printf(" -DIQ_PARSER_V2_EXTRA_CFLAGS='-I%s/sysroots/armv8a-aisys-linux/usr/include/rockchip-uapi;", g:sdk_dir)
-    let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", g:sdk_dir)
+    let cmake = printf("cmake -S. -B%s -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
+    let cmake .= printf(" -DIQ_PARSER_V2_EXTRA_CFLAGS='-I%s/sysroots/armv8a-aisys-linux/usr/include/rockchip-uapi;", s:sdk_dir)
+    let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", s:sdk_dir)
     let cmake .= " -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DISP_HW_VERSION='-DISP_HW_V30' -DARCH='aarch64' -DRKAIQ_TARGET_SOC='rk3588'"
   else
-    let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s", g:build_type, g:build_type)
+    let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
   endif
-  let build = printf("cmake --build %s -j 10", g:build_type)
+  let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
   let cmds = [dir, env, cxxflags, cflags, cmake, build]
   let command = ["/bin/bash", "-c", join(cmds, ';')]
@@ -62,6 +62,10 @@ function s:ObsidianMake(...)
   let bang = get(a:, 1, "")
   return Make(command, bang)
 endfunction
+
+command! -nargs=? -complete=customlist,BuildCompl Debug let g:BUILD_TYPE = "Debug"
+
+command! -nargs=? -complete=customlist,BuildCompl Release let g:BUILD_TYPE = "Release"
 
 function! s:ResolveEnvFile()
   let fname = expand("%:f")
@@ -96,19 +100,20 @@ function! s:ResolveEnvFile()
 endfunction
 
 command! -nargs=0 -bang Make call <SID>ObsidianMake("<bang>")
-command! -nargs=0 Clean call system("rm -rf " . FugitiveFind(g:build_type))
+command! -nargs=0 Clean call system("rm -rf " . FugitiveFind(g:BUILD_TYPE))
 nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 "}}}
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine)
+  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
     return []
   endif
   let pat = "*" . a:ArgLead . "*"
   let find = "find /var/tmp -name " . shellescape(pat) . " -type f -executable"
-  return systemlist(["ssh", "-o", "ConnectTimeout=1", g:host, find])
+  let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
+  return filter(result, 'stridx(v:val, "Release") < 0')
 endfunction
 
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
@@ -117,10 +122,10 @@ function! SshfsCompl(ArgLead, CmdLine, CursorPos)
   endif
 
   let dirname = empty(a:ArgLead) ? '/' : fnamemodify(a:ArgLead, ':h')
-  let remote_dirs = systemlist(["ssh", g:host, "find " . dirname . " -maxdepth 1 -type d"])
+  let remote_dirs = systemlist(["ssh", g:HOST, "find " . dirname . " -maxdepth 1 -type d"])
   let remote_dirs = map(remote_dirs, 'v:val . "/"')
   call filter(remote_dirs, 'v:val != "//"')
-  let remote_files = systemlist(["ssh", g:host, "find " . dirname . " -maxdepth 1 -type f"])
+  let remote_files = systemlist(["ssh", g:HOST, "find " . dirname . " -maxdepth 1 -type f"])
   let total = remote_dirs + remote_files
   return filter(total, 'stridx(v:val, a:ArgLead) == 0')
 endfunction
@@ -156,7 +161,7 @@ function! s:RemoteSync(arg, ...)
   if dir[-1:-1] == '/'
     let dir = dir[0:-2]
   endif
-  const remote_dir = g:host . ":/var/tmp/"
+  const remote_dir = g:HOST . ":/var/tmp/"
 
   let cmd = ["rsync", "-rlt"]
 
@@ -167,7 +172,6 @@ function! s:RemoteSync(arg, ...)
     " Include all executables
     let exes = systemlist(["find", dir, "-type", "f", "-executable", "-printf", "%P\n"])
     for exe in exes
-      " throw exe
       call add(cmd, '--include=' . exe)
     endfor
     " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
@@ -188,43 +192,32 @@ function! s:RemoteSync(arg, ...)
 endfunction
 
 function! s:Resync()
-  let dir = FugitiveFind(g:build_type)
+  let dir = FugitiveFind(g:BUILD_TYPE)
   exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s')", dir)
   call s:ObsidianMake()
 endfunction
 
 function s:MakeNiceApp(exe)
-  let dst = "/tmp/" .. fnamemodify(a:exe, ":t")
-  let cmd = printf("cp --preserve=timestamps %s %s && setcap cap_sys_nice+ep %s", a:exe, dst, dst)
-  let msg = systemlist(["ssh", g:host, cmd])
+  let exe = split(a:exe, " ")[0]
+  let msg = systemlist(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
   if v:shell_error
     call init#ShowErrors(msg)
-    throw "Failed to prepare " . a:exe
+    throw "Failed to prepare " . exe
   endif
-  return dst
+  return a:exe
 endfunction
 
 function! s:PrepareApp(exe)
-  if a:exe =~ "mock_video$"
-    let nice_exe = s:MakeNiceApp(a:exe)
-    return #{exe: nice_exe, user: "rock-video"}
-  elseif a:exe =~ "obsidian-video$"
-    let nice_exe = s:MakeNiceApp(a:exe)
-    return #{exe: nice_exe, user: "rock-video"}
-  elseif a:exe =~ "rtsp-server$"
-    let nice_exe = s:MakeNiceApp(a:exe)
+  let nice_exe = s:MakeNiceApp(a:exe)
+  if a:exe =~ "rtsp-server$"
     let nice_exe ..= " --noauth"
     return #{exe: nice_exe, user: "rtsp-server"}
-  elseif a:exe =~ "focus-tool$"
-    let nice_exe = s:MakeNiceApp(a:exe)
-    return #{exe: nice_exe, user: "rock-video"}
   elseif a:exe =~ "badge_and_face$"
-    let nice_exe = s:MakeNiceApp(a:exe)
     return #{exe: nice_exe, user: "badge_and_face"}
-  elseif !empty(a:exe)
-    return #{exe: a:exe}
+  elseif a:exe =~ "profile_generator$"
+    return #{exe: nice_exe}
   else
-    return #{headless: v:true}
+    return #{exe: nice_exe, user: "rock-video"}
   endif
 endfunction
 
@@ -233,26 +226,32 @@ function! work#DebugApp(exe, run)
   if a:run
     let opts['br'] = init#GetDebugLoc()
   endif
-  let opts['ssh'] = g:host
+  let opts['ssh'] = g:HOST
   " Part of main init.vim
   call init#Debug(opts)
 endfunction
 
-function! work#ToClipboard(app)
-  let opts = s:PrepareApp(a:app)
-  let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
-  let @+ = cmd
-  echom printf("Copied to clipboard: '%s'.", cmd)
-endfunction
-
-function s:ToClipboard(arg)
-  let app = printf("/var/tmp/%s/%s", g:build_type, a:arg)
-  call init#TryCall('work#ToClipboard', app)
+function! s:ToClipboard(app)
+  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
+  try
+    let opts = s:PrepareApp(app)
+    if has_key(opts, 'user')
+      let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
+    else
+      let cmd = opts['exe']
+    endif
+    let @+ = cmd
+    mode
+    echom printf("Copied to clipboard: '%s'.", cmd)
+  catch
+    echo v:exception
+  endtry
 endfunction
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
 nnoremap <silent> <leader>rv <cmd>call <SID>ToClipboard("application/obsidian-video")<CR>
 nnoremap <silent> <leader>rf <cmd>call <SID>ToClipboard("application/focus-tool")<CR>
+nnoremap <silent> <leader>rq <cmd>call <SID>ToClipboard("application/qrcode-scanner")<CR>
 nnoremap <silent> <leader>rs <cmd>call <SID>ToClipboard("application/rtsp-server")<CR>
 nnoremap <silent> <leader>rb <cmd>call <SID>ToClipboard("bin/badge_and_face")<CR>
 
@@ -262,35 +261,55 @@ function! s:StartMaster()
       call jobwait([s:master_job_id])
     endif
   endif
-  let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:host]
+  let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:HOST]
   let s:master_job_id = jobstart(cmd, #{})
   if s:master_job_id <= 0
     echoerr "Failed to start SSH master!"
+    return v:false
   endif
+  return v:true
 endfunction
 
-function! ChangeHostNoMessage(host, check)
-  let host = empty(a:host) ? g:default_host : a:host
-  if a:check
-    call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
-    if v:shell_error != 0
-      echo "Failed to connect to host " . host
-      return
-    endif
+function s:DetermineSdk()
+  let lines = systemlist(["ssh", g:HOST, "cat /var/lib/mender/device_type"])
+  if v:shell_error
+    return v:false
   endif
-  let g:host = host
+  if stridx(lines[0], "rockx-dm-p15") >= 0
+    " Cache the results
+    let g:DEVICE = "p15"
+    let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+    return v:true
+  endif
+  return v:false
+endfunction
+
+function! s:InstallHostCommands()
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#DebugApp', <q-args>, v:false)")
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
-  exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:host)
-  exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:host)
-  exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:host)
-  call s:StartMaster()
+  exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
 endfunction
 
-function! ChangeHost(host, check)
-  call ChangeHostNoMessage(a:host, a:check)
-  if s:master_job_id > 0
-    echo "SSH Master running..."
+" Install commands for the first time
+call s:InstallHostCommands()
+call s:StartMaster()
+let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+
+function! s:ChangeHost(host)
+  call system(["ssh", "-o", "ConnectTimeout=1", a:host, "exit"])
+  if v:shell_error != 0
+    echo "Failed to connect to host " . a:host
+  else
+    let g:HOST = a:host
+    call s:InstallHostCommands()
+    if !s:StartMaster(a:host)
+      echo "Failed to start SSH master!"
+    endif
+    if !s:DetermineSdk()
+      echo "Failed to determine SDK! You must manually set g:DEVICE"
+    endif
   endif
 endfunction
 
@@ -304,7 +323,7 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-command! -nargs=? -complete=customlist,ChangeHostCompl Host call ChangeHost(<q-args>, v:true)
+command! -nargs=+ -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
@@ -323,8 +342,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "InstallSdk", "InstallMender", "FakeSdk", "FakeImage",
-        \ "HostDebugSyms", "PlotTrace", "BarfPlotTrace"]
+        \ "InstallSdk", "InstallImage", "FakeSdk", "FakeMpp", "FakeImage",
+        \ "ReverseImage", "HostDebugSyms", "PlotTrace", "BarfPlotTrace"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -343,7 +362,7 @@ function! s:StopServices()
     call add(cmds, cmd)
   endfor
 
-  let msg = systemlist(["ssh", g:host, join(cmds, ";")])
+  let msg = systemlist(["ssh", g:HOST, join(cmds, ";")])
   if v:shell_error
     bot new
     setlocal buftype=nofile
@@ -364,29 +383,35 @@ function! s:DropClients()
 endfunction
 
 function! s:UpdateDocker()
-  sp ~/aidistro/bashrc
-  call search('^p="\i*"')
-  call setline('.', printf('p="%s"', g:sdk))
-  call search('^host="\i*"')
-  call setline('.', printf('host="%s"', g:host))
-  write
+  " sp ~/aidistro/bashrc
+  " call search('^p="\i*"')
+  " call setline('.', printf('p="%s"', g:DEVICE))
+  " call search('^host="\i*"')
+  " call setline('.', printf('host="%s"', g:HOST))
+  " write
+  " enew
+  " lcd ~/aidistro/repo
+  " 1,1G! --paginate pull origin master
+  " set nomodified
+  sp
   enew
-  lcd ~/aidistro/repo
-  1,1G! --paginate pull origin master
-  set nomodified
+  lcd ~/aidistro
+  let cmds = ["sudo docker-compose build ubuntu22"]
+  call termopen(join(cmds, ";"))
+  startinsert
 endfunction
 
 function! s:RunDocker()
   sp
   enew
   lcd ~/aidistro
-  let cmds = ["sudo docker-compose build ubuntu22", "sudo docker-compose run ubuntu22"]
+  let cmds = ["sudo docker-compose run ubuntu22"]
   call termopen(join(cmds, ";"))
   startinsert
 endfunction
 
 function! s:InstallSdk()
-  let sdks = systemlist(["find", "/home/" .. $USER .. "/aidistro/cache/tmp/deploy/sdk/", "-regex", printf(".*%s.*dev.sh", g:sdk)])
+  let sdks = systemlist(["find", "/home/" .. $USER .. "/aidistro/cache/tmp/deploy/sdk/", "-regex", printf(".*%s.*dev.sh", g:DEVICE)])
   if empty(sdks)
     echo "No sdk found"
     return
@@ -399,12 +424,12 @@ function! s:InstallSdk()
   endfor
   split
   enew
-  call termopen(printf("sudo %s -d /opt/aisys/obsidian_%s/ -y", most_recent_file, g:sdk))
+  call termopen(printf("sudo %s -d /opt/aisys/obsidian_%s/ -y", most_recent_file, g:DEVICE))
   startinsert
 endfunction
 
-function! s:InstallMender()
-  let images = systemlist(["find", "/home/" .. $USER .. "/aidistro/cache/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:sdk)])
+function! s:InstallImage()
+  let images = systemlist(["find", "/home/" .. $USER .. "/aidistro/cache/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:DEVICE)])
   if empty(images)
     echo "No image found"
     return
@@ -418,8 +443,8 @@ function! s:InstallMender()
   split
   enew
   let cmds = []
-  call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:host))
-  call add(cmds, printf("ssh %s mender install /tmp/image.mender", g:host))
+  call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:HOST))
+  call add(cmds, printf("ssh %s mender install /tmp/image.mender", g:HOST))
   call add(cmds, "echo Reboot required!")
 
   call termopen(join(cmds, ";"))
@@ -429,10 +454,24 @@ endfunction
 function! s:FakeSdk()
   let cmds = []
   let repo_dir = $HOME .. "/libalcatraz"
-  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so.*", repo_dir, g:build_type)
-  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:sdk_dir))
-  call add(cmds, printf("sudo rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:sdk_dir))
-  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:host))
+  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so.*", repo_dir, g:BUILD_TYPE)
+  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("sudo rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
+  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:HOST))
+  if !empty(cmds)
+    split
+    enew
+    call termopen(join(cmds, ";"))
+    startinsert
+  endif
+endfunction
+
+function! s:FakeMpp()
+  let cmds = []
+  let repo_dir = $HOME .. "/mpp"
+  let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
+  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:HOST))
   if !empty(cmds)
     split
     enew
@@ -442,7 +481,7 @@ function! s:FakeSdk()
 endfunction
 
 function! s:HostDebugSyms(pat)
-  let dir = g:sdk_dir .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
+  let dir = s:sdk_dir .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
   let pat = ".*" .. a:pat .. ".*"
   let files = systemlist(["find", dir, "-regex", pat])
   let bytes = 0
@@ -455,7 +494,7 @@ function! s:HostDebugSyms(pat)
     return
   endif
 
-  let remote_dir = g:host . ":/usr/lib/.debug"
+  let remote_dir = g:HOST . ":/usr/lib/.debug"
   let msg = systemlist(printf("rsync -lt %s %s", join(files), remote_dir))
   if v:shell_error
     call init#ShowErrors(msg)
@@ -470,7 +509,7 @@ function! s:HostDebugSyms(pat)
 endfunction
 
 function! s:PlotTrace(name)
-  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-trace/", g:host))
+  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-trace/", g:HOST))
   if empty(trace_txt)
     echo "No trace"
     return
@@ -481,10 +520,15 @@ function! s:PlotTrace(name)
   let plot_input = printf("~/Downloads/tracing/output/%s/%s", a:name, fnamemodify(trace_txt, ":r"))
   let plot_output = "~/Downloads/tracing/plot/" .. a:name
 
+  if g:BUILD_TYPE != "Release"
+    let msg = "Build type is " .. g:BUILD_TYPE .. "."
+    call nvim_echo([[msg, "WarningMsg"]], v:true, #{})
+  endif
+
   let cmds = []
   call add(cmds, "mkdir -p " .. parse_input)
   call add(cmds, "mkdir -p " .. plot_output)
-  call add(cmds, printf("scp %s:/tmp/obsidian-trace/%s %s", g:host, trace_txt, parse_input))
+  call add(cmds, printf("scp %s:/tmp/obsidian-trace/%s %s", g:HOST, trace_txt, parse_input))
   call add(cmds, "source ~/tracing_venv/bin/activate")
   call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
   call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
@@ -495,12 +539,17 @@ function! s:PlotTrace(name)
 endfunction
 
 function! s:BarfPlotTrace(name)
-  let trace_txt = systemlist(printf("ssh %s ls -t /tmp | grep debug-info-", g:host))
+  let trace_txt = systemlist(printf("ssh %s ls -t /tmp | grep debug-info-", g:HOST))
   if empty(trace_txt)
     echo "No trace"
     return
   endif
   let trace_txt = trace_txt[0]
+
+  if g:BUILD_TYPE != "Release"
+    let msg = "Build type is " .. g:BUILD_TYPE .. "."
+    call nvim_echo([[msg, "WarningMsg"]], v:true, #{})
+  endif
 
   echo "Removing extra columns from file..."
   let parse_input = "~/Downloads/bf_tracing/input/" .. a:name
@@ -511,7 +560,7 @@ function! s:BarfPlotTrace(name)
   let cmds = []
   call add(cmds, "mkdir -p " .. parse_input)
   call add(cmds, "mkdir -p " .. plot_output)
-  call add(cmds, printf("scp %s:/tmp/%s %s", g:host, trace_txt, parse_input))
+  call add(cmds, printf("scp %s:/tmp/%s %s", g:HOST, trace_txt, parse_input))
   let output = systemlist(join(cmds, ";"))
   if v:shell_error
     call init#ShowErrors(output)
@@ -548,9 +597,12 @@ function! s:FakeImage()
 
     " Check if unpushed
     let new_branch = init#BranchName()
+    if empty(new_branch)
+      throw "Repo " .. repo .. " does not have a branch!"
+    endif
     let new_hash = init#HashOrThrow(new_branch)
     if new_hash != init#HashOrThrow("origin/" .. new_branch)
-      throw "You have unpushed changes in " .. repo
+      call nvim_echo([["You have unpushed changes in " .. repo, "WarningMsg"]], v:true, #{})
     endif
 
     " Find old hash
