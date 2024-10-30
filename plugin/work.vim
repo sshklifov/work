@@ -2,7 +2,7 @@
 
 """"""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:BranchIssueNumber()
+function! work#BranchIssueNumber()
   let branch = init#BranchName()
   return matchstr(branch, 'SW-[0-9]\{4\}')
 endfunction
@@ -11,7 +11,7 @@ function! s:OnNewCommit()
   setlocal spell
   setlocal tw=90
   setlocal cc=91
-  let issue = s:BranchIssueNumber()
+  let issue = work#BranchIssueNumber()
   if empty(getline(1)) && !empty(issue)
     call setline(1, issue .. ': ')
     startinsert!
@@ -111,9 +111,9 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let pat = "*" . a:ArgLead . "*"
-  let find = "find /var/tmp -name " . shellescape(pat) . " -type f -executable"
+  let find = "find /var/tmp/Debug -name " . shellescape(pat) . " -type f -executable"
   let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
-  return filter(result, 'stridx(v:val, "Release") < 0')
+  return filter(result, 'v:val !~ ".sh$"')
 endfunction
 
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
@@ -343,7 +343,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
         \ "InstallSdk", "InstallImage", "FakeSdk", "FakeMpp", "FakeImage",
-        \ "ReverseImage", "HostDebugSyms", "PlotTrace", "BarfPlotTrace"]
+        \ "ReverseImage", "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
+        \ "BarfPlotTrace"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -652,6 +653,26 @@ function! s:ReverseImage()
     endif
     exe "G log"
   endfor
+endfunction
+
+function! s:FactoryReset()
+  botr split
+  enew
+  call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
+endfunction
+
+function! s:Trust(host)
+  let ssh_config = systemlist(["ssh", "-G", a:host])
+  call filter(ssh_config, 'v:val =~ "^hostname"')
+  let ip = split(ssh_config[0])[1]
+  let cmds = []
+  call add(cmds, "ssh-keygen -R " .. ip)
+  call add(cmds, "ssh_wait_silent " .. a:host)
+  call add(cmds, "ssh " .. a:host .. " exit")
+
+  botr split
+  enew
+  call termopen(join(cmds, ";"))
 endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
