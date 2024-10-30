@@ -292,11 +292,6 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
 endfunction
 
-" Install commands for the first time
-call s:InstallHostCommands()
-call s:StartMaster()
-let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
-
 function! s:ChangeHost(host)
   call system(["ssh", "-o", "ConnectTimeout=1", a:host, "exit"])
   if v:shell_error != 0
@@ -673,6 +668,7 @@ function! s:Trust(host)
   botr split
   enew
   call termopen(join(cmds, ";"))
+  startinsert
 endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
@@ -823,3 +819,48 @@ endfunction
 command! -nargs=1 AI call s:AI(<q-args>)
 cabbr Ai AI
 " }}}
+
+function! s:OpenJira()
+  let issue = work#BranchIssueNumber()
+  if !empty(issue)
+    let @+ = "https://alcatrazai.atlassian.net/browse/" .. issue
+    mode
+    echom printf("Copied to clipboard: '%s'.", @+)
+  endif
+endfunction
+
+command! -nargs=0 Jira call s:OpenJira()
+
+function! s:CheckIssueActivity()
+  for repo in ["/home/stef/badge-and-face/.git", "/home/stef/obsidian-video/.git", "/home/stef/libalcatraz/.git"]
+    let dict = FugitiveExecute(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo)
+    if dict['exit_status'] != 0
+      return init#ShowErrors(dict['stderr'])
+    endif
+    let branches = filter(dict['stdout'], 'stridx(v:val, "stef") >= 0')
+    for branch in branches
+      let dict = FugitiveExecute(["log", "-1", "--since='1 day ago'", branch])
+      let too_old = empty(join(dict['stdout']))
+      if !too_old
+        let issue = matchstr(branch, 'SW-[0-9]\{4\}')
+        let msg = printf("Check %s -> https://alcatrazai.atlassian.net/browse/%s", branch, issue)
+        echom msg
+      endif
+    endfor
+  endfor
+endfunction
+
+function! s:OnVimEnter()
+  if !exists('g:LAST_ACTIVITY_CHECK') || g:LAST_ACTIVITY_CHECK != strftime('%F')
+    let g:LAST_ACTIVITY_CHECK = strftime('%F')
+    call s:CheckIssueActivity()
+  endif
+  " Install commands for the first time
+  call s:InstallHostCommands()
+  call s:StartMaster()
+  let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+endfunction
+
+augroup Work
+  autocmd! VimEnter * ++once call s:OnVimEnter()
+augroup END
