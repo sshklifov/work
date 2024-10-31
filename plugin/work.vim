@@ -440,8 +440,8 @@ function! s:InstallImage()
   enew
   let cmds = []
   call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:HOST))
-  call add(cmds, printf("ssh %s mender install /tmp/image.mender", g:HOST))
-  call add(cmds, "echo Reboot required!")
+  call add(cmds, printf("ssh %s 'mender install /tmp/image.mender && reboot'", g:HOST))
+  call add(cmds, "ssh_wait_silent " .. g:HOST)
 
   call termopen(join(cmds, ";"))
   startinsert
