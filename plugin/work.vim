@@ -755,7 +755,11 @@ function! work#CommitAI()
     let issue = matchstr(msg, 'SW-[0-9]\{4\}')
     " Create branch
     e ~/aidistro/repo
-    let ai_branch = "stef/" .. issue .. "/ai"
+    if empty(issue)
+      let ai_branch = "stef/ai"
+    else
+      let ai_branch = "stef/" .. issue .. "/ai"
+    endif
     let dict = FugitiveExecute(["checkout", "-b", ai_branch])
     if dict['exit_status'] != 0
       throw "Failed to create branch " .. ai_branch
@@ -782,7 +786,7 @@ function! work#PushAI()
   echo "URL copied to clipboard!"
 endfunction
 
-function! work#FinishAI()
+function! work#CleanUpAI()
   e ~/aidistro/repo
   let branch = init#CheckedBranchOrThrow()
   let dict = FugitiveExecute(["checkout", "master"])
@@ -802,21 +806,15 @@ function! work#FinishAI()
   echo "Finished!"
 endfunction
 
-function! s:AI(qarg)
-  if a:qarg == "0"
-    call init#TryCall("work#FetchAI")
-  elseif a:qarg == "1"
-    call init#TryCall("work#CommitAI")
-  elseif a:qarg == "2"
-    call init#TryCall("work#PushAI")
-  elseif a:qarg == "3"
-    call init#TryCall("work#FinishAI")
-  else
-    echo "WTF you on about?"
+function! AiCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
   endif
+  let items = ["Fetch", "Commit", "Push", "CleanUp"]
+  return filter(items, 'stridx(v:val, a:ArgLead) >= 0')
 endfunction
 
-command! -nargs=1 AI call s:AI(<q-args>)
+command! -nargs=1 -complete=customlist,AiCompl AI call init#TryCall("s:" .. <q-args> .. "AI")
 cabbr Ai AI
 " }}}
 
@@ -829,7 +827,9 @@ function! s:OpenJira()
   endif
 endfunction
 
-command! -nargs=0 Jira call s:OpenJira()
+command! -nargs=0 Issue call s:OpenJira()
+
+command! -nargs=1 Jira G log --grep=<q-args>
 
 function! s:CheckIssueActivity()
   for repo in ["/home/stef/badge-and-face/.git", "/home/stef/obsidian-video/.git", "/home/stef/libalcatraz/.git"]
@@ -839,12 +839,14 @@ function! s:CheckIssueActivity()
     endif
     let branches = filter(dict['stdout'], 'stridx(v:val, "stef") >= 0')
     for branch in branches
-      let dict = FugitiveExecute(["log", "-1", "--since='1 day ago'", branch])
+      let dict = FugitiveExecute(["log", "-1", "--since=1 day ago", branch], repo)
       let too_old = empty(join(dict['stdout']))
       if !too_old
         let issue = matchstr(branch, 'SW-[0-9]\{4\}')
-        let msg = printf("Check %s -> https://alcatrazai.atlassian.net/browse/%s", branch, issue)
-        echom msg
+        if !empty(issue)
+          let @+ = "https://alcatrazai.atlassian.net/browse/" .. issue
+          call input("Check if " .. branch .. " is up to date. ")
+        endif
       endif
     endfor
   endfor
