@@ -492,9 +492,9 @@ function! s:HostDebugSyms(pat)
   for file in files
     let bytes += getfsize(file)
   endfor
-  let max_bytes = 100 * 1000 * 1000
+  let max_bytes = 300 * 1000 * 1000
   if bytes > max_bytes
-    echo "Too much debugging symbols selected."
+    echo printf("Too much debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
     return
   endif
 
