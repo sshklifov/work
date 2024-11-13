@@ -918,6 +918,7 @@ function! s:OnVimEnter()
   call s:InstallHostCommands()
   call s:StartMaster()
   let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+  command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
 endfunction
 
 augroup Work
