@@ -293,13 +293,18 @@ function! s:InstallHostCommands()
 endfunction
 
 function! s:ChangeHost(host)
-  call system(["ssh", "-o", "ConnectTimeout=1", a:host, "exit"])
-  if v:shell_error != 0
-    echo "Failed to connect to host " . a:host
+  if empty(a:host)
+    let host = "max_p15"
   else
-    let g:HOST = a:host
+    let host = a:host
+  endif
+  call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
+  if v:shell_error != 0
+    echo "Failed to connect to host " . host
+  else
+    let g:HOST = host
     call s:InstallHostCommands()
-    if !s:StartMaster(a:host)
+    if !s:StartMaster()
       echo "Failed to start SSH master!"
     endif
     if !s:DetermineSdk()
@@ -318,7 +323,7 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-command! -nargs=+ -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>)
+command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
@@ -420,7 +425,10 @@ function! s:InstallSdk()
   endfor
   split
   enew
-  call termopen(printf("sudo %s -d /opt/aisys/obsidian_%s/ -y", most_recent_file, g:DEVICE))
+  let cmds = []
+  call add(cmds, "sudo rm -rf " .. s:sdk_dir)
+  call add(cmds, printf("sudo %s -d %s -y", most_recent_file, s:sdk_dir))
+  call termopen(join(cmds, ";"))
   startinsert
 endfunction
 
