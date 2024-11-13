@@ -818,18 +818,65 @@ command! -nargs=1 -complete=customlist,AiCompl AI call init#TryCall("s:" .. <q-a
 cabbr Ai AI
 " }}}
 
-function! s:OpenJira()
-  let issue = work#BranchIssueNumber()
-  if !empty(issue)
-    let @+ = "https://alcatrazai.atlassian.net/browse/" .. issue
+""""""""""""""""""""""""""""Issue"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! work#OpenJira(issue)
+  if !empty(a:issue)
+    let msg = "https://alcatrazai.atlassian.net/browse/" .. a:issue
+    let @+ = msg
     mode
-    echom printf("Copied to clipboard: '%s'.", @+)
+    echom printf("Copied to clipboard: '%s'.", msg)
   endif
 endfunction
 
-command! -nargs=0 Issue call s:OpenJira()
+function! s:ShowActivity()
+  let issues = keys(g:ISSUES)
+  call init#CreateCustomQuickfix('Issues', issues, 'work#OnIssueSelected')
+endfunction
 
-command! -nargs=1 Jira G log --grep=<q-args>
+function! work#OnIssueSelected()
+  let issue = getline('.')
+  call work#OpenJira(issue)
+  quit
+endfunction
+
+function! s:OpenCurrent()
+  let issue = work#BranchIssueNumber()
+  if empty(issue)
+    echo "Nothing to show!"
+  else
+    call work#OpenJira(issue)
+  endif
+endfunction
+
+function! s:MessageSearch(...)
+  let args = join(a:000)
+  if empty(args)
+    echo "Expecting string!"
+  else
+    exe "G log --grep=" .. join(a:000)
+  endif
+endfunction
+
+function! s:CodeSearch(...)
+  let args = join(a:000)
+  if empty(args)
+    echo "Expecting string!"
+  else
+    exe "G log -S " .. join(a:000)
+  endif
+endfunction
+
+function! IssueCompl(ArgLead, CmdLine, CursorPos)
+  let nargs = len(split(a:CmdLine))
+  if a:CursorPos < len(a:CmdLine) || nargs > 2
+    return []
+  endif
+  let cmds = ["ShowActivity", "OpenCurrent", "MessageSearch", "CodeSearch"]
+  return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
+endfunction
+
+command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 
 function! s:CheckIssueActivity()
   for repo in ["/home/stef/badge-and-face/.git", "/home/stef/obsidian-video/.git", "/home/stef/libalcatraz/.git"]
@@ -843,14 +890,16 @@ function! s:CheckIssueActivity()
       let too_old = empty(join(dict['stdout']))
       if !too_old
         let issue = matchstr(branch, 'SW-[0-9]\{4\}')
-        if !empty(issue)
-          let @+ = "https://alcatrazai.atlassian.net/browse/" .. issue
-          call input("Check if " .. branch .. " is up to date. ")
+        if !empty(issue) && !has_key(g:ISSUES, issue)
+          call work#OpenJira(issue)
+          let progress = input("Issue copied to clipboard. In progress? ")
+          let g:ISSUES[issue] = 1
         endif
       endif
     endfor
   endfor
 endfunction
+" }}}
 
 function! s:OnVimEnter()
   if !exists('g:LAST_ACTIVITY_CHECK') || g:LAST_ACTIVITY_CHECK != strftime('%F')
