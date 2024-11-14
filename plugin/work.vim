@@ -207,6 +207,8 @@ function s:MakeNiceApp(exe)
       call init#ShowErrors(msg)
       throw "Failed to prepare " . exe
     endif
+  else
+    call init#Warn("Capabilities are disabled!")
   endif
   return a:exe
 endfunction
@@ -245,7 +247,7 @@ function! s:ToClipboard(app)
       let cmd = opts['exe']
     endif
     let @+ = cmd
-    mode
+    " TODO mode
     echom printf("Copied to clipboard: '%s'.", cmd)
   catch
     echo v:exception
@@ -555,7 +557,7 @@ function! s:PlotTrace(name)
 
   if g:BUILD_TYPE != "Release"
     let msg = "Build type is " .. g:BUILD_TYPE .. "."
-    call nvim_echo([[msg, "WarningMsg"]], v:true, #{})
+    call init#Warn(msg)
   endif
 
   let cmds = []
@@ -581,7 +583,7 @@ function! s:BarfPlotTrace(name)
 
   if g:BUILD_TYPE != "Release"
     let msg = "Build type is " .. g:BUILD_TYPE .. "."
-    call nvim_echo([[msg, "WarningMsg"]], v:true, #{})
+    call init#Warn(msg)
   endif
 
   echo "Removing extra columns from file..."
@@ -635,7 +637,8 @@ function! s:FakeImage()
     endif
     let new_hash = init#HashOrThrow(new_branch)
     if new_hash != init#HashOrThrow("origin/" .. new_branch)
-      call nvim_echo([["You have unpushed changes in " .. repo, "WarningMsg"]], v:true, #{})
+      let msg = "You have unpushed changes in " .. repo
+      call init#Warn(msg)
     endif
 
     " Find old hash
