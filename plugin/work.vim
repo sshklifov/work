@@ -259,19 +259,43 @@ nnoremap <silent> <leader>rq <cmd>call <SID>ToClipboard("application/qrcode-scan
 nnoremap <silent> <leader>rs <cmd>call <SID>ToClipboard("application/rtsp-server")<CR>
 nnoremap <silent> <leader>rb <cmd>call <SID>ToClipboard("bin/badge_and_face")<CR>
 
-function! s:StartMaster()
+function! s:ControlFileExists()
+  let config = systemlist(["ssh", '-G', g:HOST])
+  call filter(config, 'v:val =~ "^controlpath"')
+  let path = expand(split(config[0])[1])
+  return filereadable(path)
+endfunction
+
+function! s:StopMaster()
   if exists('s:master_job_id')
     if jobstop(s:master_job_id)
       call jobwait([s:master_job_id])
     endif
   endif
+  return !s:ControlFileExists()
+endfunction
+
+function! s:StartMaster()
+  if !s:StopMaster()
+    return v:false
+  endif
   let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:HOST]
-  let s:master_job_id = jobstart(cmd, #{})
-  if s:master_job_id <= 0
+  let id = jobstart(cmd, #{on_exit: 's:OnMasterExit'})
+  if id <= 0
     echoerr "Failed to start SSH master!"
     return v:false
   endif
+  let s:master_job_id = id
   return v:true
+endfunction
+
+function! s:OnMasterExit(...)
+  echom "SSH master died!"
+  unlet s:master_job_id
+endfunction
+
+function! work#IsMasterRunning()
+  return get(s:, 'master_job_id', 0) > 0
 endfunction
 
 function s:DetermineSdk()
@@ -926,6 +950,14 @@ function! s:OnVimEnter()
   command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
 endfunction
 
+function! s:OnVimLeave()
+  if exists('s:master_job_id')
+    call input("Killing SSH master! ")
+    call s:StopMaster()
+  endif
+endfunction
+
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
+  autocmd! VimLeavePre * ++once call s:OnVimLeave()
 augroup END
