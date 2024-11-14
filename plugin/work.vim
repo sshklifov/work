@@ -197,12 +197,16 @@ function! s:Resync()
   call s:ObsidianMake()
 endfunction
 
+command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
+
 function s:MakeNiceApp(exe)
-  let exe = split(a:exe, " ")[0]
-  let msg = systemlist(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
-  if v:shell_error
-    call init#ShowErrors(msg)
-    throw "Failed to prepare " . exe
+  if get(g:, 'CAPABILITIES', 1)
+    let exe = split(a:exe, " ")[0]
+    let msg = systemlist(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
+    if v:shell_error
+      call init#ShowErrors(msg)
+      throw "Failed to prepare " . exe
+    endif
   endif
   return a:exe
 endfunction
@@ -289,6 +293,7 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=? Sshfind call init#RemoteRecentFiles('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
 endfunction
 
@@ -377,7 +382,7 @@ endfunction
 function! s:DropClients()
   sp ~/obsidian-video
   Source fd_transmitter
-  if search("DropTimeoutClients") == 0
+  if search("DropClient.*Force dropped") == 0
     echo "Failed to find drop call site"
     return
   endif
@@ -819,10 +824,10 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let items = ["Fetch", "Commit", "Push", "CleanUp"]
-  return filter(items, 'stridx(v:val, a:ArgLead) >= 0')
+  return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
-command! -nargs=1 -complete=customlist,AiCompl AI call init#TryCall("s:" .. <q-args> .. "AI")
+command! -nargs=1 -complete=customlist,AiCompl AI call init#TryCall("work#" .. <q-args> .. "AI")
 cabbr Ai AI
 " }}}
 
