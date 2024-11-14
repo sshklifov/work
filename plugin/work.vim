@@ -951,14 +951,15 @@ function! s:OnVimEnter()
   command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
 endfunction
 
-function! s:OnVimLeave()
+" Used in a keymap for :q and :qa
+function ConfirmQuit()
   if exists('s:master_job_id')
-    call input("Killing SSH master! ")
-    call s:StopMaster()
+    let args = #{prompt: "Killing SSH master! Are you sure? ", cancelreturn: 'n'}
+    return input(args)[0] !=? 'n'
   endif
+  return v:true
 endfunction
 
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
-  autocmd! VimLeavePre * ++once call s:OnVimLeave()
 augroup END
