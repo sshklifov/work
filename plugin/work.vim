@@ -693,14 +693,15 @@ function! s:FactoryReset()
   call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
 endfunction
 
-function! s:Trust(host)
-  let ssh_config = systemlist(["ssh", "-G", a:host])
+function! s:Trust(...)
+  let host = get(a:, 1, g:HOST)
+  let ssh_config = systemlist(["ssh", "-G", host])
   call filter(ssh_config, 'v:val =~ "^hostname"')
   let ip = split(ssh_config[0])[1]
   let cmds = []
   call add(cmds, "ssh-keygen -R " .. ip)
-  call add(cmds, "ssh_wait_silent " .. a:host)
-  call add(cmds, "ssh " .. a:host .. " exit")
+  call add(cmds, "ssh_wait_silent " .. host)
+  call add(cmds, "ssh " .. host .. " exit")
 
   botr split
   enew
