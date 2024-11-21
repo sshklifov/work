@@ -319,7 +319,7 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:HOST)
-  exe printf("command! -nargs=? Sshfind call init#RemoteRecentFiles('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
 endfunction
 
@@ -489,10 +489,10 @@ endfunction
 function! s:FakeSdk()
   let cmds = []
   let repo_dir = $HOME .. "/libalcatraz"
-  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so.*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
+  call add(cmds, printf("sudo rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
   call add(cmds, printf("sudo rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
-  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:HOST))
+  call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
   if !empty(cmds)
     split
     enew
@@ -844,7 +844,13 @@ function! work#CleanUpAI()
   if dict['exit_status'] != 0
     throw "Failed to delete newly created branch"
   endif
-  echo "Finished!"
+  let issue = matchstr(branch, 'SW-[0-9]\{4\}')
+  if !empty(issue)
+    if has_key(g:ISSUES, issue)
+      unlet g:ISSUES[issue]
+    endif
+    call work#OpenJira(issue)
+  endif
 endfunction
 
 function! AiCompl(ArgLead, CmdLine, CursorPos)
@@ -871,8 +877,8 @@ function! work#OpenJira(issue)
 endfunction
 
 function! s:ShowActivity()
-  let issues = keys(g:ISSUES)
-  call init#CreateCustomQuickfix('Issues', issues, 'work#OnIssueSelected')
+  let lines = map(keys(g:ISSUES), 'v:val .. ": " .. g:ISSUES[v:val]')
+  call init#CreateCustomQuickfix('Issues', lines, 'work#OnIssueSelected')
 endfunction
 
 function! work#OnIssueSelected()
@@ -887,6 +893,40 @@ function! s:OpenCurrent()
     echo "Nothing to show!"
   else
     call work#OpenJira(issue)
+  endif
+endfunction
+
+function! s:NewBranch(issue, name)
+  if empty(FugitiveGitDir())
+    echo "Not inside repository!"
+    return
+  endif
+  let branch = printf("stef/%s/%s", a:issue, a:name)
+  exe "Git checkout -b " .. branch
+  if !has_key(g:ISSUES, a:issue)
+    call work#OpenJira(a:issue)
+    let progress = input("Issue copied to clipboard. In progress? ")
+    let g:ISSUES[a:issue] = branch
+  endif
+endfunction
+
+function! s:CopyBranch()
+  let branch = init#BranchName()
+  if !empty(branch)
+    let @+ = branch
+    echom printf("Copied to clipboard: '%s'.", branch)
+  endif
+endfunction
+
+function! s:CopyHash()
+  let dict = FugitiveExecute(['rev-parse', 'HEAD'])
+  if dict['exit_status'] != 0
+    throw "Failed to parse " .. a:commitish
+  endif
+  let hash = dict['stdout'][0]
+  if !empty(hash)
+    let @+ = hash
+    echom printf("Copied to clipboard: '%s'.", hash)
   endif
 endfunction
 
@@ -913,40 +953,16 @@ function! IssueCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["ShowActivity", "OpenCurrent", "MessageSearch", "CodeSearch"]
+  let cmds = ["ShowActivity", "OpenCurrent",
+        \ "NewBranch", "CopyBranch", "CopyHash",
+        \ "MessageSearch", "CodeSearch"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
 command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
-
-function! s:CheckIssueActivity()
-  for repo in ["/home/stef/badge-and-face/.git", "/home/stef/obsidian-video/.git", "/home/stef/libalcatraz/.git"]
-    let dict = FugitiveExecute(["for-each-ref", "--format=%(refname:short)", "refs/heads/"], repo)
-    if dict['exit_status'] != 0
-      return init#ShowErrors(dict['stderr'])
-    endif
-    let branches = filter(dict['stdout'], 'stridx(v:val, "stef") >= 0')
-    for branch in branches
-      let dict = FugitiveExecute(["log", "-1", "--since=1 day ago", branch], repo)
-      let too_old = empty(join(dict['stdout']))
-      if !too_old
-        let issue = matchstr(branch, 'SW-[0-9]\{4\}')
-        if !empty(issue) && !has_key(g:ISSUES, issue)
-          call work#OpenJira(issue)
-          let progress = input("Issue copied to clipboard. In progress? ")
-          let g:ISSUES[issue] = 1
-        endif
-      endif
-    endfor
-  endfor
-endfunction
 " }}}
 
 function! s:OnVimEnter()
-  if !exists('g:LAST_ACTIVITY_CHECK') || g:LAST_ACTIVITY_CHECK != strftime('%F')
-    let g:LAST_ACTIVITY_CHECK = strftime('%F')
-    call s:CheckIssueActivity()
-  endif
   " Install commands for the first time
   call s:InstallHostCommands()
   call s:StartMaster()
