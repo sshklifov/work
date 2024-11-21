@@ -968,6 +968,11 @@ function! s:OnVimEnter()
   call s:StartMaster()
   let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
   command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
+
+  " Run RSI plugin on the main vim instance
+  if work#IsMasterRunning()
+    call RsiEnable()
+  endif
 endfunction
 
 " Used in a keymap for :q and :qa
