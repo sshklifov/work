@@ -237,7 +237,7 @@ function! work#DebugApp(exe, run)
   call init#Debug(opts)
 endfunction
 
-function! s:ToClipboard(app)
+function! s:AppToClipboard(app)
   let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
   try
     let opts = s:PrepareApp(app)
@@ -246,20 +246,18 @@ function! s:ToClipboard(app)
     else
       let cmd = opts['exe']
     endif
-    let @+ = cmd
-    " TODO mode
-    echom printf("Copied to clipboard: '%s'.", cmd)
+    call init#ToClipboard(cmd)
   catch
     echo v:exception
   endtry
 endfunction
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
-nnoremap <silent> <leader>rv <cmd>call <SID>ToClipboard("application/obsidian-video")<CR>
-nnoremap <silent> <leader>rf <cmd>call <SID>ToClipboard("application/focus-tool")<CR>
-nnoremap <silent> <leader>rq <cmd>call <SID>ToClipboard("application/qrcode-scanner")<CR>
-nnoremap <silent> <leader>rs <cmd>call <SID>ToClipboard("application/rtsp-server")<CR>
-nnoremap <silent> <leader>rb <cmd>call <SID>ToClipboard("bin/badge_and_face")<CR>
+nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("application/obsidian-video")<CR>
+nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-tool")<CR>
+nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
+nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
+nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
 
 function! s:ControlFileExists()
   let config = systemlist(["ssh", '-G', g:HOST])
@@ -823,8 +821,7 @@ function! work#PushAI()
   if dict['exit_status'] != 0
     throw "Failed to push branch to origin"
   endif
-  let @+ = "https://gitlab.com/Rainbe/Firmware/aidistro/-/merge_requests"
-  echo "URL copied to clipboard!"
+  call init#ToClipboard("https://gitlab.com/Rainbe/Firmware/aidistro/-/merge_requests")
 endfunction
 
 function! work#CleanUpAI()
@@ -847,7 +844,7 @@ function! work#CleanUpAI()
   let issue = matchstr(branch, 'SW-[0-9]\{4\}')
   if !empty(issue)
     if has_key(g:ISSUES, issue)
-      unlet g:ISSUES[issue]
+      let g:ISSUES[issue]['completed'] = 1
     endif
     call work#OpenJira(issue)
   endif
@@ -869,16 +866,29 @@ cabbr Ai AI
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#OpenJira(issue)
   if !empty(a:issue)
-    let msg = "https://alcatrazai.atlassian.net/browse/" .. a:issue
-    let @+ = msg
-    mode
-    echom printf("Copied to clipboard: '%s'.", msg)
+    call init#ToClipboard("https://alcatrazai.atlassian.net/browse/" .. a:issue)
   endif
 endfunction
 
 function! s:ShowActivity()
-  let lines = map(keys(g:ISSUES), 'v:val .. ": " .. g:ISSUES[v:val]')
-  call init#CreateCustomQuickfix('Issues', lines, 'work#OnIssueSelected')
+  let keys_sorted = reverse(sort(keys(g:ISSUES), 's:CompareIssues'))
+  let lines = map(copy(keys_sorted), 'v:val .. ": " .. g:ISSUES[v:val]["branches"][0][1]')
+  let nr = init#CreateCustomQuickfix('Issues', lines, 'work#OnIssueSelected')
+  let ns = nvim_create_namespace('')
+  for idx in range(len(keys_sorted))
+    let issue = keys_sorted[idx]
+    if g:ISSUES[issue]['completed']
+      call nvim_buf_set_extmark(nr, ns, idx, 0, #{line_hl_group: 'Conceal'})
+    endif
+  endfor
+endfunction
+
+function! s:MyDashboard()
+  call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
+endfunction
+
+function! s:CompareIssues(k1, k2)
+  return g:ISSUES[a:k1]['timestamp'] - g:ISSUES[a:k2]['timestamp']
 endfunction
 
 function! work#OnIssueSelected()
@@ -896,26 +906,44 @@ function! s:OpenCurrent()
   endif
 endfunction
 
+function! s:SwitchTo(issue)
+  if !has_key(g:ISSUES, a:issue)
+    throw "Invalid issue!"
+  endif
+  let branches = g:ISSUES[a:issue]['branches']
+  for [repo, branch] in branches
+    let opts = #{prompt: "Check out " .. branch .. " inside " .. repo .. "? ", cancelreturn: "n"}
+    let user_resp = input(opts)
+    if user_resp[0] !=? 'n'
+      exe "sp " .. repo
+      call init#SwitchToBranchOrThrow(branch)
+      quit
+    endif
+  endfor
+endfunction
+
 function! s:NewBranch(issue, name)
-  if empty(FugitiveGitDir())
+  let repo = FugitiveWorkTree()
+  if empty(repo)
     echo "Not inside repository!"
     return
   endif
   let branch = printf("stef/%s/%s", a:issue, a:name)
-  exe "Git checkout -b " .. branch
-  if !has_key(g:ISSUES, a:issue)
-    call work#OpenJira(a:issue)
-    let progress = input("Issue copied to clipboard. In progress? ")
-    let g:ISSUES[a:issue] = branch
+  let dict = FugitiveExecute(["checkout", "-b", branch])
+  if dict['exit_status'] != 0
+    call init#ShowErrors(dict['stderr'])
+    throw "Failed to create branch"
   endif
+  call work#OpenJira(a:issue)
+  echom "Did you set issue in progress? "
+  let branches = get(g:ISSUES, a:issue, [])
+  call add(branches, [repo, branch])
+  let opts = #{branches: branches, completed: 0, timestamp: localtime()}
+  let g:ISSUES[a:issue] = opts
 endfunction
 
 function! s:CopyBranch()
-  let branch = init#BranchName()
-  if !empty(branch)
-    let @+ = branch
-    echom printf("Copied to clipboard: '%s'.", branch)
-  endif
+  call init#ToClipboard(init#BranchName())
 endfunction
 
 function! s:CopyHash()
@@ -924,10 +952,7 @@ function! s:CopyHash()
     throw "Failed to parse " .. a:commitish
   endif
   let hash = dict['stdout'][0]
-  if !empty(hash)
-    let @+ = hash
-    echom printf("Copied to clipboard: '%s'.", hash)
-  endif
+  call init#ToClipboard(hash)
 endfunction
 
 function! s:MessageSearch(...)
@@ -953,7 +978,7 @@ function! IssueCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["ShowActivity", "OpenCurrent",
+  let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent", "SwitchTo",
         \ "NewBranch", "CopyBranch", "CopyHash",
         \ "MessageSearch", "CodeSearch"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
