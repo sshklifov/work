@@ -106,6 +106,57 @@ nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! s:Journal(bang, arg)
+  let output = systemlist(["ssh", g:HOST, 'cat ' .. a:arg])
+  if v:shell_error
+    call init#ShowErrors(output)
+    return
+  endif
+  let service_name = fnamemodify(a:arg, ':t:r')
+  let m = matchstrlist(output, 'Description=\(.*\)', #{submatches: v:true})
+  if !exists("m[0].submatches[0]")
+    echo "Failed to parse description in systemd file!"
+    return
+  endif
+  let msg = "Started " .. m[0].submatches[0] .. "."
+  let output = systemlist(["ssh", g:HOST, printf('journalctl MESSAGE="%s" -r -o short-unix', msg)])
+  if v:shell_error
+    call init#ShowErrors(output)
+    return
+  endif
+  let timestamp = split(output[0])[0]
+  let output = systemlist(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
+  if v:shell_error
+    call init#ShowErrors(output)
+    return
+  endif
+  let since = output[0]
+
+  let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
+  if !empty(a:bang)
+    bot sp
+    enew
+    call termopen(["ssh", g:HOST, cmd .. " -f"])
+  else
+    let lines = systemlist(["ssh", g:HOST, cmd])
+    let nr = init#CreateCustomBuffer('Journal', lines)
+    bot sp
+    exe "b " .. nr
+  endif
+endfunction
+
+function! JournalCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
+    return []
+  endif
+  let files = ["/usr/lib/systemd/system/obsidian-video.service",
+        \ "/usr/lib/systemd/system/qrcode-scanner.service",
+        \ "/usr/lib/systemd/system/badge-and-face.service"]
+  return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
+endfunction
+
+command! -nargs=1 -bang -complete=customlist,JournalCompl Journal call s:Journal("<bang>", <q-args>)
+
 function! s:SshfsOnSteroids(what)
   if empty(a:what)
     let files = init#RemoteRecentFiles(g:HOST)
@@ -129,7 +180,7 @@ endfunction
 function! work#SelectRemoteFile()
   let file = getline('.')
   quit
-  exe "Sshfs " .. file
+  call init#Sshfs(g:HOST, file)
 endfunction
 
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
@@ -233,6 +284,9 @@ function s:MakeNiceApp(exe)
 endfunction
 
 function! s:PrepareApp(exe)
+  if a:exe =~ "qrcode-scanner$"
+    return #{exe: a:exe, user: "rock-bootstrap"}
+  endif
   let nice_exe = s:MakeNiceApp(a:exe)
   if a:exe =~ "rtsp-server$"
     let nice_exe ..= " --noauth"
