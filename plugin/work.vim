@@ -106,6 +106,39 @@ nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! s:SshfsOnSteroids(what)
+  if empty(a:what)
+    let files = init#RemoteRecentFiles(g:HOST)
+  else
+    call system(["ssh", g:HOST, "[ -f " .. a:what .. " ]"])
+    if v:shell_error
+      let files = init#RemoteFindFiles(g:HOST, a:what)
+    else
+      let files = [a:what]
+    endif
+  endif
+  if len(files) > 1
+    call init#CreateCustomQuickfix('Remote files', files, 'work#SelectRemoteFile')
+  elseif len(files) == 1
+    call init#Sshfs(g:HOST, files[0])
+  else
+    echo "Nothing to show."
+  endif
+endfunction
+
+function! work#SelectRemoteFile()
+  let file = getline('.')
+  quit
+  exe "Sshfs " .. file
+endfunction
+
+function! SshfsCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
+    return []
+  endif
+  return init#RemoteFindFiles(g:HOST, a:ArgLead)
+endfunction
+
 function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
     return []
@@ -114,20 +147,6 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
   let find = "find /var/tmp/Debug -name " . shellescape(pat) . " -type f -executable"
   let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
   return filter(result, 'v:val !~ ".sh$"')
-endfunction
-
-function! SshfsCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine)
-    return []
-  endif
-
-  let dirname = empty(a:ArgLead) ? '/' : fnamemodify(a:ArgLead, ':h')
-  let remote_dirs = systemlist(["ssh", g:HOST, "find " . dirname . " -maxdepth 1 -type d"])
-  let remote_dirs = map(remote_dirs, 'v:val . "/"')
-  call filter(remote_dirs, 'v:val != "//"')
-  let remote_files = systemlist(["ssh", g:HOST, "find " . dirname . " -maxdepth 1 -type f"])
-  let total = remote_dirs + remote_files
-  return filter(total, 'stridx(v:val, a:ArgLead) == 0')
 endfunction
 
 function! s:RemoteSync(arg, ...)
@@ -316,9 +335,12 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#DebugApp', <q-args>, v:false)")
   exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
-  exe printf("command! -nargs=1 -complete=customlist,SshfsCompl Sshfs call init#Sshfs('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
   exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
+
+  command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:SshfsOnSteroids(<q-args>)
+  cabbr SSfs Ssfs
 endfunction
 
 function! s:ChangeHost(host)
