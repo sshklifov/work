@@ -134,13 +134,11 @@ function! s:Journal(bang, arg)
 
   let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
   if !empty(a:bang)
-    bot sp
     enew
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
-    let nr = init#CreateCustomBuffer('Journal', lines)
-    bot sp
+    let nr = init#CreateCustomBuffer('Journal ' .. service_name, lines)
     exe "b " .. nr
   endif
 endfunction
@@ -489,16 +487,6 @@ function! s:DropClients()
 endfunction
 
 function! s:UpdateDocker()
-  " sp ~/aidistro/bashrc
-  " call search('^p="\i*"')
-  " call setline('.', printf('p="%s"', g:DEVICE))
-  " call search('^host="\i*"')
-  " call setline('.', printf('host="%s"', g:HOST))
-  " write
-  " enew
-  " lcd ~/aidistro/repo
-  " 1,1G! --paginate pull origin master
-  " set nomodified
   sp
   enew
   lcd ~/aidistro
@@ -531,8 +519,8 @@ function! s:InstallSdk()
   split
   enew
   let cmds = []
-  call add(cmds, "sudo rm -rf " .. s:sdk_dir)
-  call add(cmds, printf("sudo %s -d %s -y", most_recent_file, s:sdk_dir))
+  call add(cmds, "rm -rf " .. s:sdk_dir .. "/*")
+  call add(cmds, printf("%s -d %s -y", most_recent_file, s:sdk_dir))
   call termopen(join(cmds, ";"))
   startinsert
 endfunction
@@ -564,29 +552,27 @@ function! s:FakeSdk()
   let cmds = []
   let repo_dir = $HOME .. "/libalcatraz"
   let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("sudo rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
-  call add(cmds, printf("sudo rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
-  if !empty(cmds)
-    split
-    enew
-    call termopen(join(cmds, ";"))
-    startinsert
-  endif
+
+  split
+  enew
+  call termopen(join(cmds, ";"))
+  startinsert
 endfunction
 
 function! s:FakeMpp()
   let cmds = []
   let repo_dir = $HOME .. "/mpp"
   let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("sudo rsync -ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
-  call add(cmds, printf("rsync -ltv %s %s:/usr/lib", so_pattern, g:HOST))
-  if !empty(cmds)
-    split
-    enew
-    call termopen(join(cmds, ";"))
-    startinsert
-  endif
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
+
+  split
+  enew
+  call termopen(join(cmds, ";"))
+  startinsert
 endfunction
 
 function! s:HostDebugSyms(pat)
