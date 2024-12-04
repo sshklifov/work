@@ -329,6 +329,7 @@ nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-to
 nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
 nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
 nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
+nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 
 function! s:ControlFileExists()
   let config = systemlist(["ssh", '-G', g:HOST])
@@ -375,8 +376,11 @@ function s:DetermineSdk()
     return v:false
   endif
   if stridx(lines[0], "rockx-dm-p15") >= 0
-    " Cache the results
     let g:DEVICE = "p15"
+    let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+    return v:true
+  elseif stridx(lines[0], "rockx-dm-r10") >= 0
+    let g:DEVICE = "r10"
     let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
     return v:true
   endif
@@ -444,10 +448,11 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "InstallSdk", "InstallImage", "FakeSdk", "FakeMpp", "FakeImage",
-        \ "ReverseImage", "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace"]
+  let cmds = ["StopServices", "DropClients", "UpdateDocker",
+        \ "BuildSdk", "BuildImage", "InstallSdk", "InstallImage",
+        \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
+        \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
+        \ "BarfPlotTrace", "MemoryMonitor"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -495,13 +500,29 @@ function! s:UpdateDocker()
   startinsert
 endfunction
 
-function! s:RunDocker()
+function! s:RunDocker(cmd)
   sp
   enew
   lcd ~/aidistro
-  let cmds = ["sudo docker-compose run ubuntu22"]
-  call termopen(join(cmds, ";"))
+  let cmds = ["sudo", "docker-compose", "run", "--rm", "ubuntu22"]
+
+  let bash_cmd = ["export USE_S3_BUCKET=1",
+        \ printf("export MACHINE=rockx-dm-%s", g:DEVICE),
+        \ "source /home/stef/aidistro/setup-environment /home/stef/cache"]
+  call add(bash_cmd, a:cmd)
+  let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
+
+  call add(cmds, docker_cmd)
+  call termopen(join(cmds))
   startinsert
+endfunction
+
+function! s:BuildSdk()
+  call s:RunDocker("bitbake rock-image -c populate_sdk")
+endfunction
+
+function! s:BuildImage()
+  call s:RunDocker("bitbake rock-image")
 endfunction
 
 function! s:InstallSdk()
@@ -511,14 +532,20 @@ function! s:InstallSdk()
     return
   endif
   let most_recent_file = sdks[0]
+  let most_recent_timestamp = getftime(sdks[0])
   for file in sdks[1:]
-    if getftime(file) > getftime(most_recent_file)
+    let curr_timestamp = getftime(file)
+    if curr_timestamp > most_recent_timestamp
       let most_recent_file = file
+      let most_recent_timestamp = curr_timestamp
     endif
   endfor
+  let mins = (localtime() - most_recent_timestamp) / 60
+
   split
   enew
   let cmds = []
+  call add(cmds, "echo 'Found sdk from " .. mins .. "m ago'")
   call add(cmds, "rm -rf " .. s:sdk_dir .. "/*")
   call add(cmds, printf("%s -d %s -y", most_recent_file, s:sdk_dir))
   call termopen(join(cmds, ";"))
@@ -532,14 +559,20 @@ function! s:InstallImage()
     return
   endif
   let most_recent_image = images[0]
+  let most_recent_timestamp = getftime(most_recent_image)
   for image in images[1:]
-    if getftime(image) > getftime(most_recent_image)
+    let curr_timestamp = getftime(image)
+    if curr_timestamp > most_recent_timestamp
       let most_recent_image = image
+      let most_recent_timestamp = curr_timestamp
     endif
   endfor
+  let mins = (localtime() - most_recent_timestamp) / 60
+
   split
   enew
   let cmds = []
+  call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
   call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:HOST))
   call add(cmds, printf("ssh %s 'mender install /tmp/image.mender && reboot'", g:HOST))
   call add(cmds, "ssh_wait_silent " .. g:HOST)
@@ -585,7 +618,7 @@ function! s:HostDebugSyms(pat)
   endfor
   let max_bytes = 300 * 1000 * 1000
   if bytes > max_bytes
-    echo printf("Too much debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
+    echo printf("Too many debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
     return
   endif
 
@@ -679,6 +712,15 @@ function! s:BarfPlotTrace(name)
   call termopen(join(cmds, " && "), #{})
 endfunction
 
+function! s:MemoryMonitor()
+  Ssfs /tmp/memory_trace.txt
+  %!c++filt
+  setlocal nomodified
+  setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
+  setlocal foldmethod=expr
+  setlocal foldenable
+endfunction
+
 function! s:FakeImage()
   let targets = [
         \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
@@ -720,7 +762,7 @@ function! s:FakeImage()
   exe "normal \<C-w>w"
   q
   " Run docker in split
-  call s:RunDocker()
+  call s:BuildImage()
 endfunction
 
 function! s:ReverseImage()
@@ -905,9 +947,6 @@ function! work#CleanUpAI()
   endif
   let issue = matchstr(branch, 'SW-[0-9]\{4\}')
   if !empty(issue)
-    if has_key(g:ISSUES, issue)
-      let g:ISSUES[issue]['completed'] = 1
-    endif
     call work#OpenJira(issue)
   endif
 endfunction
@@ -937,12 +976,6 @@ function! s:ShowActivity()
   let lines = map(copy(keys_sorted), 'v:val .. ": " .. g:ISSUES[v:val]["branches"][0][1]')
   let nr = init#CreateCustomQuickfix('Issues', lines, 'work#OnIssueSelected')
   let ns = nvim_create_namespace('')
-  for idx in range(len(keys_sorted))
-    let issue = keys_sorted[idx]
-    if g:ISSUES[issue]['completed']
-      call nvim_buf_set_extmark(nr, ns, idx, 0, #{line_hl_group: 'Conceal'})
-    endif
-  endfor
 endfunction
 
 function! s:MyDashboard()
@@ -1000,7 +1033,7 @@ function! s:NewBranch(issue, name)
   echom "Did you set issue in progress? "
   let branches = get(g:ISSUES, a:issue, [])
   call add(branches, [repo, branch])
-  let opts = #{branches: branches, completed: 0, timestamp: localtime()}
+  let opts = #{branches: branches, timestamp: localtime()}
   let g:ISSUES[a:issue] = opts
 endfunction
 
@@ -1031,8 +1064,16 @@ function! s:CodeSearch(...)
   if empty(args)
     echo "Expecting string!"
   else
-    exe "G log -S " .. join(a:000)
+    exe "G log -S " .. args
   endif
+endfunction
+
+function! s:AuthorSearch(...)
+  let args = join(a:000)
+  if empty(args)
+    let args = "Shklifov"
+  endif
+  exe "G log --author " .. args
 endfunction
 
 function! IssueCompl(ArgLead, CmdLine, CursorPos)
@@ -1042,7 +1083,7 @@ function! IssueCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent", "SwitchTo",
         \ "NewBranch", "CopyBranch", "CopyHash",
-        \ "MessageSearch", "CodeSearch"]
+        \ "MessageSearch", "CodeSearch", "AuthorSearch"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1065,8 +1106,11 @@ endfunction
 " Used in a keymap for :q and :qa
 function ConfirmQuit()
   if exists('s:master_job_id')
-    let args = #{prompt: "Killing SSH master! Are you sure? ", cancelreturn: 'n'}
-    return input(args)[0] !=? 'n'
+    " let args = #{prompt: "Killing SSH master! Are you sure? ", cancelreturn: 'n'}
+    " return input(args)[0] !=? 'n'
+    echo "Killing SSH master!"
+    sleep 200m
+    return v:true
   endif
   return v:true
 endfunction
