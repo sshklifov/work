@@ -144,7 +144,7 @@ function! s:Journal(bang, arg)
 endfunction
 
 function! JournalCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
+  if a:CursorPos < len(a:CmdLine)
     return []
   endif
   let files = ["/usr/lib/systemd/system/obsidian-video.service",
@@ -182,7 +182,7 @@ function! work#SelectRemoteFile()
 endfunction
 
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
+  if a:CursorPos < len(a:CmdLine)
     return []
   endif
   return init#RemoteFindFiles(g:HOST, a:ArgLead)
@@ -393,7 +393,7 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
   exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
-  exe printf("command! -nargs=0 Scp call init#Scp('%s')", g:HOST)
+  exe printf("command! -nargs=? -complete=customlist,SshfsCompl Scp call init#Scp('%s', empty(<q-args>) ? '/tmp' : <q-args>)", g:HOST)
 
   command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:SshfsOnSteroids(<q-args>)
   cabbr SSfs Ssfs
@@ -586,6 +586,9 @@ function! s:FakeSdk()
   let repo_dir = $HOME .. "/libalcatraz"
   let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  " TODO
+  " let pc_pattern = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
+  " call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, s:sdk_dir))
   call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
@@ -714,6 +717,7 @@ endfunction
 
 function! s:MemoryMonitor()
   Ssfs /tmp/memory_trace.txt
+  e!
   %!c++filt
   setlocal nomodified
   setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
@@ -1095,12 +1099,10 @@ function! s:OnVimEnter()
   call s:InstallHostCommands()
   call s:StartMaster()
   let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+  " Quick way to map sdk source files to GDB
   command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
-
-  " Run RSI plugin on the main vim instance
-  if work#IsMasterRunning()
-    call RsiEnable()
-  endif
+  " Start RSI on the second workspace
+  call RsiEnable("2")
 endfunction
 
 " Used in a keymap for :q and :qa
