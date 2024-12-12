@@ -450,6 +450,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker",
         \ "BuildSdk", "BuildImage", "InstallSdk", "InstallImage",
+        \ "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
         \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
         \ "BarfPlotTrace", "MemoryMonitor"]
@@ -513,16 +514,17 @@ function! s:RunDocker(cmd)
   let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
 
   call add(cmds, docker_cmd)
-  call termopen(join(cmds))
+  let id = termopen(join(cmds))
   startinsert
+  return id
 endfunction
 
 function! s:BuildSdk()
-  call s:RunDocker("bitbake rock-image -c populate_sdk")
+  return s:RunDocker("bitbake rock-image -c populate_sdk")
 endfunction
 
 function! s:BuildImage()
-  call s:RunDocker("bitbake rock-image")
+  return s:RunDocker("bitbake rock-image")
 endfunction
 
 function! s:InstallSdk()
@@ -579,6 +581,29 @@ function! s:InstallImage()
 
   call termopen(join(cmds, ";"))
   startinsert
+endfunction
+
+function! s:RefreshImage()
+  let id = s:BuildImage()
+  let cb = expand("<SID>") .. "InstallImage"
+  call init#OnJobFinished(id, cb)
+endfunction
+
+function! s:RefreshSdk()
+  let id = s:BuildSdk()
+  let cb = expand("<SID>") .. "InstallSdk"
+  call init#OnJobFinished(id, cb)
+endfunction
+
+function! s:Refresh()
+  let id = s:RunDocker("bitbake rock-image && bitbake rock-image -c populate_sdk")
+  let cb = expand("<SID>") .. "InstallBoth"
+  call init#OnJobFinished(id, cb)
+endfunction
+
+function! s:InstallBoth()
+  call s:InstallImage()
+  call s:InstallSdk()
 endfunction
 
 function! s:FakeSdk()
