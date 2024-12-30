@@ -30,33 +30,39 @@ function s:ObsidianMake(...)
     return
   endif
   let repo = split(FugitiveWorkTree(), "/")[-1]
-  let obsidian_repos = ["obsidian-video", "libalcatraz", "mpp", "camera_engine_rkaiq", "badge-and-face"]
+  let obsidian_repos = ["obsidian-video", "libalcatraz", "mpp",
+        \ "camera_engine_rkaiq", "badge-and-face", "rock-video", "alcatraz-ml-library"]
   if index(obsidian_repos, repo) < 0
     echo "Unsupported repo: " . repo
     return
   endif
 
   let common_flags = join([
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", s:sdk_dir),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", s:sdk_dir),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR),
         \ "-O0 -ggdb -U_FORTIFY_SOURCE"])
-  let cxxflags = "export CXXFLAGS=" . string(common_flags)
-  let cflags = "export CFLAGS=" . string(common_flags)
 
-  let dir = printf("cd %s", FugitiveWorkTree())
-  let env = printf("source %s/environment-setup-armv8a-aisys-linux", s:sdk_dir)
+  let cmds = []
+  call add(cmds, printf("cd %s", FugitiveWorkTree()))
+  call add(cmds, printf("source %s/environment-setup-armv8a-aisys-linux", g:SDK_DIR))
+  if repo == 'alcatraz-ml-library'
+    call add(cmds, "export ParavisionSDKType=ROCKCHIP")
+  endif
+  call add(cmds, "export CXXFLAGS=" . string(common_flags))
+  call add(cmds, "export CFLAGS=" . string(common_flags))
 
   if repo == 'camera_engine_rkaiq'
     let cmake = printf("cmake -S. -B%s -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
-    let cmake .= printf(" -DIQ_PARSER_V2_EXTRA_CFLAGS='-I%s/sysroots/armv8a-aisys-linux/usr/include/rockchip-uapi;", s:sdk_dir)
-    let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", s:sdk_dir)
+    let cmake .= printf(" -DIQ_PARSER_V2_EXTRA_CFLAGS='-I%s/sysroots/armv8a-aisys-linux/usr/include/rockchip-uapi;", g:SDK_DIR)
+    let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", g:SDK_DIR)
     let cmake .= " -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DISP_HW_VERSION='-DISP_HW_V30' -DARCH='aarch64' -DRKAIQ_TARGET_SOC='rk3588'"
   else
     let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
   endif
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
-  let cmds = [dir, env, cxxflags, cflags, cmake, build]
+  call add(cmds, cmake)
+  call add(cmds, build)
   let command = ["/bin/bash", "-c", join(cmds, ';')]
 
   let bang = get(a:, 1, "")
@@ -134,11 +140,13 @@ function! s:Journal(bang, arg)
 
   let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
   if !empty(a:bang)
+    sp
     enew
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
     let nr = init#CreateCustomBuffer('Journal ' .. service_name, lines)
+    sp
     exe "b " .. nr
   endif
 endfunction
@@ -265,7 +273,7 @@ function! s:Resync()
   call s:ObsidianMake()
 endfunction
 
-command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
+" command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
 
 function s:MakeNiceApp(exe)
   if get(g:, 'CAPABILITIES', 1)
@@ -310,17 +318,39 @@ endfunction
 
 function! s:AppToClipboard(app)
   let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
-  try
-    let opts = s:PrepareApp(app)
-    if has_key(opts, 'user')
-      let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
-    else
-      let cmd = opts['exe']
-    endif
-    call init#ToClipboard(cmd)
-  catch
-    echo v:exception
-  endtry
+  let opts = s:PrepareApp(app)
+  if has_key(opts, 'user')
+    let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
+  else
+    let cmd = opts['exe']
+  endif
+  call init#ToClipboard(cmd)
+endfunction
+
+function! s:AppToSystemd(app)
+  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
+  let name = fnamemodify(app, ':t')
+  if name == 'obsidian-video'
+    let systemd_name = "obsidian-video"
+  elseif name == 'badge_and_face'
+    let systemd_name = 'badge-and-face'
+  else
+    echo "Unsupported app: " .. a:app
+    return
+  endif
+
+  let cmds = []
+  call add(cmds, "echo Stopping service...")
+  call add(cmds, "systemctl stop " .. systemd_name)
+  call add(cmds, printf("cp %s /usr/bin/%s", app, name))
+  call add(cmds, "setcap cap_sys_nice+ep /usr/bin/" .. name)
+  call add(cmds, "echo Starting service...")
+  call add(cmds, "systemctl start " .. systemd_name)
+  call add(cmds, "systemctl status " .. systemd_name)
+
+  sp
+  enew
+  call termopen(["ssh", g:HOST, join(cmds, ' && ')])
 endfunction
 
 nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
@@ -329,6 +359,10 @@ nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-to
 nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
 nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
 nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
+
+nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("application/obsidian-video")<CR>
+nnoremap <silent> <leader>sb <cmd>call <SID>AppToSystemd("bin/badge_and_face")<CR>
+
 nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 
 function! s:ControlFileExists()
@@ -376,12 +410,20 @@ function s:DetermineSdk()
     return v:false
   endif
   if stridx(lines[0], "rockx-dm-p15") >= 0
-    let g:DEVICE = "p15"
-    let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+    let g:DEVICE = "rockx-dm-p15"
+    let g:SDK_DIR = "/opt/aisys/obsidian_p15"
     return v:true
   elseif stridx(lines[0], "rockx-dm-r10") >= 0
-    let g:DEVICE = "r10"
-    let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
+    let g:DEVICE = "rockx-dm-r10"
+    let g:SDK_DIR = "/opt/aisys/obsidian_r10"
+    return v:true
+  elseif stridx(lines[0], "onyx-p1") >= 0
+    let g:DEVICE = "onyx-p1"
+    let g:SDK_DIR = "/opt/aisys/onyx_p1"
+    return v:true
+  elseif stridx(lines[0], "onyx-cr") >= 0
+    let g:DEVICE = "onyx-cr"
+    let g:SDK_DIR = "/opt/aisys/onyx_cr"
     return v:true
   endif
   return v:false
@@ -508,7 +550,7 @@ function! s:RunDocker(cmd)
   let cmds = ["sudo", "docker-compose", "run", "--rm", "ubuntu22"]
 
   let bash_cmd = ["export USE_S3_BUCKET=1",
-        \ printf("export MACHINE=rockx-dm-%s", g:DEVICE),
+        \ printf("export MACHINE=%s", g:DEVICE),
         \ "source /home/stef/aidistro/setup-environment /home/stef/cache"]
   call add(bash_cmd, a:cmd)
   let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
@@ -548,8 +590,8 @@ function! s:InstallSdk()
   enew
   let cmds = []
   call add(cmds, "echo 'Found sdk from " .. mins .. "m ago'")
-  call add(cmds, "rm -rf " .. s:sdk_dir .. "/*")
-  call add(cmds, printf("%s -d %s -y", most_recent_file, s:sdk_dir))
+  call add(cmds, "rm -rf " .. g:SDK_DIR .. "/*")
+  call add(cmds, printf("%s -d %s -y", most_recent_file, g:SDK_DIR))
   call termopen(join(cmds, ";"))
   startinsert
 endfunction
@@ -610,11 +652,11 @@ function! s:FakeSdk()
   let cmds = []
   let repo_dir = $HOME .. "/libalcatraz"
   let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
   " TODO
   " let pc_pattern = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
-  " call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, s:sdk_dir))
-  call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, s:sdk_dir))
+  " call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, g:SDK_DIR))
+  call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
   split
@@ -627,7 +669,7 @@ function! s:FakeMpp()
   let cmds = []
   let repo_dir = $HOME .. "/mpp"
   let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, s:sdk_dir))
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
   split
@@ -637,7 +679,7 @@ function! s:FakeMpp()
 endfunction
 
 function! s:HostDebugSyms(pat)
-  let dir = s:sdk_dir .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
+  let dir = g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
   let pat = ".*" .. a:pat .. ".*"
   let files = systemlist(["find", dir, "-regex", pat])
   let bytes = 0
@@ -1123,22 +1165,14 @@ function! s:OnVimEnter()
   " Install commands for the first time
   call s:InstallHostCommands()
   call s:StartMaster()
-  let s:sdk_dir = "/opt/aisys/obsidian_" .. g:DEVICE
   " Quick way to map sdk source files to GDB
-  command! -nargs=0 Map call PromptDebugSendCommand('map ' .. s:sdk_dir)
+  command! -nargs=0 Map call PromptDebugSendCommand('map ' .. g:SDK_DIR)
   " Start RSI on the second workspace
   call RsiEnable("2")
 endfunction
 
 " Used in a keymap for :q and :qa
 function ConfirmQuit()
-  if exists('s:master_job_id')
-    " let args = #{prompt: "Killing SSH master! Are you sure? ", cancelreturn: 'n'}
-    " return input(args)[0] !=? 'n'
-    echo "Killing SSH master!"
-    sleep 200m
-    return v:true
-  endif
   return v:true
 endfunction
 
