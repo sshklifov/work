@@ -31,7 +31,8 @@ function s:ObsidianMake(...)
   endif
   let repo = split(FugitiveWorkTree(), "/")[-1]
   let obsidian_repos = ["obsidian-video", "libalcatraz", "mpp",
-        \ "camera_engine_rkaiq", "badge-and-face", "rock-video", "alcatraz-ml-library"]
+        \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
+        \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app"]
   if index(obsidian_repos, repo) < 0
     echo "Unsupported repo: " . repo
     return
@@ -130,18 +131,22 @@ function! s:Journal(bang, arg)
     call init#ShowErrors(output)
     return
   endif
-  let timestamp = split(output[0])[0]
+
+  if stridx(output[0], "No entries") < 0
+    let timestamp = split(output[0])[0]
+  else
+    let timestamp = 0
+  endif
   let output = systemlist(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
   if v:shell_error
     call init#ShowErrors(output)
     return
   endif
   let since = output[0]
-
   let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
+
   if !empty(a:bang)
-    sp
-    enew
+    sp enew
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
@@ -490,7 +495,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["StopServices", "DropClients", "UpdateDocker",
+  let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
         \ "BuildSdk", "BuildImage", "InstallSdk", "InstallImage",
         \ "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
@@ -543,7 +548,7 @@ function! s:UpdateDocker()
   startinsert
 endfunction
 
-function! s:RunDocker(cmd)
+function! s:RunDocker(...)
   sp
   enew
   lcd ~/aidistro
@@ -552,9 +557,13 @@ function! s:RunDocker(cmd)
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", g:DEVICE),
         \ "source /home/stef/aidistro/setup-environment /home/stef/cache"]
-  call add(bash_cmd, a:cmd)
-  let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
+  if a:0 > 0
+    call add(bash_cmd, join(a:000))
+  else
+    call add(bash_cmd, "/usr/bin/bash")
+  endif
 
+  let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
   call add(cmds, docker_cmd)
   let id = termopen(join(cmds))
   startinsert
@@ -871,13 +880,15 @@ endfunction
 
 function! s:Trust(...)
   let host = get(a:, 1, g:HOST)
+  if str2nr(host) > 0
+    let host = "root@10.1.20." .. host
+  endif
   let ssh_config = systemlist(["ssh", "-G", host])
   call filter(ssh_config, 'v:val =~ "^hostname"')
   let ip = split(ssh_config[0])[1]
   let cmds = []
   call add(cmds, "ssh-keygen -R " .. ip)
   call add(cmds, "ssh_wait_silent " .. host)
-  call add(cmds, "ssh " .. host .. " exit")
 
   botr split
   enew
