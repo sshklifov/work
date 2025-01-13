@@ -38,10 +38,15 @@ function s:ObsidianMake(...)
     return
   endif
 
-  let common_flags = join([
+  let common_flags = [
         \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR),
-        \ "-O0 -ggdb -U_FORTIFY_SOURCE"])
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR)]
+  if g:BUILD_TYPE == "Debug"
+    let common_flags += ["-Og", "-ggdb", "-U_FORTIFY_SOURCE"]
+  else
+    let common_flags += ["-O2", "-g1"]
+  endif
+  let common_flags = join(common_flags)
 
   let cmds = []
   call add(cmds, printf("cd %s", FugitiveWorkTree()))
@@ -58,7 +63,7 @@ function s:ObsidianMake(...)
     let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", g:SDK_DIR)
     let cmake .= " -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DISP_HW_VERSION='-DISP_HW_V30' -DARCH='aarch64' -DRKAIQ_TARGET_SOC='rk3588'"
   else
-    let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
+    let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s -DCMAKE_INSTALL_PREFIX=/usr", g:BUILD_TYPE, g:BUILD_TYPE)
   endif
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
@@ -500,7 +505,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
         \ "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
         \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "MemoryMonitor"]
+        \ "BarfPlotTrace", "MemoryMonitor", "DmaMonitor"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -509,9 +514,9 @@ function! s:StopServices()
         \ "rtsp-server-noauth",
         \ "rtsp-server.socket",
         \ "rtsp-server.service",
-        \ "obsidian-video",
         \ "badge-and-face",
-        \ "qrcode-scanner"
+        \ "qrcode-scanner",
+        \ "obsidian-video"
         \ ]
   let cmds = []
   for service in stop_list
@@ -662,9 +667,8 @@ function! s:FakeSdk()
   let repo_dir = $HOME .. "/libalcatraz"
   let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
-  " TODO
-  " let pc_pattern = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
-  " call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, g:SDK_DIR))
+  let pc_pattern = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, g:SDK_DIR))
   call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
@@ -799,6 +803,58 @@ function! s:MemoryMonitor()
   setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
   setlocal foldmethod=expr
   setlocal foldenable
+endfunction
+
+function! s:DmaMonitor()
+  Ssfs /tmp/dma_trace.txt
+  e!
+  let line_syms = #{}
+  for lnum in range(1, line('$'))
+    let m = matchlist(getline(lnum), '-- .*badge_and_face(\(+0x\x\+\))', )
+    if len(m) >= 2
+      let sym = m[1]
+      let line_syms[lnum] = sym
+    endif
+  endfor
+  let cmd = printf("addr2line -fsipC -e ~/badge-and-face/%s/bin/badge_and_face ", g:BUILD_TYPE)
+  let addrs = values(line_syms)
+  let cmd ..= join(addrs)
+  echo "Running addr2line..."
+  let output = systemlist(cmd)
+  if v:shell_error
+    call init#ShowErrors(output)
+    echo "addr2line errors!"
+    return
+  endif
+
+  let addr_pos = map(matchstrlist(output, '^\S', #{idx: 1}), 'v:val.idx')
+  if len(addr_pos) != len(addrs)
+    echom printf("Error in logic. Recods in output: %d vs. expected %d.", len(addr_pos), len(addrs))
+    call init#ShowErrors(output)
+    return
+  endif
+  " Show only location if too long
+  call map(output, 'len(v:val) <= 100 ? v:val : " (inlined by) " .. v:val[strridx(v:val, " at ")+4:]')
+  " Add indentation
+  call map(output, '"-- " .. v:val')
+
+  let addr_to_output_idx = #{}
+  for idx in range(len(addrs))
+    let end_pos = get(addr_pos, idx + 1, len(output))
+    let addr_to_output_idx[addrs[idx]] = [addr_pos[idx], end_pos]
+  endfor
+
+  let lines_descending = reverse(sort(keys(line_syms)))
+  for lnum in lines_descending
+    let [start_pos, end_pos] = addr_to_output_idx[line_syms[lnum]]
+    let txt = map(range(start_pos, end_pos - 1), 'output[v:val]')
+    call setline(lnum, txt[0])
+    for inl in txt[1:]
+      call append(lnum, inl)
+      let lnum += 1
+    endfor
+  endfor
+  set nomod
 endfunction
 
 function! s:FakeImage()
