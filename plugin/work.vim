@@ -2,8 +2,8 @@
 
 """"""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#BranchIssueNumber()
-  let branch = init#BranchName()
+function! work#BranchIssueNumber(...)
+  let branch = get(a:000, 0, init#BranchName())
   return matchstr(branch, 'SW-[0-9]\{4\}')
 endfunction
 
@@ -32,7 +32,8 @@ function s:ObsidianMake(...)
   let repo = split(FugitiveWorkTree(), "/")[-1]
   let obsidian_repos = ["obsidian-video", "libalcatraz", "mpp",
         \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
-        \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app"]
+        \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
+        \ "badge-and-face-rock" ]
   if index(obsidian_repos, repo) < 0
     echo "Unsupported repo: " . repo
     return
@@ -42,7 +43,7 @@ function s:ObsidianMake(...)
         \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
         \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR)]
   if g:BUILD_TYPE == "Debug"
-    let common_flags += ["-Og", "-ggdb", "-U_FORTIFY_SOURCE"]
+    let common_flags += ["-O0", "-ggdb", "-U_FORTIFY_SOURCE"]
   else
     let common_flags += ["-O2", "-g1"]
   endif
@@ -251,35 +252,37 @@ function! s:RemoteSync(arg, ...)
 
   let cmd = ["rsync", "-rlt"]
 
-  const fast_sync = v:true
-  if fast_sync
-    " Include all directories
-    call add(cmd, '--include=*/')
-    " Include all executables
-    let exes = systemlist(["find", dir, "-type", "f", "-executable", "-printf", "%P\n"])
-    for exe in exes
-      call add(cmd, '--include=' . exe)
-    endfor
-    " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
-    call add(cmd, '--exclude=*')
-  endif
+  let pat = get(a:000, 0, "")
+  let pat = empty(pat) ? ".*" : printf(".*%s.*", pat)
+  " Include all directories
+  call add(cmd, '--include=*/')
+  " Include all executables
+  let exes = systemlist(["find", dir, "-type", "f", "-executable", "-regex", pat, "-printf", "%P\n"])
+  for exe in exes
+    call add(cmd, '--include=' . exe)
+  endfor
+  " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
+  call add(cmd, '--exclude=*')
 
-  let bang = get(a:000, 0, "")
-  if empty(bang)
-    call extend(cmd, ["--info=progress2", dir, remote_dir])
-    return jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
-  else
-    bot new
-    call extend(cmd, ["--info=all4", dir, remote_dir])
-    let id = termopen(cmd, #{on_exit: funcref("OnExit")})
-    call cursor("$", 1)
-    return id
-  endif
+  call extend(cmd, ["--info=progress2", dir, remote_dir])
+  return jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
 endfunction
+
+command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>)
 
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
-  exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s')", dir)
+  let pat = ".*"
+  if stridx(dir, "obsidian-video") > 0
+    let pat = "obsidian-video"
+  elseif stridx(dir, "badge-and-face") > 0
+    let pat = "badge_and_face"
+  elseif stridx(dir, "libalcatraz") > 0
+    let pat = ""
+  endif
+  if !empty(pat)
+    exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s', '%s')", dir, pat)
+  endif
   call s:ObsidianMake()
 endfunction
 
@@ -316,14 +319,27 @@ function! s:PrepareApp(exe)
   endif
 endfunction
 
-function! work#DebugApp(exe, run)
-  let opts = s:PrepareApp(a:exe)
-  if a:run
-    let opts['br'] = init#GetDebugLoc()
-  endif
+function! work#Debug(exe, opts)
+  let opts = extend(a:opts, s:PrepareApp(a:exe))
   let opts['ssh'] = g:HOST
-  " Part of main init.vim
+  if !has_key(opts, 'post_cmds')
+    let opts['post_cmds'] = []
+  endif
+  let aisys_sdk_subst = printf('set substitute-path /usr/src/debug %s/sysroots/armv8a-aisys-linux/usr/src/debug', g:SDK_DIR)
+  call add(opts['post_cmds'], aisys_sdk_subst)
   call init#Debug(opts)
+endfunction
+
+function! work#Start(exe)
+  call work#Debug(a:exe, #{})
+endfunction
+
+function! work#Run(exe)
+  call work#Debug(a:exe, #{br: init#GetDebugLoc()})
+endfunction
+
+function! work#File(exe)
+  call work#Debug(a:exe, #{wait: 1})
 endfunction
 
 function! s:AppToClipboard(app)
@@ -406,7 +422,9 @@ function! s:StartMaster()
 endfunction
 
 function! s:OnMasterExit(...)
-  echom "SSH master died!"
+  if !exists('s:no_died_message')
+    echom "SSH master died!"
+  endif
   unlet s:master_job_id
 endfunction
 
@@ -440,8 +458,10 @@ function s:DetermineSdk()
 endfunction
 
 function! s:InstallHostCommands()
-  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#DebugApp', <q-args>, v:false)")
-  exe printf("command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#DebugApp', <q-args>, v:true)")
+  command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#Start', <q-args>)
+  command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#Run', <q-args>)
+  command! -nargs=? -complete=customlist,RemoteExeCompl File call init#TryCall('work#File', <q-args>)
+
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
   exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
@@ -451,25 +471,40 @@ function! s:InstallHostCommands()
   cabbr SSfs Ssfs
 endfunction
 
-function! s:ChangeHost(host)
-  if empty(a:host)
-    let host = "max_p15"
-  else
-    let host = a:host
-  endif
+function! s:ChangeHost(host, tried_to_trust)
+  let host = empty(a:host) ? "max_p15" : a:host
   call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
   if v:shell_error != 0
-    echo "Failed to connect to host " . host
-  else
+    " Yikes recursion???
+    if !a:tried_to_trust
+      let id = s:Trust(host)
+      call init#OnJobFinished(id, function('s:ChangeHost', [a:host, v:true]))
+    else
+      call init#Warn("Failed to connect to host " . host)
+    endif
+    return
+  endif
+
+  let old_host = g:HOST
+  try
     let g:HOST = host
     call s:InstallHostCommands()
     if !s:StartMaster()
-      echo "Failed to start SSH master!"
+      throw "Failed to restart SSH master!"
     endif
     if !s:DetermineSdk()
-      echo "Failed to determine SDK! You must manually set g:DEVICE"
+      throw "Failed to determine SDK! You must manually set g:DEVICE"
     endif
-  endif
+    mode
+    echo "SSH master restarted."
+  catch
+    let g:HOST = old_host
+    call s:InstallHostCommands()
+    call s:StartMaster()
+    mode
+    echom v:exception
+    return
+  endtry
 endfunction
 
 function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
@@ -482,7 +517,7 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>)
+command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>, v:false)
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
@@ -505,7 +540,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
         \ "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
         \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "MemoryMonitor", "DmaMonitor"]
+        \ "BarfPlotTrace", "MemoryMonitor", "DmaMonitor",
+        \ "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -641,20 +677,17 @@ endfunction
 
 function! s:RefreshImage()
   let id = s:BuildImage()
-  let cb = expand("<SID>") .. "InstallImage"
-  call init#OnJobFinished(id, cb)
+  call init#OnJobFinished(id, function("s:InstallImage"))
 endfunction
 
 function! s:RefreshSdk()
   let id = s:BuildSdk()
-  let cb = expand("<SID>") .. "InstallSdk"
-  call init#OnJobFinished(id, cb)
+  call init#OnJobFinished(id, function("s:InstallSdk"))
 endfunction
 
 function! s:Refresh()
   let id = s:RunDocker("bitbake rock-image && bitbake rock-image -c populate_sdk")
-  let cb = expand("<SID>") .. "InstallBoth"
-  call init#OnJobFinished(id, cb)
+  call init#OnJobFinished(id, function("s:InstallBoth"))
 endfunction
 
 function! s:InstallBoth()
@@ -798,63 +831,49 @@ endfunction
 function! s:MemoryMonitor()
   Ssfs /tmp/memory_trace.txt
   e!
-  %!c++filt
-  setlocal nomodified
   setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
   setlocal foldmethod=expr
   setlocal foldenable
 endfunction
 
-function! s:DmaMonitor()
-  Ssfs /tmp/dma_trace.txt
-  e!
-  let line_syms = #{}
-  for lnum in range(1, line('$'))
-    let m = matchlist(getline(lnum), '-- .*badge_and_face(\(+0x\x\+\))', )
-    if len(m) >= 2
-      let sym = m[1]
-      let line_syms[lnum] = sym
-    endif
-  endfor
-  let cmd = printf("addr2line -fsipC -e ~/badge-and-face/%s/bin/badge_and_face ", g:BUILD_TYPE)
-  let addrs = values(line_syms)
-  let cmd ..= join(addrs)
-  echo "Running addr2line..."
-  let output = systemlist(cmd)
+function! s:DmaMonitor(...)
+  let tool = init#RemoteFindFiles(g:HOST, "backtrace_tool")
+  if empty(tool)
+    throw "Not found: backtrace_tool"
+  endif
+  let tool = tool[0]
+
+  let input = init#RemoteFindFiles(g:HOST, get(a:000, 0, "dma_trace.txt"))
+  if empty(input)
+    throw "Not found: dma_trace.txt"
+  endif
+  let input = input[0]
+
+  let executable = printf("/var/tmp/%s/bin/badge_and_face", g:BUILD_TYPE)
+
+  let cmd = printf("%s -e=%s -i=%s", tool, executable, input)
+  echo 'Running tool...'
+  let lines = systemlist(["ssh", g:HOST, cmd])
+  let nr = init#CreateCustomBuffer('Dma Report', lines)
+  bot sp
+  exe "b " .. nr
+  if v:shell_error
+    echo 'Errors encountered!'
+  else
+    mode
+    setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
+    setlocal foldmethod=expr
+    setlocal foldenable
+  endif
+endfunction
+
+function! s:EnableCore()
+  let output = systemlist(["ssh", g:HOST, '/usr/bin/bash -c "echo 1 > /proc/sys/fs/suid_dumpable"'])
   if v:shell_error
     call init#ShowErrors(output)
-    echo "addr2line errors!"
-    return
+  else
+    echo "suid_dumpable set to true."
   endif
-
-  let addr_pos = map(matchstrlist(output, '^\S', #{idx: 1}), 'v:val.idx')
-  if len(addr_pos) != len(addrs)
-    echom printf("Error in logic. Recods in output: %d vs. expected %d.", len(addr_pos), len(addrs))
-    call init#ShowErrors(output)
-    return
-  endif
-  " Show only location if too long
-  call map(output, 'len(v:val) <= 100 ? v:val : " (inlined by) " .. v:val[strridx(v:val, " at ")+4:]')
-  " Add indentation
-  call map(output, '"-- " .. v:val')
-
-  let addr_to_output_idx = #{}
-  for idx in range(len(addrs))
-    let end_pos = get(addr_pos, idx + 1, len(output))
-    let addr_to_output_idx[addrs[idx]] = [addr_pos[idx], end_pos]
-  endfor
-
-  let lines_descending = reverse(sort(keys(line_syms)))
-  for lnum in lines_descending
-    let [start_pos, end_pos] = addr_to_output_idx[line_syms[lnum]]
-    let txt = map(range(start_pos, end_pos - 1), 'output[v:val]')
-    call setline(lnum, txt[0])
-    for inl in txt[1:]
-      call append(lnum, inl)
-      let lnum += 1
-    endfor
-  endfor
-  set nomod
 endfunction
 
 function! s:FakeImage()
@@ -935,21 +954,25 @@ function! s:FactoryReset()
 endfunction
 
 function! s:Trust(...)
-  let host = get(a:, 1, g:HOST)
+  let host = get(a:000, 0, g:HOST)
   if str2nr(host) > 0
-    let host = "root@10.1.20." .. host
+    let ip = "10.1.20." .. host
+    let host = "root@" .. ip
+  else
+    let ssh_config = systemlist(["ssh", "-G", host])
+    call filter(ssh_config, 'v:val =~ "^hostname"')
+    let ip = split(ssh_config[0])[1]
   endif
-  let ssh_config = systemlist(["ssh", "-G", host])
-  call filter(ssh_config, 'v:val =~ "^hostname"')
-  let ip = split(ssh_config[0])[1]
   let cmds = []
   call add(cmds, "ssh-keygen -R " .. ip)
+  call add(cmds, "echo 'Waiting for connection...'")
   call add(cmds, "ssh_wait_silent " .. host)
 
   botr split
   enew
-  call termopen(join(cmds, ";"))
+  let id = termopen(join(cmds, ";"))
   startinsert
+  return id
 endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
@@ -1057,6 +1080,10 @@ function! work#CommitAI()
   throw "Unexpected failure, fixme!"
 endfunction
 
+function! work#TestAI()
+  call s:BuildImage()
+endfunction
+
 function! work#PushAI()
   e ~/aidistro/repo
   let dict = FugitiveExecute(["push", "origin", "HEAD"])
@@ -1093,7 +1120,7 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let items = ["Fetch", "Commit", "Push", "CleanUp"]
+  let items = ["Fetch", "Commit", "Test", "Push", "CleanUp"]
   return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
@@ -1110,24 +1137,25 @@ function! work#OpenJira(issue)
 endfunction
 
 function! s:ShowActivity()
-  let keys_sorted = reverse(sort(keys(g:ISSUES), 's:CompareIssues'))
-  let lines = map(copy(keys_sorted), 'v:val .. ": " .. g:ISSUES[v:val]["branches"][0][1]')
-  let nr = init#CreateCustomQuickfix('Issues', lines, 'work#OnIssueSelected')
-  let ns = nvim_create_namespace('')
+  " TODO FugitiveExecute on all locations...
+  let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
+  let branches = init#FugitiveExecuteOrThrow(cmd)
+  call filter(branches, '!empty(v:val)')
+  call init#CreateCustomQuickfix('Branches', branches, 'work#OnIssueSelected')
+endfunction
+
+function! work#OnIssueSelected()
+  let issue = work#BranchIssueNumber(getline('.'))
+  if !empty(issue)
+    call work#OpenJira(issue)
+  else
+    echo "Nothing to show!"
+  endif
+  quit
 endfunction
 
 function! s:MyDashboard()
   call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
-endfunction
-
-function! s:CompareIssues(k1, k2)
-  return g:ISSUES[a:k1]['timestamp'] - g:ISSUES[a:k2]['timestamp']
-endfunction
-
-function! work#OnIssueSelected()
-  let issue = getline('.')
-  call work#OpenJira(issue)
-  quit
 endfunction
 
 function! s:OpenCurrent()
@@ -1137,42 +1165,6 @@ function! s:OpenCurrent()
   else
     call work#OpenJira(issue)
   endif
-endfunction
-
-function! s:SwitchTo(issue)
-  if !has_key(g:ISSUES, a:issue)
-    throw "Invalid issue!"
-  endif
-  let branches = g:ISSUES[a:issue]['branches']
-  for [repo, branch] in branches
-    let opts = #{prompt: "Check out " .. branch .. " inside " .. repo .. "? ", cancelreturn: "n"}
-    let user_resp = input(opts)
-    if user_resp[0] !=? 'n'
-      exe "sp " .. repo
-      call init#SwitchToBranchOrThrow(branch)
-      quit
-    endif
-  endfor
-endfunction
-
-function! s:NewBranch(issue, name)
-  let repo = FugitiveWorkTree()
-  if empty(repo)
-    echo "Not inside repository!"
-    return
-  endif
-  let branch = printf("stef/%s/%s", a:issue, a:name)
-  let dict = FugitiveExecute(["checkout", "-b", branch])
-  if dict['exit_status'] != 0
-    call init#ShowErrors(dict['stderr'])
-    throw "Failed to create branch"
-  endif
-  call work#OpenJira(a:issue)
-  echom "Did you set issue in progress? "
-  let branches = get(g:ISSUES, a:issue, [])
-  call add(branches, [repo, branch])
-  let opts = #{branches: branches, timestamp: localtime()}
-  let g:ISSUES[a:issue] = opts
 endfunction
 
 function! s:CopyBranch()
@@ -1202,7 +1194,7 @@ function! s:CodeSearch(...)
   if empty(args)
     echo "Expecting string!"
   else
-    exe "G log -S " .. args
+    exe "G log --all -S " .. args
   endif
 endfunction
 
@@ -1219,9 +1211,9 @@ function! IssueCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent", "SwitchTo",
-        \ "NewBranch", "CopyBranch", "CopyHash",
-        \ "MessageSearch", "CodeSearch", "AuthorSearch"]
+  let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent",
+        \ "CopyBranch", "CopyHash", "MessageSearch",
+        \ "CodeSearch", "AuthorSearch"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1232,15 +1224,8 @@ function! s:OnVimEnter()
   " Install commands for the first time
   call s:InstallHostCommands()
   call s:StartMaster()
-  " Quick way to map sdk source files to GDB
-  command! -nargs=0 Map call PromptDebugSendCommand('map ' .. g:SDK_DIR)
   " Start RSI on the second workspace
   call RsiEnable("2")
-endfunction
-
-" Used in a keymap for :q and :qa
-function ConfirmQuit()
-  return v:true
 endfunction
 
 augroup Work
