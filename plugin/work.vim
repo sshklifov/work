@@ -536,8 +536,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "BuildSdk", "BuildImage", "InstallSdk", "InstallImage",
-        \ "RefreshImage", "RefreshSdk", "Refresh",
+        \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage",
+        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
         \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
         \ "BarfPlotTrace", "MemoryMonitor", "DmaMonitor",
@@ -646,11 +646,10 @@ function! s:InstallSdk()
   startinsert
 endfunction
 
-function! s:InstallImage()
+function! s:FindImage()
   let images = systemlist(["find", "/home/" .. $USER .. "/aidistro/cache/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:DEVICE)])
   if empty(images)
-    echo "No image found"
-    return
+    throw "No image found"
   endif
   let most_recent_image = images[0]
   let most_recent_timestamp = getftime(most_recent_image)
@@ -661,8 +660,18 @@ function! s:InstallImage()
       let most_recent_timestamp = curr_timestamp
     endif
   endfor
-  let mins = (localtime() - most_recent_timestamp) / 60
+  return most_recent_image
+endfunction
 
+function! s:ShowImage()
+  let img = s:FindImage()
+  echo img
+endfunction
+
+function! s:InstallImage()
+  let most_recent_image = s:FindImage()
+  let most_recent_timestamp = getftime(most_recent_image)
+  let mins = (localtime() - most_recent_timestamp) / 60
   split
   enew
   let cmds = []
@@ -670,7 +679,6 @@ function! s:InstallImage()
   call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:HOST))
   call add(cmds, printf("ssh %s 'mender install /tmp/image.mender && reboot'", g:HOST))
   call add(cmds, "ssh_wait_silent " .. g:HOST)
-
   call termopen(join(cmds, ";"))
   startinsert
 endfunction
@@ -916,8 +924,6 @@ function! s:FakeImage()
   G
   exe "normal \<C-w>w"
   q
-  " Run docker in split
-  call s:BuildImage()
 endfunction
 
 function! s:ReverseImage()
