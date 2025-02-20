@@ -3,7 +3,7 @@
 """"""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#BranchIssueNumber(...)
-  let branch = get(a:000, 0, init#BranchName())
+  let branch = get(a:000, 0, git#GetBranch())
   return matchstr(branch, 'SW-[0-9]\{4\}')
 endfunction
 
@@ -30,7 +30,7 @@ function s:ObsidianMake(...)
     return
   endif
   let repo = split(FugitiveWorkTree(), "/")[-1]
-  let obsidian_repos = ["obsidian-video", "libalcatraz", "mpp",
+  let whitelist_repos = ["obsidian-video", "libalcatraz", "mpp",
         \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
         \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
         \ "badge-and-face-rock" ]
@@ -113,6 +113,7 @@ function! s:ResolveEnvFile()
 endfunction
 
 command! -nargs=0 -bang Make call <SID>ObsidianMake("<bang>")
+command! -nargs=0 -bang Remake exe "Clean" | exe "Make<bang>"
 command! -nargs=0 Clean call system("rm -rf " . FugitiveFind(g:BUILD_TYPE))
 nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 "}}}
@@ -168,7 +169,8 @@ function! JournalCompl(ArgLead, CmdLine, CursorPos)
   endif
   let files = ["/usr/lib/systemd/system/obsidian-video.service",
         \ "/usr/lib/systemd/system/qrcode-scanner.service",
-        \ "/usr/lib/systemd/system/badge-and-face.service"]
+        \ "/usr/lib/systemd/system/badge-and-face.service",
+        \ "/usr/lib/systemd/system/rock-video.service"]
   return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
 endfunction
 
@@ -305,6 +307,8 @@ endfunction
 function! s:PrepareApp(exe)
   if a:exe =~ "qrcode-scanner$"
     return #{exe: a:exe, user: "rock-bootstrap"}
+  elseif a:exe =~ "rock-video$"
+    return #{exe: a:exe, user: "rock-video"}
   endif
   let nice_exe = s:MakeNiceApp(a:exe)
   if a:exe =~ "rtsp-server$"
@@ -360,36 +364,31 @@ function! s:AppToSystemd(app)
     let systemd_name = "obsidian-video"
   elseif name == 'badge_and_face'
     let systemd_name = 'badge-and-face'
+  elseif name == 'rock-video'
+    let systemd_name = 'rock-video'
   else
     echo "Unsupported app: " .. a:app
     return
   endif
 
   let cmds = []
-  call add(cmds, "echo Stopping service...")
+  call add(cmds, printf("echo Stopping %s...", systemd_name))
   call add(cmds, "systemctl stop " .. systemd_name)
   call add(cmds, printf("cp %s /usr/bin/%s", app, name))
   call add(cmds, "setcap cap_sys_nice+ep /usr/bin/" .. name)
-  call add(cmds, "echo Starting service...")
+  call add(cmds, printf("echo Starting %s...", systemd_name))
   call add(cmds, "systemctl start " .. systemd_name)
-  call add(cmds, "systemctl status " .. systemd_name)
 
   sp
   enew
-  call termopen(["ssh", g:HOST, join(cmds, ' && ')])
+  let id = termopen(["ssh", g:HOST, join(cmds, ' && ')])
+  let systemd_file = JournalCompl(systemd_name, '', 0)
+  if len(systemd_file) == 1
+    call init#OnJobFinished(id, function('s:Journal', ['!', systemd_file[0]]))
+  else
+    call init#Warn('Failed to find ' .. systemd_name)
+  endif
 endfunction
-
-nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
-nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("application/obsidian-video")<CR>
-nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-tool")<CR>
-nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
-nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
-nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
-
-nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("application/obsidian-video")<CR>
-nnoremap <silent> <leader>sb <cmd>call <SID>AppToSystemd("bin/badge_and_face")<CR>
-
-nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 
 function! s:ControlFileExists()
   let config = systemlist(["ssh", '-G', g:HOST])
@@ -469,6 +468,24 @@ function! s:InstallHostCommands()
 
   command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:SshfsOnSteroids(<q-args>)
   cabbr SSfs Ssfs
+
+  nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
+  nnoremap <silent> <leader>sb <cmd>call <SID>AppToSystemd("bin/badge_and_face")<CR>
+  if stridx(g:DEVICE, "onyx") >= 0
+    nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("pipeline/rock-video")<CR>
+    nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("pipeline/rtsp-server")<CR>
+    nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("pipeline/rock-video")<CR>
+  elseif stridx(g:DEVICE, "rockx") >= 0
+    nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("application/obsidian-video")<CR>
+    nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-tool")<CR>
+    nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
+    nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
+    nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("application/obsidian-video")<CR>
+  else
+    call init#Warn("Not installing host specific maps!")
+  endif
+  nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
+  nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 endfunction
 
 function! s:ChangeHost(host, tried_to_trust)
@@ -507,7 +524,7 @@ function! s:ChangeHost(host, tried_to_trust)
   endtry
 endfunction
 
-function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
+function! HostCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
@@ -517,7 +534,7 @@ function! ChangeHostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-command! -nargs=? -complete=customlist,ChangeHostCompl Host call s:ChangeHost(<q-args>, v:false)
+command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>, v:false)
 "}}}
 
 """"""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
@@ -540,8 +557,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
         \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
         \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "MemoryMonitor", "DmaMonitor",
-        \ "EnableCore"]
+        \ "BarfPlotTrace", "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -554,6 +570,12 @@ function! s:StopServices()
         \ "qrcode-scanner",
         \ "obsidian-video"
         \ ]
+  if stridx(g:DEVICE_TYPE, "rockx") >= 0
+    call add(stop_list, "obsidian-video")
+  elseif stridx(g:DEVICE_TYPE, "onyx") >= 0
+    call add(stop_list, "rock-video")
+  endif
+
   let cmds = []
   for service in stop_list
     let cmd = "systemctl stop " . service
@@ -837,41 +859,30 @@ function! s:BarfPlotTrace(name)
 endfunction
 
 function! s:MemoryMonitor()
-  Ssfs /tmp/memory_trace.txt
-  e!
-  setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
-  setlocal foldmethod=expr
-  setlocal foldenable
-endfunction
-
-function! s:DmaMonitor(...)
   let tool = init#RemoteFindFiles(g:HOST, "backtrace_tool")
   if empty(tool)
     throw "Not found: backtrace_tool"
   endif
   let tool = tool[0]
 
-  let input = init#RemoteFindFiles(g:HOST, get(a:000, 0, "dma_trace.txt"))
+  let input = systemlist(["ssh", g:HOST, "ls -t /tmp"])
   if empty(input)
-    throw "Not found: dma_trace.txt"
+    throw "No files found in /tmp!"
   endif
-  let input = input[0]
+  let input = "/tmp/" .. input[0]
 
   let executable = printf("/var/tmp/%s/bin/badge_and_face", g:BUILD_TYPE)
 
-  let cmd = printf("%s -e=%s -i=%s", tool, executable, input)
-  echo 'Running tool...'
+  let cmd = printf("%s %s -e=%s", tool, input, executable)
+  echo printf('Running tool on %s..', input)
   let lines = systemlist(["ssh", g:HOST, cmd])
-  let nr = init#CreateCustomBuffer('Dma Report', lines)
-  bot sp
-  exe "b " .. nr
   if v:shell_error
     echo 'Errors encountered!'
   else
+    let nr = init#CreateCustomBuffer('Memory report', lines)
+    bot sp
+    exe "b " .. nr
     mode
-    setlocal foldexpr=len(matchstr(getline(v:lnum),'^-*'))
-    setlocal foldmethod=expr
-    setlocal foldenable
   endif
 endfunction
 
@@ -893,15 +904,15 @@ function! s:FakeImage()
   for [repo, branch, bitbake] in targets
     " Find new hash
     exe "e " .. repo
-    call init#WorkTreeCleanOrThrow()
+    call git#CleanOrThrow()
 
     " Check if unpushed
-    let new_branch = init#BranchName()
+    let new_branch = git#GetBranch()
     if empty(new_branch)
       throw "Repo " .. repo .. " does not have a branch!"
     endif
-    let new_hash = init#HashOrThrow(new_branch)
-    if new_hash != init#HashOrThrow("origin/" .. new_branch)
+    let new_hash = git#HashOrThrow(new_branch)
+    if new_hash != git#HashOrThrow("origin/" .. new_branch)
       let msg = "You have unpushed changes in " .. repo
       call init#Warn(msg)
     endif
@@ -944,11 +955,7 @@ function! s:ReverseImage()
     q
     " Checkout hash
     exe "tabnew " .. repo
-    let dict = FugitiveExecute(['checkout', hash])
-    if dict['exit_status'] != 0
-      call init#ShowErrors(dict['stdout'])
-      throw "Failed to checkout in " .. repo
-    endif
+    call git#ExecuteOrThrow(['checkout', hash], "Failed to checkout in " .. repo)
     exe "G log"
   endfor
 endfunction
@@ -958,6 +965,29 @@ function! s:FactoryReset()
   enew
   call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
 endfunction
+
+function! s:GetIp(...)
+  let host = get(a:000, 0, "")
+  if str2nr(host) > 0
+    let ip = "10.1.20." .. host
+  else
+    if empty(host)
+      let host = g:HOST
+    endif
+    let ssh_config = systemlist(["ssh", "-G", host])
+    call filter(ssh_config, 'v:val =~ "^hostname"')
+    let ip = split(ssh_config[0])[1]
+  endif
+  return ip
+endfunction
+
+function! s:CopyIp(args)
+  let ip = s:GetIp(a:args)
+  call init#ToClipboard(ip)
+endfunction
+
+command! -nargs=? -complete=customlist,HostCompl Ip call s:CopyIp(<q-args>)
+cabbr IP Ip
 
 function! s:Trust(...)
   let host = get(a:000, 0, g:HOST)
@@ -995,28 +1025,22 @@ function! work#FetchAI()
   echo "Fetching from origin..."
 
   e ~/aidistro/repo
-  call init#WorkTreeCleanOrThrow()
+  call git#CleanOrThrow()
 
-  let dict = FugitiveExecute(["checkout", "master"])
-  let dict = FugitiveExecute(["pull", "origin", "master"])
-  if dict['exit_status'] != 0
-    throw "Failed to pull aidistro"
-  endif
+  call git#ExecuteOrThrow(["checkout", "master"], "Failed to checkout aidistro master")
+  call git#ExecuteOrThrow(["pull", "origin", "master"], "Failed to pull aidistro")
 
   for [repo, branch, _] in targets
     " Find new hash
     exe "e " .. repo
-    let dict = FugitiveExecute(["fetch", "origin", branch])
-    if dict['exit_status'] != 0
-      throw "Fetch in " .. repo .. " failed"
-    endif
+    call git#ExecuteOrThrow(["fetch", "origin", branch], "Fetch in " .. repo .. " failed")
   endfor
 
   echo "Fetching completed!"
   for [repo, branch, bitbake] in targets
     " Find new hash
     exe "e " .. repo
-    let new_hash = init#HashOrThrow("origin/" .. branch)
+    let new_hash = git#HashOrThrow("origin/" .. branch)
     " Find old hash
     let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
     call jobwait([id])
@@ -1045,11 +1069,8 @@ function! work#CommitAI()
         \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
 
   e ~/aidistro/repo
-  let dict = FugitiveExecute(["diff", "--name-only", "--cached"])
-  if dict['exit_status'] != 0 || dict['stdout'][0] == ''
-    throw "Cannot determine what changed in aidistro."
-  endif
-  let staged = dict['stdout']
+  let cmd = ["diff", "--name-only", "--cached"]
+  let staged = git#ExecuteOrThrow(cmd, "Cannot determine what changed in aidistro.")
   for [repo, branch, bitbake] in reverse(targets)
     let staged_bitbake = filter(copy(staged), 'stridx(v:val, bitbake) >= 0')
     if empty(staged_bitbake)
@@ -1057,11 +1078,8 @@ function! work#CommitAI()
     endif
     " Get commit message. This is needed to create the branch and the commit
     exe "e " .. repo
-    let dict = FugitiveExecute(["log", "-1", "--format=%B", "origin/" .. branch])
-    if dict['exit_status'] != 0
-      throw "Cannot determine commit message for " .. repo
-    endif
-    let msg = dict['stdout'][0]
+    let cmd = ["log", "-1", "--format=%B", "origin/" .. branch]
+    let msg = git#ExecuteOrThrow(cmd, "Cannot determine commit message for " .. repo)[0]
     let issue = matchstr(msg, 'SW-[0-9]\{4\}')
     " Create branch
     e ~/aidistro/repo
@@ -1070,15 +1088,10 @@ function! work#CommitAI()
     else
       let ai_branch = "stef/" .. issue .. "/ai"
     endif
-    let dict = FugitiveExecute(["checkout", "-b", ai_branch])
-    if dict['exit_status'] != 0
-      throw "Failed to create branch " .. ai_branch
-    endif
+    let cmd = ["checkout", "-b", ai_branch]
+    call git#ExecuteOrThrow(cmd, "Failed to create branch " .. ai_branch)
     let ai_msg = repo[2:] .. ": " .. msg
-    let dict = FugitiveExecute(["commit", "-m", ai_msg])
-    if dict['exit_status'] != 0
-      throw printf("Failed to commit changes with message '%s'", ai_msg)
-    endif
+    call git#ExecuteOrThrow(["commit", "-m", ai_msg])
     " Success
     exe "Gdrop " .. ai_branch
     return
@@ -1092,30 +1105,18 @@ endfunction
 
 function! work#PushAI()
   e ~/aidistro/repo
-  let dict = FugitiveExecute(["push", "origin", "HEAD"])
-  if dict['exit_status'] != 0
-    throw "Failed to push branch to origin"
-  endif
+  call git#ExecuteOrThrow(["push", "origin", "HEAD"], "Failed to push branch to origin")
   call init#ToClipboard("https://gitlab.com/Rainbe/Firmware/aidistro/-/merge_requests")
 endfunction
 
 function! work#CleanUpAI()
   e ~/aidistro/repo
-  let branch = init#CheckedBranchOrThrow()
-  let dict = FugitiveExecute(["checkout", "master"])
-  if dict['exit_status'] != 0
-    throw "Failed to checkout master"
-  endif
+  let branch = git#GetBranchOrThrow()
+  call git#ExecuteOrThrow(["checkout", "master"], "Failed to checkout master")
   " Not the end of the world if this fails.
-  call FugitiveExecute(["reset", "--hard"])
-  let dict = FugitiveExecute(["pull", "origin", "master"])
-  if dict['exit_status'] != 0
-    throw "Failed to pull new changes"
-  endif
-  let dict = FugitiveExecute(["branch", "-D", branch])
-  if dict['exit_status'] != 0
-    throw "Failed to delete newly created branch"
-  endif
+  call git#ExecuteOrThrow(["reset", "--hard"])
+  call git#ExecuteOrThrow(["pull", "origin", "master"], "Failed to pull new changes")
+  call git#ExecuteOrThrow(["branch", "-D", branch], "Failed to delete newly created branch")
   let issue = matchstr(branch, 'SW-[0-9]\{4\}')
   if !empty(issue)
     call work#OpenJira(issue)
@@ -1143,9 +1144,8 @@ function! work#OpenJira(issue)
 endfunction
 
 function! s:ShowActivity()
-  " TODO FugitiveExecute on all locations...
   let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
-  let branches = init#FugitiveExecuteOrThrow(cmd)
+  let branches = git#ExecuteOrThrow(cmd, "Failed to fetch recent commits!")
   call filter(branches, '!empty(v:val)')
   call init#CreateCustomQuickfix('Branches', branches, 'work#OnIssueSelected')
 endfunction
@@ -1174,16 +1174,12 @@ function! s:OpenCurrent()
 endfunction
 
 function! s:CopyBranch()
-  call init#ToClipboard(init#BranchName())
+  call init#ToClipboard(git#GetBranch())
 endfunction
 
 function! s:CopyHash()
-  let dict = FugitiveExecute(['rev-parse', 'HEAD'])
-  if dict['exit_status'] != 0
-    throw "Failed to parse " .. a:commitish
-  endif
-  let hash = dict['stdout'][0]
-  call init#ToClipboard(hash)
+  let hash = git#ExecuteOrThrow(['rev-parse', 'HEAD'], "Failed to parse HEAD")
+  call init#ToClipboard(hash[0])
 endfunction
 
 function! s:MessageSearch(...)
@@ -1231,7 +1227,7 @@ function! s:OnVimEnter()
   call s:InstallHostCommands()
   call s:StartMaster()
   " Start RSI on the second workspace
-  call RsiEnable("2")
+  call RsiEnableOn("2")
 endfunction
 
 augroup Work
