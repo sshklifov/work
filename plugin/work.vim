@@ -537,7 +537,7 @@ endfunction
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>, v:false)
 "}}}
 
-""""""""""""""""""""""""""""Utility functions"""""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""DO"""""""""""""""""""""""""""" {{{
 function s:Do(cmd, ...)
   let Partial = function("s:" .. a:cmd, a:000)
   try
@@ -1096,7 +1096,7 @@ function! work#CommitAI()
     exe "Gdrop " .. ai_branch
     return
   endfor
-  throw "Unexpected failure, fixme!"
+  throw "No changes detected!"
 endfunction
 
 function! work#TestAI()
@@ -1221,6 +1221,51 @@ endfunction
 
 command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 " }}}
+
+function! s:Disassemble(dyn, exe)
+  let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, a:exe))
+  call map(funcs, 'split(v:val)')
+  call filter(funcs, 'toupper(v:val[1]) == "W" || toupper(v:val[1]) == "T"')
+  call map(funcs, 'v:val[2]')
+
+  if empty(funcs)
+    echo "No symbols!"
+    return
+  endif
+  let unmangled = systemlist("c++filt", funcs)
+  call init#CreateCustomQuickfix('Symbols', unmangled, function('s:SelectSymbol', [a:exe]))
+  " Much faster than binding it in above 'function'.
+  let b:mangled_names = funcs
+endfunction
+
+function! s:SelectSymbol(exe)
+  let idx = line('.') - 1
+  let mangled = b:mangled_names[idx]
+  quit
+
+  let objdump = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
+  let disas = systemlist(printf('%s -S --disassemble=%s %s', objdump, mangled, a:exe))
+  let nr = init#CreateCustomBuffer('Disassembly', disas)
+  below split
+  exe "b " .. nr
+  call setbufvar(nr, '&expandtab', v:false)
+  call setbufvar(nr, '&smarttab', v:false)
+  call setbufvar(nr, '&softtabstop', 0)
+  call setbufvar(nr, '&tabstop', 8)
+  call setbufvar(nr, '&list', v:false)
+endfunction
+
+command! -nargs=1 -bang -complete=customlist,DisassembleCompl Disassemble call s:Disassemble(<bang>0 ? 'D' : '', <q-args>)
+
+function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  let files = []
+  call add(files, printf("/home/%s/badge-and-face/%s/bin/badge_and_face", $USER, g:BUILD_TYPE))
+  call add(files, printf("/home/%s/badge-and-face-rock/%s/bin/badge_and_face", $USER, g:BUILD_TYPE))
+  return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
+endfunction
 
 function! s:OnVimEnter()
   " Install commands for the first time
