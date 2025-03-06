@@ -23,7 +23,8 @@ autocmd FileType gitcommit call s:OnNewCommit()
 
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function s:ObsidianMake(...)
+
+function! s:GetMakeCommand(force_configure)
   let repo = FugitiveWorkTree()
   if empty(repo)
     echo "Not inside repo"
@@ -34,20 +35,10 @@ function s:ObsidianMake(...)
         \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
         \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
         \ "badge-and-face-rock" ]
-  if index(obsidian_repos, repo) < 0
+  if index(whitelist_repos, repo) < 0
     echo "Unsupported repo: " . repo
-    return
+    return []
   endif
-
-  let common_flags = [
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR)]
-  if g:BUILD_TYPE == "Debug"
-    let common_flags += ["-O0", "-ggdb", "-U_FORTIFY_SOURCE"]
-  else
-    let common_flags += ["-O2", "-g1"]
-  endif
-  let common_flags = join(common_flags)
 
   let cmds = []
   call add(cmds, printf("cd %s", FugitiveWorkTree()))
@@ -55,8 +46,11 @@ function s:ObsidianMake(...)
   if repo == 'alcatraz-ml-library'
     call add(cmds, "export ParavisionSDKType=ROCKCHIP")
   endif
-  call add(cmds, "export CXXFLAGS=" . string(common_flags))
-  call add(cmds, "export CFLAGS=" . string(common_flags))
+
+  let sdk_flags = [
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR)]
+  call add(cmds, "export CXXFLAGS=" . string(join(sdk_flags)))
 
   if repo == 'camera_engine_rkaiq'
     let cmake = printf("cmake -S. -B%s -DCMAKE_BUILD_TYPE=%s", g:BUILD_TYPE, g:BUILD_TYPE)
@@ -66,19 +60,45 @@ function s:ObsidianMake(...)
   else
     let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s -DCMAKE_INSTALL_PREFIX=/usr", g:BUILD_TYPE, g:BUILD_TYPE)
   endif
+
+  if repo == 'libalcatraz'
+    let cmake .= " -DPRELOAD_OPENCV_MAT_SUPPORT=1"
+    if stridx(g:DEVICE, "onyx") >= 0
+      let cmake .= " -DPLATFORM=onyx"
+    elseif stridx(g:DEVICE, "rockx") >= 0
+      let cmake .= " -DPLATFORM=obsidian-dm"
+    endif
+  endif
+
+  " Build specific flags
+  if g:BUILD_TYPE == 'Release'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_RELEASE=-g1'
+  elseif g:BUILD_TYPE == 'RelWithDebinfo'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-Og -g"'
+  elseif g:BUILD_TYPE == 'Debug'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_DEBUG="-O0 -ggdb -U_FORTIFY_SOURCE"'
+  endif
+
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
-  call add(cmds, cmake)
+  let build_dir = printf("%s/%s", FugitiveWorkTree(), g:BUILD_TYPE)
+  if a:force_configure || !isdirectory(build_dir)
+    call add(cmds, cmake)
+  endif
   call add(cmds, build)
   let command = ["/bin/bash", "-c", join(cmds, ';')]
-
-  let bang = get(a:, 1, "")
-  return Make(command, bang)
+  return command
 endfunction
 
-command! -nargs=? -complete=customlist,BuildCompl Debug let g:BUILD_TYPE = "Debug"
+command! -nargs=0 -bang Configure call Make(s:GetMakeCommand(v:true), "<bang>")
+command! -nargs=0 -bang Reconfigure Configure<bang>
+command! -nargs=0 -bang Make call Make(s:GetMakeCommand(v:false), "<bang>")
 
-command! -nargs=? -complete=customlist,BuildCompl Release let g:BUILD_TYPE = "Release"
+command! -nargs=0 Debug let g:BUILD_TYPE = "Debug"
+
+command! -nargs=0 Release let g:BUILD_TYPE = "Release"
+
+command! -nargs=0 RelWithDeb let g:BUILD_TYPE = "RelWithDebinfo"
 
 function! s:ResolveEnvFile()
   let fname = expand("%:f")
@@ -112,20 +132,15 @@ function! s:ResolveEnvFile()
   endif
 endfunction
 
-command! -nargs=0 -bang Make call <SID>ObsidianMake("<bang>")
-command! -nargs=0 -bang Remake exe "Clean" | exe "Make<bang>"
 command! -nargs=0 Clean call system("rm -rf " . FugitiveFind(g:BUILD_TYPE))
+command! -nargs=0 -bang Remake exe "Clean" | exe "Make<bang>"
 nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 "}}}
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:Journal(bang, arg)
-  let output = systemlist(["ssh", g:HOST, 'cat ' .. a:arg])
-  if v:shell_error
-    call init#ShowErrors(output)
-    return
-  endif
+  let output = init#SystemOrThrow(["ssh", g:HOST, 'cat ' .. a:arg])
   let service_name = fnamemodify(a:arg, ':t:r')
   let m = matchstrlist(output, 'Description=\(.*\)', #{submatches: v:true})
   if !exists("m[0].submatches[0]")
@@ -133,22 +148,15 @@ function! s:Journal(bang, arg)
     return
   endif
   let msg = "Started " .. m[0].submatches[0] .. "."
-  let output = systemlist(["ssh", g:HOST, printf('journalctl MESSAGE="%s" -r -o short-unix', msg)])
-  if v:shell_error
-    call init#ShowErrors(output)
-    return
-  endif
+  let cmd = printf('journalctl MESSAGE="%s" -r -o short-unix', msg)
+  let output = init#SystemOrThrow(["ssh", g:HOST, cmd])
 
   if stridx(output[0], "No entries") < 0
     let timestamp = split(output[0])[0]
   else
     let timestamp = 0
   endif
-  let output = systemlist(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
-  if v:shell_error
-    call init#ShowErrors(output)
-    return
-  endif
+  let output = init#SystemOrThrow(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
   let since = output[0]
   let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
 
@@ -157,9 +165,7 @@ function! s:Journal(bang, arg)
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
-    let nr = init#CreateCustomBuffer('Journal ' .. service_name, lines)
-    sp
-    exe "b " .. nr
+    call init#CreatebottomBuffer('Journal ' .. service_name, lines)
   endif
 endfunction
 
@@ -175,6 +181,14 @@ function! JournalCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 command! -nargs=1 -bang -complete=customlist,JournalCompl Journal call s:Journal("<bang>", <q-args>)
+
+function! s:SshTerminal()
+  below sp
+  enew
+  call termopen(["ssh", g:HOST])
+endfunction
+
+command! -nargs=0 T call s:SshTerminal()
 
 function! s:SshfsOnSteroids(what)
   if empty(a:what)
@@ -210,11 +224,11 @@ function! SshfsCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine) || g:BUILD_TYPE == "Release"
+  if a:CursorPos < len(a:CmdLine)
     return []
   endif
   let pat = "*" . a:ArgLead . "*"
-  let find = "find /var/tmp/Debug -name " . shellescape(pat) . " -type f -executable"
+  let find = printf("find /var/tmp/%s -name %s -type f -executable", g:BUILD_TYPE, shellescape(pat))
   let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
   return filter(result, 'v:val !~ ".sh$"')
 endfunction
@@ -285,7 +299,7 @@ function! s:Resync()
   if !empty(pat)
     exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s', '%s')", dir, pat)
   endif
-  call s:ObsidianMake()
+  call Make(s:GetMakeCommand(v:false))
 endfunction
 
 " command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
@@ -293,11 +307,7 @@ endfunction
 function s:MakeNiceApp(exe)
   if get(g:, 'CAPABILITIES', 1)
     let exe = split(a:exe, " ")[0]
-    let msg = systemlist(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
-    if v:shell_error
-      call init#ShowErrors(msg)
-      throw "Failed to prepare " . exe
-    endif
+    call init#SystemOrThrow(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
   else
     call init#Warn("Capabilities are disabled!")
   endif
@@ -325,6 +335,8 @@ endfunction
 
 function! work#Debug(exe, opts)
   let opts = extend(a:opts, s:PrepareApp(a:exe))
+  " TODO hacky code
+  let opts['exe'] = a:exe
   let opts['ssh'] = g:HOST
   if !has_key(opts, 'post_cmds')
     let opts['post_cmds'] = []
@@ -489,7 +501,11 @@ function! s:InstallHostCommands()
 endfunction
 
 function! s:ChangeHost(host, tried_to_trust)
-  let host = empty(a:host) ? "max_p15" : a:host
+  if empty(a:host)
+    echo "Current host is: " .. g:HOST
+    return
+  endif
+  let host = a:host
   call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
   if v:shell_error != 0
     " Yikes recursion???
@@ -553,11 +569,11 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
-        \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage",
+        \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
         \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
-        \ "FactoryReset", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "MemoryMonitor", "EnableCore"]
+        \ "FactoryReset", "Enrol", "Trust", "HostDebugSyms", "PlotTrace",
+        \ "BarfPlotTrace", "OpenCV", "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -570,9 +586,9 @@ function! s:StopServices()
         \ "qrcode-scanner",
         \ "obsidian-video"
         \ ]
-  if stridx(g:DEVICE_TYPE, "rockx") >= 0
+  if stridx(g:DEVICE, "rockx") >= 0
     call add(stop_list, "obsidian-video")
-  elseif stridx(g:DEVICE_TYPE, "onyx") >= 0
+  elseif stridx(g:DEVICE, "onyx") >= 0
     call add(stop_list, "rock-video")
   endif
 
@@ -582,14 +598,7 @@ function! s:StopServices()
     call add(cmds, cmd)
   endfor
 
-  let msg = systemlist(["ssh", g:HOST, join(cmds, ";")])
-  if v:shell_error
-    bot new
-    setlocal buftype=nofile
-    call setline(1, msg[0])
-    call append(1, msg[1:])
-    throw "Failed to stop services"
-  endif
+  call init#SystemOrThrow(["ssh", g:HOST, join(cmds, ";")])
   echo "Stopped."
 endfunction
 
@@ -690,6 +699,17 @@ function! s:ShowImage()
   echo img
 endfunction
 
+function! s:SaveImage(name)
+  if empty(a:name)
+    echo "Expecting name!"
+    return
+  endif
+  let img = s:FindImage()
+  let dest = printf("/home/%s/Downloads/%s.mender", $USER, a:name)
+  call init#SystemOrThrow(printf("cp %s %s", img, dest))
+  echo "Copied to " .. dest .. "."
+endfunction
+
 function! s:InstallImage()
   let most_recent_image = s:FindImage()
   let most_recent_timestamp = getftime(most_recent_image)
@@ -754,32 +774,30 @@ function! s:FakeMpp()
   startinsert
 endfunction
 
-function! s:HostDebugSyms(pat)
+function! s:HostDebugSyms(...)
   let dir = g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/lib/.debug"
-  let pat = ".*" .. a:pat .. ".*"
-  let files = systemlist(["find", dir, "-regex", pat])
-  let bytes = 0
-  for file in files
-    let bytes += getfsize(file)
-  endfor
-  let max_bytes = 300 * 1000 * 1000
-  if bytes > max_bytes
-    echo printf("Too many debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
-    return
-  endif
-
-  let remote_dir = g:HOST . ":/usr/lib/.debug"
-  let msg = systemlist(printf("rsync -lt %s %s", join(files), remote_dir))
-  if v:shell_error
-    call init#ShowErrors(msg)
+  let show_only = (a:0 == 0)
+  if show_only
+    let pat = ".*"
   else
-    botr split
-    enew
-    let so = map(files, "fnamemodify(v:val, ':t')")
-    call setline(1, so)
-    set nomodified
-    echo "Debug symbols installed!"
+    let pat = ".*" .. a:1 .. ".*"
   endif
+  let files = systemlist(["find", dir, "-regex", pat])
+  if !show_only
+    let bytes = 0
+    for file in files
+      let bytes += getfsize(file)
+    endfor
+    let max_bytes = 300 * 1000 * 1000
+    if bytes > max_bytes
+      echo printf("Too many debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
+      return
+    endif
+
+    let remote_dir = g:HOST . ":/usr/lib/.debug"
+    call init#SystemOrThrow(printf("rsync -lt %s %s", join(files), remote_dir))
+  endif
+  call init#CreateBottomBuffer("Debug symbols", files)
 endfunction
 
 function! s:PlotTrace(name)
@@ -835,11 +853,7 @@ function! s:BarfPlotTrace(name)
   call add(cmds, "mkdir -p " .. parse_input)
   call add(cmds, "mkdir -p " .. plot_output)
   call add(cmds, printf("scp %s:/tmp/%s %s", g:HOST, trace_txt, parse_input))
-  let output = systemlist(join(cmds, ";"))
-  if v:shell_error
-    call init#ShowErrors(output)
-    throw "Failed to obtain debug info"
-  endif
+  call init#SystemOrThrow(join(cmds, ";"))
 
   let local_txt = expand(printf("%s/%s", parse_input, trace_txt))
   let lines = readfile(local_txt)
@@ -856,6 +870,23 @@ function! s:BarfPlotTrace(name)
   lcd ~/libalcatraz/tracing/scripts
   enew
   call termopen(join(cmds, " && "), #{})
+endfunction
+
+function! s:OpenCV()
+  let file = printf("~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so.1.0.0", g:BUILD_TYPE)
+  let file = fnamemodify(file, ":p")
+  if !filereadable(file)
+    echo "Preload library not found!"
+    return
+  endif
+  let ts = localtime() - getftime(file)
+  let cmds = []
+  call add(cmds, printf("echo Copying over library from %dm ago", ts / 60))
+  call add(cmds, printf("scp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s:/usr/lib", g:BUILD_TYPE, g:HOST))
+  call add(cmds, printf("ssh %s chmod +s /usr/lib/libalcatraz_opencv_mat.so*", g:HOST))
+  bot sp
+  enew
+  call termopen(join(cmds, ";"))
 endfunction
 
 function! s:MemoryMonitor()
@@ -875,32 +906,36 @@ function! s:MemoryMonitor()
 
   let cmd = printf("%s %s -e=%s", tool, input, executable)
   echo printf('Running tool on %s..', input)
-  let lines = systemlist(["ssh", g:HOST, cmd])
-  if v:shell_error
-    echo 'Errors encountered!'
-  else
-    let nr = init#CreateCustomBuffer('Memory report', lines)
-    bot sp
-    exe "b " .. nr
-    mode
-  endif
+  let lines = init#SystemOrThrow(["ssh", g:HOST, cmd])
+
+  call init#CreateBottomBuffer('Memory report', lines)
+  mode
 endfunction
 
 function! s:EnableCore()
-  let output = systemlist(["ssh", g:HOST, '/usr/bin/bash -c "echo 1 > /proc/sys/fs/suid_dumpable"'])
-  if v:shell_error
-    call init#ShowErrors(output)
+  call init#SystemOrThrow(["ssh", g:HOST, '/usr/bin/bash -c "echo 1 > /proc/sys/fs/suid_dumpable"'])
+  call init#ToClipboard("cd /tmp && ulimit -c unlimited")
+endfunction
+
+function s:GetTargets()
+  if stridx(g:DEVICE, "onyx") >= 0
+    let targets = [
+          \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
+          \ ["~/rock-video", "master", "rock-video_git.bb"],
+          \ ["~/badge-and-face-rock", "master", "badge-and-face_git.bb"]]
+  elseif stridx(g:DEVICE, "rockx") >= 0
+    let targets = [
+          \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
+          \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
+          \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
   else
-    echo "suid_dumpable set to true."
+    throw "Unknown device: " .. g:DEVICE
   endif
+  return targets
 endfunction
 
 function! s:FakeImage()
-  let targets = [
-        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
-        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
-
+  let targets = s:GetTargets()
   for [repo, branch, bitbake] in targets
     " Find new hash
     exe "e " .. repo
@@ -938,11 +973,7 @@ function! s:FakeImage()
 endfunction
 
 function! s:ReverseImage()
-  let targets = [
-        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
-        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
-
+  let targets = s:GetTargets()
   for [repo, branch, bitbake] in targets
     " Find hash
     sp
@@ -964,6 +995,19 @@ function! s:FactoryReset()
   botr split
   enew
   call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
+endfunction
+
+function! s:Enrol()
+  let cmds = []
+  call add(cmds, 'redis-cli SET config:device.role "\"one-fa\""' )
+  call add(cmds, 'redis-cli SET config:enrollment.enabled true' )
+  call add(cmds, 'redis-cli SET config:enrollment.min_time 5' )
+  call add(cmds, 'redis-cli SET config:enrollment.respect_acs false' )
+  call systemlist(["ssh", g:HOST, join(cmds, ";")])
+  if !v:shell_error
+    call s:SshTerminal()
+    echo "Please run mcu-inject-badge!"
+  endif
 endfunction
 
 function! s:GetIp(...)
@@ -1014,14 +1058,10 @@ endfunction
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
 "}}}
 
-""""""""""""""""""""""""""""AI distro"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""AI"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#FetchAI()
-  let targets = [
-        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
-        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
-
+  let targets = s:GetTargets()
   echo "Fetching from origin..."
 
   e ~/aidistro/repo
@@ -1063,10 +1103,7 @@ function! work#FetchAI()
 endfunction
 
 function! work#CommitAI()
-  let targets = [
-        \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-        \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
-        \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
+  let targets = s:GetTargets()
 
   e ~/aidistro/repo
   let cmd = ["diff", "--name-only", "--cached"]
@@ -1127,7 +1164,7 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let items = ["Fetch", "Commit", "Test", "Push", "CleanUp"]
+  let items = ["Fetch", "Test", "Commit", "Push", "CleanUp"]
   return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
@@ -1222,6 +1259,8 @@ endfunction
 command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 " }}}
 
+""""""""""""""""""""""""""""Disas"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:Disassemble(dyn, exe)
   let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, a:exe))
   call map(funcs, 'split(v:val)')
@@ -1245,9 +1284,7 @@ function! s:SelectSymbol(exe)
 
   let objdump = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
   let disas = systemlist(printf('%s -S --disassemble=%s %s', objdump, mangled, a:exe))
-  let nr = init#CreateCustomBuffer('Disassembly', disas)
-  below split
-  exe "b " .. nr
+  let nr = init#CreateBottomBuffer('Disassembly', disas)
   call setbufvar(nr, '&expandtab', v:false)
   call setbufvar(nr, '&smarttab', v:false)
   call setbufvar(nr, '&softtabstop', 0)
@@ -1278,3 +1315,4 @@ endfunction
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
 augroup END
+" }}}
