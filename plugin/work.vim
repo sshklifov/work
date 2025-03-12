@@ -72,9 +72,9 @@ function! s:GetMakeCommand(force_configure)
 
   " Build specific flags
   if g:BUILD_TYPE == 'Release'
-    let cmake .= ' -DCMAKE_CXX_FLAGS_RELEASE=-g1'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_RELEASE="-g1 -fno-omit-frame-pointer"'
   elseif g:BUILD_TYPE == 'RelWithDebinfo'
-    let cmake .= ' -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-Og -g"'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-Og -g2"'
   elseif g:BUILD_TYPE == 'Debug'
     let cmake .= ' -DCMAKE_CXX_FLAGS_DEBUG="-O0 -ggdb -U_FORTIFY_SOURCE"'
   endif
@@ -165,7 +165,7 @@ function! s:Journal(bang, arg)
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
-    call init#CreatebottomBuffer('Journal ' .. service_name, lines)
+    call init#CustomBottomBuffer('Journal ' .. service_name, lines)
   endif
 endfunction
 
@@ -233,7 +233,7 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
   return filter(result, 'v:val !~ ".sh$"')
 endfunction
 
-function! s:RemoteSync(arg, ...)
+function! s:RemoteSync(arg, pat, ...)
   function! OnStdout(id, data, event)
     for data in a:data
       let text = substitute(data, '\n', '', 'g')
@@ -268,8 +268,8 @@ function! s:RemoteSync(arg, ...)
 
   let cmd = ["rsync", "-rlt"]
 
-  let pat = get(a:000, 0, "")
-  let pat = empty(pat) ? ".*" : printf(".*%s.*", pat)
+  let load_results = a:0 > 0
+  let pat = printf(".*%s.*", a:pat)
   " Include all directories
   call add(cmd, '--include=*/')
   " Include all executables
@@ -281,19 +281,23 @@ function! s:RemoteSync(arg, ...)
   call add(cmd, '--exclude=*')
 
   call extend(cmd, ["--info=progress2", dir, remote_dir])
-  return jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
+  let id = jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
+  if load_results
+    call map(exes, 'printf("/var/tmp/%s/%s", g:BUILD_TYPE, v:val)')
+    call init#CustomBottomBuffer('Synced', exes)
+  endif
 endfunction
 
-command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>)
+command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>, 1)
 
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
   let pat = ".*"
-  if stridx(dir, "obsidian-video") > 0
+  if stridx(dir, "obsidian-video") >= 0
     let pat = "obsidian-video"
-  elseif stridx(dir, "badge-and-face") > 0
+  elseif stridx(dir, "badge-and-face") >= 0
     let pat = "badge_and_face"
-  elseif stridx(dir, "libalcatraz") > 0
+  elseif stridx(dir, "libalcatraz") >= 0 || stridx(dir, "alcatraz-ml-library") >= 0
     let pat = ""
   endif
   if !empty(pat)
@@ -571,8 +575,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
         \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
         \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
-        \ "FakeSdk", "FakeMpp", "FakeImage", "ReverseImage",
-        \ "FactoryReset", "Enrol", "Trust", "HostDebugSyms", "PlotTrace",
+        \ "FakeMpp", "FakeImage", "ReverseImage", "FactoryReset",
+        \ "Enrol", "Trust", "HostDebugSyms", "PlotTrace",
         \ "BarfPlotTrace", "OpenCV", "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
@@ -584,7 +588,6 @@ function! s:StopServices()
         \ "rtsp-server.service",
         \ "badge-and-face",
         \ "qrcode-scanner",
-        \ "obsidian-video"
         \ ]
   if stridx(g:DEVICE, "rockx") >= 0
     call add(stop_list, "obsidian-video")
@@ -747,12 +750,26 @@ endfunction
 
 function! s:FakeSdk()
   let cmds = []
-  let repo_dir = $HOME .. "/libalcatraz"
-  let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
+  let repo_dir = FugitiveWorkTree()
+  if stridx(repo_dir, "libalcatraz") >= 0
+    let so_name = "libalcatraz.so"
+    let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
+    let pc = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
+    call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
+  elseif stridx(repo_dir, "alcatraz-ml-library") >= 0
+    let so_name = "libalcatraz_ml.so"
+    let so_pattern = printf("%s/%s/src/libalcatraz_ml.so*", repo_dir, g:BUILD_TYPE)
+    let pc = printf("%s/%s/libalcatraz_ml.pc", repo_dir, g:BUILD_TYPE)
+    call add(cmds, printf("rsync -rtv %s/include/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/ml", repo_dir, g:SDK_DIR))
+  else
+    echo "No repo matched!"
+    return
+  endif
+
+  " Remove old versions of the library
+  call add(cmds, printf("rm  %s/sysroots/armv8a-aisys-linux/usr/lib/%s*", g:SDK_DIR, so_name))
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
-  let pc_pattern = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc_pattern, g:SDK_DIR))
-  call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
+  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
   split
@@ -797,7 +814,7 @@ function! s:HostDebugSyms(...)
     let remote_dir = g:HOST . ":/usr/lib/.debug"
     call init#SystemOrThrow(printf("rsync -lt %s %s", join(files), remote_dir))
   endif
-  call init#CreateBottomBuffer("Debug symbols", files)
+  call init#CustomBottomBuffer("Debug symbols", files)
 endfunction
 
 function! s:PlotTrace(name)
@@ -882,6 +899,7 @@ function! s:OpenCV()
   let ts = localtime() - getftime(file)
   let cmds = []
   call add(cmds, printf("echo Copying over library from %dm ago", ts / 60))
+  call add(cmds, printf("cp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s/sysroots/armv8a-aisys-linux/usr/lib", g:BUILD_TYPE, g:SDK_DIR))
   call add(cmds, printf("scp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s:/usr/lib", g:BUILD_TYPE, g:HOST))
   call add(cmds, printf("ssh %s chmod +s /usr/lib/libalcatraz_opencv_mat.so*", g:HOST))
   bot sp
@@ -889,7 +907,7 @@ function! s:OpenCV()
   call termopen(join(cmds, ";"))
 endfunction
 
-function! s:MemoryMonitor()
+function! s:MemoryMonitor(...)
   let tool = init#RemoteFindFiles(g:HOST, "backtrace_tool")
   if empty(tool)
     throw "Not found: backtrace_tool"
@@ -900,6 +918,13 @@ function! s:MemoryMonitor()
   if empty(input)
     throw "No files found in /tmp!"
   endif
+  if a:0 > 0
+    call filter(input, 'stridx(v:val, a:1) >= 0')
+  endif
+  if empty(input)
+    echo "Nothing to show!"
+    return
+  endif
   let input = "/tmp/" .. input[0]
 
   let executable = printf("/var/tmp/%s/bin/badge_and_face", g:BUILD_TYPE)
@@ -907,8 +932,7 @@ function! s:MemoryMonitor()
   let cmd = printf("%s %s -e=%s", tool, input, executable)
   echo printf('Running tool on %s..', input)
   let lines = init#SystemOrThrow(["ssh", g:HOST, cmd])
-
-  call init#CreateBottomBuffer('Memory report', lines)
+  call init#CustomBottomBuffer('Memory report', lines)
   mode
 endfunction
 
@@ -1032,6 +1056,18 @@ endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Ip call s:CopyIp(<q-args>)
 cabbr IP Ip
+
+function! s:Reboot()
+  let cmds = []
+  call add(cmds, printf("ssh %s reboot", g:HOST))
+  call add(cmds, "echo Waiting for reboot...")
+  call add(cmds, "ssh_wait_silent " .. g:HOST)
+  bot sp
+  enew
+  call termopen(join(cmds, ";"))
+endfunction
+
+command! -nargs=0 Reboot call s:Reboot()
 
 function! s:Trust(...)
   let host = get(a:000, 0, g:HOST)
