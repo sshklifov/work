@@ -1297,18 +1297,23 @@ command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 
 """"""""""""""""""""""""""""Disas"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:Disassemble(dyn, exe)
-  let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, a:exe))
+function! s:Disassemble(dyn, arg)
+  let targets = s:GetDisassembleTargets()->FileFilter(a:arg)
+  if len(targets) != 1
+    return init#CustomBottomBuffer('Matches', targets)
+  endif
+  let exe = targets[0]
+  let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, exe))
   call map(funcs, 'split(v:val)')
   call filter(funcs, 'toupper(v:val[1]) == "W" || toupper(v:val[1]) == "T"')
   call map(funcs, 'v:val[2]')
-
   if empty(funcs)
     echo "No symbols!"
     return
   endif
   let unmangled = systemlist("c++filt", funcs)
-  call init#CreateCustomQuickfix('Symbols', unmangled, function('s:SelectSymbol', [a:exe]))
+  call init#CreateCustomQuickfix('Symbols', unmangled, function('s:SelectSymbol', [exe]))
+  resize 15
   " Much faster than binding it in above 'function'.
   let b:mangled_names = funcs
 endfunction
@@ -1316,29 +1321,99 @@ endfunction
 function! s:SelectSymbol(exe)
   let idx = line('.') - 1
   let mangled = b:mangled_names[idx]
-  quit
 
   let objdump = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
-  let disas = systemlist(printf('%s -S --disassemble=%s %s', objdump, mangled, a:exe))
-  let nr = init#CreateBottomBuffer('Disassembly', disas)
-  call setbufvar(nr, '&expandtab', v:false)
-  call setbufvar(nr, '&smarttab', v:false)
-  call setbufvar(nr, '&softtabstop', 0)
-  call setbufvar(nr, '&tabstop', 8)
-  call setbufvar(nr, '&list', v:false)
+  let disas = systemlist(printf('%s -Sl --disassemble=%s %s', objdump, mangled, a:exe))
+
+  let disas_nr = bufadd('Disassembly')
+  call setbufvar(disas_nr, '&buftype', 'nofile')
+  call setbufvar(disas_nr, '&bufhidden', 'wipe')
+  call bufload(disas_nr)
+
+  let file_line_map = #{}
+  let curr_lines = []
+  for i in range(len(disas))
+    let m = matchlist(disas[i], '^\(/.*\):\([0-9]\+\)')
+    if !empty(m)
+      let curr_file = m[1]
+      " Needed in order to get syntax (init#CopySyntax)
+      exe "e " .. curr_file
+      let curr_lines = getline(1, '$')
+      let curr_pos = 0
+    else
+      let m = matchlist(disas[i], '^\s*\x\+:')
+      if !empty(m)
+        call init#AppendChunksAtEnd(disas_nr, [[disas[i], '@module']])
+      elseif !empty(curr_lines)
+        let idx = index(curr_lines[curr_pos:], disas[i])
+        if idx >= 0
+          let curr_pos += idx + 1
+          call init#CopySyntax(curr_pos, disas_nr)
+          if !has_key(file_line_map, curr_file)
+            let file_line_map[curr_file] = #{}
+          endif
+          let line_map = file_line_map[curr_file]
+          if !has_key(line_map, curr_pos - 1)
+            let line_map[curr_pos - 1] = []
+          endif
+          call add(line_map[curr_pos - 1], nvim_buf_line_count(disas_nr) - 1)
+        else
+          let curr_lines = []
+        endif
+      endif
+    endif
+  endfor
+
+  call setbufvar(disas_nr, '&expandtab', v:false)
+  call setbufvar(disas_nr, '&smarttab', v:false)
+  call setbufvar(disas_nr, '&softtabstop', 0)
+  call setbufvar(disas_nr, '&tabstop', 8)
+  call setbufvar(disas_nr, 'file_line_map', file_line_map)
+
+  for filename in keys(file_line_map)
+    " Needed by LSP to process file
+    exe "e " .. filename
+    let nr = bufnr()
+    exe printf("lua GetSemanticTokens(%d, 'work#TransferExtmarks', {%d, %d})", nr, disas_nr, nr)
+    tabp
+  endfor
+
+  exe "b " .. disas_nr
+  call setbufvar(disas_nr, '&list', v:false)
 endfunction
 
-command! -nargs=1 -bang -complete=customlist,DisassembleCompl Disassemble call s:Disassemble(<bang>0 ? 'D' : '', <q-args>)
+function work#TransferExtmarks(dst_nr, src_nr, in_lnum, in_col, in_opt)
+  let ns = nvim_create_namespace('semantic_tokens')
+  let file_line_map = getbufvar(a:dst_nr, 'file_line_map')
+  let src_pathname = fnamemodify(bufname(a:src_nr), ':p')
+  let line_map = file_line_map[src_pathname]
+  if has_key(line_map, a:in_lnum)
+    let dst_lnums = line_map[a:in_lnum]
+    for dst_lnum in dst_lnums
+      call nvim_buf_set_extmark(a:dst_nr, ns, dst_lnum, a:in_col, a:in_opt)
+    endfor
+  endif
+endfunction
+
+function! s:GetDisassembleTargets()
+  let dir = FugitiveWorkTree()
+  if !isdirectory(dir)
+    return []
+  endif
+  let dir = printf("%s/%s", dir, g:BUILD_TYPE)
+  return systemlist(["find", dir, "-type", "f", "-executable"])
+endfunction
+
+command! -nargs=1 -bang -complete=customlist,DisassembleCompl Disassemble
+      \ call s:Disassemble(<bang>0 ? 'D' : '', <q-args>)
 
 function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let files = []
-  call add(files, printf("/home/%s/badge-and-face/%s/bin/badge_and_face", $USER, g:BUILD_TYPE))
-  call add(files, printf("/home/%s/badge-and-face-rock/%s/bin/badge_and_face", $USER, g:BUILD_TYPE))
-  return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
+  return s:GetDisassembleTargets()->TailItems(a:ArgLead)
 endfunction
+"}}}
 
 function! s:OnVimEnter()
   " Install commands for the first time
