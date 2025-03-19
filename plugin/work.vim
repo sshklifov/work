@@ -586,9 +586,9 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
         \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
         \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
-        \ "FakeMpp", "FakeImage", "ReverseImage", "FactoryReset",
-        \ "Enrol", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "OpenCV", "MemoryMonitor", "EnableCore"]
+        \ "FakeImage", "ReverseImage", "FactoryReset", "Enrol", "Trust",
+        \ "HostDebugSyms", "PlotTrace", "BarfPlotTrace", "OpenCV",
+        \ "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -772,6 +772,10 @@ function! s:FakeSdk()
     let so_pattern = printf("%s/%s/src/libalcatraz_ml.so*", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/%s/libalcatraz_ml.pc", repo_dir, g:BUILD_TYPE)
     call add(cmds, printf("rsync -rtv %s/include/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/ml", repo_dir, g:SDK_DIR))
+    call add(cmds, printf("rsync -tv %s/include/rockchip/alcatraz_ml_sdk.h %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/ml", repo_dir, g:SDK_DIR))
+  elseif stridx(repo_dir, 'mpp') >= 0
+    let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
+    let pc = printf("%s/%s/rockchip_mpp.pc", repo_dir, g:BUILD_TYPE)
   else
     echo "No repo matched!"
     return
@@ -781,19 +785,6 @@ function! s:FakeSdk()
   call add(cmds, printf("rm  %s/sysroots/armv8a-aisys-linux/usr/lib/%s*", g:SDK_DIR, so_name))
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc, g:SDK_DIR))
-  call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
-
-  split
-  enew
-  call termopen(join(cmds, ";"))
-  startinsert
-endfunction
-
-function! s:FakeMpp()
-  let cmds = []
-  let repo_dir = $HOME .. "/mpp"
-  let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
-  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
 
   split
@@ -819,6 +810,7 @@ function! s:HostDebugSyms(...)
     let max_bytes = 300 * 1000 * 1000
     if bytes > max_bytes
       echo printf("Too many debugging symbols selected (%d vs limit %d).", bytes, max_bytes)
+      call init#CustomBottomBuffer('Found objects', files)
       return
     endif
 
@@ -1323,6 +1315,7 @@ function! s:Disassemble(dyn, arg)
     return
   endif
   let unmangled = systemlist("c++filt", funcs)
+  call map(unmangled, 'v:val[:180]')
   call init#CreateCustomQuickfix('Symbols', unmangled, function('s:SelectSymbol', [exe]))
   resize 15
   " Much faster than binding it in above 'function'.
@@ -1386,7 +1379,6 @@ function! s:SelectSymbol(exe)
     exe "e " .. filename
     let nr = bufnr()
     exe printf("lua GetSemanticTokens(%d, 'work#TransferExtmarks', {%d, %d})", nr, disas_nr, nr)
-    tabp
   endfor
 
   exe "b " .. disas_nr
