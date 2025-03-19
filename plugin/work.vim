@@ -94,11 +94,17 @@ command! -nargs=0 -bang Configure call Make(s:GetMakeCommand(v:true), "<bang>")
 command! -nargs=0 -bang Reconfigure Configure<bang>
 command! -nargs=0 -bang Make call Make(s:GetMakeCommand(v:false), "<bang>")
 
-command! -nargs=0 Debug let g:BUILD_TYPE = "Debug"
+function! s:ChangeBuildType(new_type)
+  " Avoids a lot of user errors
+  call system(["ssh", g:HOST, "rm -r /var/tmp/" .. g:BUILD_TYPE])
+  let g:BUILD_TYPE = a:new_type
+endfunction
 
-command! -nargs=0 Release let g:BUILD_TYPE = "Release"
+command! -nargs=0 Debug call s:ChangeBuildType("Debug")
 
-command! -nargs=0 RelWithDeb let g:BUILD_TYPE = "RelWithDebinfo"
+command! -nargs=0 Release call s:ChangeBuildType("Release")
+
+command! -nargs=0 RelWithDeb call s:ChangeBuildType("RelWithDeb")
 
 function! s:ResolveEnvFile()
   let fname = expand("%:f")
