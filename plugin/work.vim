@@ -290,8 +290,13 @@ function! s:RemoteSync(arg, pat, ...)
   let id = jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
   if load_results
     call map(exes, 'printf("/var/tmp/%s/%s", g:BUILD_TYPE, v:val)')
-    call init#CustomBottomBuffer('Synced', exes)
+    call init#CreateCustomQuickfix('Target', exes, function('s:SelectTarget'))
   endif
+endfunction
+
+function s:SelectTarget()
+  call init#ToClipboard(getline('.'))
+  quit
 endfunction
 
 command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>, 1)
