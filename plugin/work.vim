@@ -48,8 +48,8 @@ function! s:GetMakeCommand(force_configure)
   endif
 
   let sdk_flags = [
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/", g:SDK_DIR),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.4.0/aarch64-aisys-linux", g:SDK_DIR)]
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.5.0/", g:SDK_DIR),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.5.0/aarch64-aisys-linux", g:SDK_DIR)]
   call add(cmds, "export CXXFLAGS=" . string(join(sdk_flags)))
 
   if repo == 'camera_engine_rkaiq'
@@ -566,6 +566,49 @@ function! HostCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>, v:false)
+
+function! s:Health()
+  let services = work#GetServices()
+  let qf = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
+  let ns = nvim_create_namespace('services')
+  for idx in range(len(services))
+    let output = systemlist(["ssh", g:HOST, "systemctl is-active " .. services[idx]])
+    if output[0] == 'active'
+      call nvim_buf_set_extmark(qf, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
+    else
+      call nvim_buf_set_extmark(qf, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+    endif
+  endfor
+endfunction
+
+function work#OnSelectedService()
+  let pos = line('.')
+  let service = getline(pos)
+  let ns = nvim_create_namespace('services')
+  let extmarks = nvim_buf_get_extmarks(bufnr(), ns, [pos - 1, 0], [pos - 1, 0], #{details: 1})
+  if empty(extmarks)
+    echo "FIXME!"
+    return
+  endif
+
+  let hl = extmarks[0][3]['line_hl_group']
+  call nvim_buf_del_extmark(bufnr(), ns, extmarks[0][0])
+
+  if hl == 'DiagnosticOk'
+    call systemlist(["ssh", g:HOST, "systemctl stop " .. service])
+  else
+    call systemlist(["ssh", g:HOST, "systemctl start " .. service])
+  endif
+
+  let output = systemlist(["ssh", g:HOST, "systemctl is-active " .. service])
+  if output[0] == 'active'
+    call nvim_buf_set_extmark(bufnr(), ns, pos - 1, 0, #{line_hl_group: 'DiagnosticOk'})
+  else
+    call nvim_buf_set_extmark(bufnr(), ns, pos - 1, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+  endif
+endfunction
+
+command! -nargs=0 Health call s:Health()
 "}}}
 
 """"""""""""""""""""""""""""DO"""""""""""""""""""""""""""" {{{
@@ -592,8 +635,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-function! s:StopServices()
-  let stop_list = [
+function work#GetServices()
+  let services = [
         \ "rtsp-server-noauth",
         \ "rtsp-server.socket",
         \ "rtsp-server.service",
@@ -601,11 +644,15 @@ function! s:StopServices()
         \ "qrcode-scanner",
         \ ]
   if stridx(g:DEVICE, "rockx") >= 0
-    call add(stop_list, "obsidian-video")
+    call add(services, "obsidian-video")
   elseif stridx(g:DEVICE, "onyx") >= 0
-    call add(stop_list, "rock-video")
+    call add(services, "rock-video")
   endif
+  return services
+endfunction
 
+function! s:StopServices()
+  let stop_list = work#GetServices()
   let cmds = []
   for service in stop_list
     let cmd = "systemctl stop " . service
