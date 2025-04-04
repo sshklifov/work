@@ -570,42 +570,42 @@ command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>
 function! s:Health()
   let services = work#GetServices()
   let qf = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
+  call s:HighlightServices(qf)
+endfunction
+
+function! s:HighlightServices(bufnr)
+  let services = getbufline(a:bufnr, 1, '$')
+  let cmd = "systemctl is-active " .. join(services, " ")
+  let activity = systemlist(["ssh", g:HOST, cmd])
+
   let ns = nvim_create_namespace('services')
+  let ret = []
   for idx in range(len(services))
-    let output = systemlist(["ssh", g:HOST, "systemctl is-active " .. services[idx]])
-    if output[0] == 'active'
-      call nvim_buf_set_extmark(qf, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
+    let extmarks = nvim_buf_get_extmarks(a:bufnr, ns, [idx, 0], [idx, 0], #{details: 1})
+    if !empty(extmarks)
+      call nvim_buf_del_extmark(a:bufnr, ns, extmarks[0][0])
+    endif
+    if activity[idx] == 'active'
+      call add(ret, v:true)
+      call nvim_buf_set_extmark(a:bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
     else
-      call nvim_buf_set_extmark(qf, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+      call add(ret, v:false)
+      call nvim_buf_set_extmark(a:bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
     endif
   endfor
+  return ret
 endfunction
 
 function work#OnSelectedService()
   let pos = line('.')
   let service = getline(pos)
-  let ns = nvim_create_namespace('services')
-  let extmarks = nvim_buf_get_extmarks(bufnr(), ns, [pos - 1, 0], [pos - 1, 0], #{details: 1})
-  if empty(extmarks)
-    echo "FIXME!"
-    return
-  endif
-
-  let hl = extmarks[0][3]['line_hl_group']
-  call nvim_buf_del_extmark(bufnr(), ns, extmarks[0][0])
-
-  if hl == 'DiagnosticOk'
+  let is_active = s:HighlightServices(bufnr())
+  if is_active[pos - 1]
     call systemlist(["ssh", g:HOST, "systemctl stop " .. service])
   else
     call systemlist(["ssh", g:HOST, "systemctl start " .. service])
   endif
-
-  let output = systemlist(["ssh", g:HOST, "systemctl is-active " .. service])
-  if output[0] == 'active'
-    call nvim_buf_set_extmark(bufnr(), ns, pos - 1, 0, #{line_hl_group: 'DiagnosticOk'})
-  else
-    call nvim_buf_set_extmark(bufnr(), ns, pos - 1, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
-  endif
+  call s:HighlightServices(bufnr())
 endfunction
 
 command! -nargs=0 Health call s:Health()
