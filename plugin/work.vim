@@ -515,6 +515,18 @@ function! s:InstallHostCommands()
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 endfunction
 
+function! s:OnConnectedHost()
+  let mnt = systemlist(["ssh", g:HOST, "mount"])
+  call filter(mnt, 'stridx(v:val, "on /usr ") >= 0')
+  if v:shell_error || empty(mnt)
+    return
+  endif
+  let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
+  if index(flags, "ro") >= 0
+    call systemlist(["ssh", g:HOST, "mount -o remount,rw /usr"])
+  endif
+endfunction
+
 function! s:ChangeHost(host, tried_to_trust)
   if empty(a:host)
     echo "Current host is: " .. g:HOST
@@ -545,6 +557,7 @@ function! s:ChangeHost(host, tried_to_trust)
     endif
     mode
     echo "SSH master restarted."
+    call s:OnConnectedHost()
   catch
     let g:HOST = old_host
     call s:InstallHostCommands()
@@ -1518,6 +1531,7 @@ function! s:OnVimEnter()
   " Install commands for the first time
   call s:InstallHostCommands()
   call s:StartMaster()
+  call s:OnConnectedHost()
   " Start RSI on the second workspace
   call RsiEnableOn("2")
 endfunction
