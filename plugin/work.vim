@@ -1465,6 +1465,55 @@ function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 "}}}
 
+function! s:Orientation(deg)
+  sp
+  Ssfs /usr/share/obsidian-video/cfg/default.json
+  let old_pos = search('"orientation"')
+  if empty(a:deg)
+    if old_pos <= 0
+      echo "Orientation missing (0 degrees)."
+    else
+      if stridx(getline('.'), "right") >= 0
+        echo "Orientation right (0 degrees)."
+      elseif stridx(getline('.'), "flat") >= 0
+        echo "Orientation flat (90 degrees)."
+      elseif stridx(getline('.'), "left") >= 0
+        echo "Orientation flat (180 degrees)."
+      elseif stridx(getline('.'), "bottom") >= 0
+        echo "Orientation flat (270 degrees)."
+      else
+        echo "Orientation unknown!"
+      endif
+    endif
+    quit
+    return
+  endif
+
+  if old_pos > 0
+    call deletebufline(bufnr(), old_pos)
+  endif
+  let pos = search('"version"')
+  if a:deg == 0
+    let deg = "right"
+  elseif a:deg == 90
+    let deg = "flat"
+  elseif a:deg == 180
+    let deg = "left"
+  elseif a:deg == 270
+    let deg = "bottom"
+  else
+    echo "Invalid degrees!"
+    return ''
+  endif
+  let config = printf('  "orientation": "%s",', deg)
+  call append(pos, config)
+  write
+  quit
+  call init#SystemOrThrow(["ssh", g:HOST, "systemctl restart obsidian-video"])
+endfunction
+
+command! -nargs=? Orientation call s:Orientation(<q-args>)
+
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:InstallHostCommands()
