@@ -58,7 +58,8 @@ function! s:GetMakeCommand(force_configure)
     let cmake .= printf("-I%s/sysroots/armv8a-aisys-linux/usr/include'", g:SDK_DIR)
     let cmake .= " -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DISP_HW_VERSION='-DISP_HW_V30' -DARCH='aarch64' -DRKAIQ_TARGET_SOC='rk3588'"
   else
-    let cmake = printf("cmake -B %s -S . -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s -DCMAKE_INSTALL_PREFIX=/usr", g:BUILD_TYPE, g:BUILD_TYPE)
+    " TODO check g:DEVICE
+    let cmake = printf("cmake -B %s -S . -DDEVICE=obsidian -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_BUILD_TYPE=%s -DCMAKE_INSTALL_PREFIX=/usr", g:BUILD_TYPE, g:BUILD_TYPE)
   endif
 
   if repo == 'libalcatraz'
@@ -489,6 +490,7 @@ function! s:InstallHostCommands()
   command! -nargs=? -complete=customlist,RemoteExeCompl File call init#TryCall('work#File', <q-args>)
 
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
+  exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
   exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=? -complete=customlist,SshfsCompl Scp call init#Scp('%s', empty(<q-args>) ? '/tmp' : <q-args>)", g:HOST)
@@ -516,14 +518,21 @@ function! s:InstallHostCommands()
 endfunction
 
 function! s:OnConnectedHost()
-  let mnt = systemlist(["ssh", g:HOST, "mount"])
-  call filter(mnt, 'stridx(v:val, "on /usr ") >= 0')
-  if v:shell_error || empty(mnt)
+  if work#IsMasterRunning()
+    call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
+    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
+    call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+  endif
+endfunction
+
+function! s:OnDeviceMounts(mnt)
+  let mnt = filter(a:mnt, 'stridx(v:val, "on /usr ") >= 0')
+  if empty(mnt)
     return
   endif
   let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
   if index(flags, "ro") >= 0
-    call systemlist(["ssh", g:HOST, "mount -o remount,rw /usr"])
+    call jobstart(["ssh", g:HOST, "mount -o remount,rw /usr"])
   endif
 endfunction
 
@@ -579,49 +588,6 @@ function! HostCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>, v:false)
-
-function! s:Health()
-  let services = work#GetServices()
-  let qf = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
-  call s:HighlightServices(qf)
-endfunction
-
-function! s:HighlightServices(bufnr)
-  let services = getbufline(a:bufnr, 1, '$')
-  let cmd = "systemctl is-active " .. join(services, " ")
-  let activity = systemlist(["ssh", g:HOST, cmd])
-
-  let ns = nvim_create_namespace('services')
-  let ret = []
-  for idx in range(len(services))
-    let extmarks = nvim_buf_get_extmarks(a:bufnr, ns, [idx, 0], [idx, 0], #{details: 1})
-    if !empty(extmarks)
-      call nvim_buf_del_extmark(a:bufnr, ns, extmarks[0][0])
-    endif
-    if activity[idx] == 'active'
-      call add(ret, v:true)
-      call nvim_buf_set_extmark(a:bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
-    else
-      call add(ret, v:false)
-      call nvim_buf_set_extmark(a:bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
-    endif
-  endfor
-  return ret
-endfunction
-
-function work#OnSelectedService()
-  let pos = line('.')
-  let service = getline(pos)
-  let is_active = s:HighlightServices(bufnr())
-  if is_active[pos - 1]
-    call systemlist(["ssh", g:HOST, "systemctl stop " .. service])
-  else
-    call systemlist(["ssh", g:HOST, "systemctl start " .. service])
-  endif
-  call s:HighlightServices(bufnr())
-endfunction
-
-command! -nargs=0 Health call s:Health()
 "}}}
 
 """"""""""""""""""""""""""""DO"""""""""""""""""""""""""""" {{{
@@ -650,16 +616,16 @@ endfunction
 
 function work#GetServices()
   let services = [
-        \ "rtsp-server-noauth",
+        \ "rtsp-server-noauth.service",
         \ "rtsp-server.socket",
         \ "rtsp-server.service",
-        \ "badge-and-face",
-        \ "qrcode-scanner",
+        \ "badge-and-face.service",
+        \ "qrcode-scanner.service",
         \ ]
   if stridx(g:DEVICE, "rockx") >= 0
-    call add(services, "obsidian-video")
+    call add(services, "obsidian-video.service")
   elseif stridx(g:DEVICE, "onyx") >= 0
-    call add(services, "rock-video")
+    call add(services, "rock-video.service")
   endif
   return services
 endfunction
@@ -990,7 +956,7 @@ function! s:MemoryMonitor(...)
   endif
   let input = "/tmp/" .. input[0]
 
-  let executable = printf("/var/tmp/%s/bin/badge_and_face", g:BUILD_TYPE)
+  let executable = printf("/var/tmp/%s/application/obsidian-video", g:BUILD_TYPE)
 
   let cmd = printf("%s %s -e=%s", tool, input, executable)
   echo printf('Running tool on %s..', input)
@@ -1478,6 +1444,8 @@ function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 "}}}
 
+""""""""""""""""""""""""""""Orientation"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:Orientation(deg)
   sp
   Ssfs /usr/share/obsidian-video/cfg/default.json
@@ -1522,10 +1490,114 @@ function! s:Orientation(deg)
   call append(pos, config)
   write
   quit
-  call init#SystemOrThrow(["ssh", g:HOST, "systemctl restart obsidian-video"])
+  " call init#SystemOrThrow(["ssh", g:HOST, "systemctl restart obsidian-video"])
 endfunction
 
 command! -nargs=? Orientation call s:Orientation(<q-args>)
+"}}}
+
+""""""""""""""""""""""""""""Services"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function s:OnServicesChanged(_1, d, _2)
+  call extend(s:services_output, a:d)
+  while !empty(s:services_output)
+    let line = s:services_output[0]
+    call remove(s:services_output, 0)
+    if stridx(line, "path=/org/freedesktop/systemd1/unit/") < 0
+      continue
+    endif
+
+    let dbus_name = matchstr(line, 'unit/\zs[^;]*')
+    let service_name = substitute(dbus_name, '_2d', '-', 'g')
+    let service_name = substitute(service_name, '_2e', '.', 'g')
+    if index(work#GetServices(), service_name) < 0
+      continue
+    endif
+
+    if len(s:services_output) > 10
+      for idx in range(10)
+        let line = s:services_output[idx]
+        if stridx(line, 'string "ActiveState"') < 0
+          continue
+        endif
+        let next_line = s:services_output[idx+1]
+        let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
+        if get(s:services_status, service_name, "") != activity
+          let s:services_status[service_name] = activity
+          if init#BufferIsOpen("Services")
+            call s:HighlightServices()
+          else
+            call init#Warn(printf("Service %s is %s!", service_name, activity))
+          endif
+        endif
+        call remove(s:services_output, 0, idx)
+        break
+      endfor
+    endif
+  endwhile
+endfunction
+
+function! s:StartServiceMonitor(initial_activity)
+  " XXX: Potential race condition but it makes the code look nicer so it's okay.
+  let s:services_status = #{}
+  let services = work#GetServices()
+  for idx in range(len(services))
+    let s:services_status[services[idx]] = a:initial_activity[idx]
+  endfor
+
+  let cmd = [
+        \ "dbus-monitor",
+        \ "--system",
+        \ string("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.freedesktop.systemd1.Unit'")]
+  let s:services_output = []
+  call jobstart(["ssh", g:HOST, join(cmd)], #{on_stdout: 's:OnServicesChanged'})
+endfunction
+
+function! s:OpenServices()
+  let services = work#GetServices()
+  let nr = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
+  call s:HighlightServices()
+endfunction
+
+function work#OnSelectedService()
+  let pos = line('.')
+  let service = getline(pos)
+  let status = get(s:services_status, service, "")
+  if status == "active"
+    call systemlist(["ssh", g:HOST, "systemctl stop " .. service])
+  elseif status == "inactive"
+    call systemlist(["ssh", g:HOST, "systemctl start " .. service])
+  else
+    echo "Nothing to do, status is " .. status
+  endif
+endfunction
+
+function! s:HighlightServices()
+  if !bufexists("Services")
+    return
+  endif
+  let bufnr = bufnr("Services")
+
+  let services = getbufline(bufnr, 1, '$')
+  let ns = nvim_create_namespace('services')
+  for idx in range(len(services))
+    let activity = get(s:services_status, services[idx], "")
+    let extmarks = nvim_buf_get_extmarks(bufnr, ns, [idx, 0], [idx, 0], #{details: 1})
+    if !empty(extmarks)
+      call nvim_buf_del_extmark(bufnr, ns, extmarks[0][0])
+    endif
+    if activity == 'active'
+      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
+    elseif activity == 'inactive'
+      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+    else
+      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'Normal'})
+    endif
+  endfor
+endfunction
+
+command! -nargs=0 Health call s:OpenServices()
+"}}}
 
 function! s:OnVimEnter()
   " Install commands for the first time
