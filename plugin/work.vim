@@ -382,23 +382,35 @@ function! s:AppToClipboard(app)
   else
     let cmd = opts['exe']
   endif
+  " Sanity check
+  if exists('s:services_status')
+    let systemd_name = s:AppServiceFile(a:app)
+    let status = get(s:services_status, systemd_name, "inactive")
+    if status != "inactive"
+      return init#Warn(printf("Service %s is %s!", systemd_name, status))
+    endif
+  endif
   call init#ToClipboard(cmd)
 endfunction
 
-function! s:AppToSystemd(app)
+function! s:AppServiceFile(app)
   let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
   let name = fnamemodify(app, ':t')
   if name == 'obsidian-video'
-    let systemd_name = "obsidian-video"
+    return "obsidian-video.service"
   elseif name == 'badge_and_face'
-    let systemd_name = 'badge-and-face'
+    return 'badge-and-face.service'
   elseif name == 'rock-video'
-    let systemd_name = 'rock-video'
-  else
-    echo "Unsupported app: " .. a:app
-    return
+    return 'rock-video.service'
   endif
+  return ''
+endfunction
 
+function! s:AppToSystemd(app)
+  let systemd_name = s:AppToServiceFile(a:app)
+  if empty(systemd_name)
+    return "Unsupported app: " .. a:app
+  endif
   let cmds = []
   call add(cmds, printf("echo Stopping %s...", systemd_name))
   call add(cmds, "systemctl stop " .. systemd_name)
@@ -1554,6 +1566,10 @@ function! s:StartServiceMonitor(initial_activity)
 endfunction
 
 function! s:OpenServices()
+  if !exists('s:services_status')
+    echo "Do not know status of services!"
+    return
+  endif
   let services = work#GetServices()
   let nr = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
   call s:HighlightServices()
@@ -1564,9 +1580,9 @@ function work#OnSelectedService()
   let service = getline(pos)
   let status = get(s:services_status, service, "")
   if status == "active"
-    call systemlist(["ssh", g:HOST, "systemctl stop " .. service])
+    call jobstart(["ssh", g:HOST, "systemctl stop " .. service])
   elseif status == "inactive"
-    call systemlist(["ssh", g:HOST, "systemctl start " .. service])
+    call jobstart(["ssh", g:HOST, "systemctl start " .. service])
   else
     echo "Nothing to do, status is " .. status
   endif
