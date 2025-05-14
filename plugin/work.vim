@@ -302,16 +302,25 @@ endfunction
 
 command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>, 1)
 
+function! s:GetSyncPattern()
+  let s:full_sync = v:true
+  if s:full_sync
+    return ".*"
+  endif
+
+  if stridx(dir, "obsidian-video") >= 0
+    return "obsidian-video"
+  elseif stridx(dir, "badge-and-face") >= 0
+    return "badge_and_face"
+  elseif stridx(dir, "libalcatraz") >= 0 || stridx(dir, "alcatraz-ml-library") >= 0
+    return ""
+  endif
+  return ".*"
+endfunction
+
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
-  let pat = ".*"
-  if stridx(dir, "obsidian-video") >= 0
-    let pat = "obsidian-video"
-  elseif stridx(dir, "badge-and-face") >= 0
-    let pat = "badge_and_face"
-  elseif stridx(dir, "libalcatraz") >= 0 || stridx(dir, "alcatraz-ml-library") >= 0
-    let pat = ""
-  endif
+  let pat = s:GetSyncPattern()
   if !empty(pat)
     exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s', '%s')", dir, pat)
   endif
@@ -394,28 +403,29 @@ function! s:AppToClipboard(app)
 endfunction
 
 function! s:AppServiceFile(app)
-  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
-  let name = fnamemodify(app, ':t')
-  if name == 'obsidian-video'
+  let exe_name = fnamemodify(a:app, ':t')
+  if exe_name == 'obsidian-video'
     return "obsidian-video.service"
-  elseif name == 'badge_and_face'
+  elseif exe_name == 'badge_and_face'
     return 'badge-and-face.service'
-  elseif name == 'rock-video'
+  elseif exe_name == 'rock-video'
     return 'rock-video.service'
   endif
   return ''
 endfunction
 
 function! s:AppToSystemd(app)
-  let systemd_name = s:AppToServiceFile(a:app)
+  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
+  let exe_name = fnamemodify(app, ":t")
+  let systemd_name = s:AppServiceFile(app)
   if empty(systemd_name)
     return "Unsupported app: " .. a:app
   endif
   let cmds = []
   call add(cmds, printf("echo Stopping %s...", systemd_name))
   call add(cmds, "systemctl stop " .. systemd_name)
-  call add(cmds, printf("cp %s /usr/bin/%s", app, name))
-  call add(cmds, "setcap cap_sys_nice+ep /usr/bin/" .. name)
+  call add(cmds, printf("cp %s /usr/bin/%s", app, exe_name))
+  call add(cmds, "setcap cap_sys_nice+ep /usr/bin/" .. exe_name)
   call add(cmds, printf("echo Starting %s...", systemd_name))
   call add(cmds, "systemctl start " .. systemd_name)
 
@@ -532,8 +542,7 @@ endfunction
 function! s:OnConnectedHost()
   if work#IsMasterRunning()
     call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
-    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
-    call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+    call work#StartServiceMonitor()
   endif
 endfunction
 
@@ -1547,6 +1556,11 @@ function s:OnServicesChanged(_1, d, _2)
       endfor
     endif
   endwhile
+endfunction
+
+function! work#StartServiceMonitor()
+    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
+    call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
 endfunction
 
 function! s:StartServiceMonitor(initial_activity)
