@@ -34,7 +34,7 @@ function! s:GetMakeCommand(force_configure)
   let whitelist_repos = ["obsidian-video", "libalcatraz", "mpp",
         \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
         \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
-        \ "badge-and-face-rock" ]
+        \ "badge-and-face-rock", "hiredis" ]
   if index(whitelist_repos, repo) < 0
     echo "Unsupported repo: " . repo
     return []
@@ -128,6 +128,9 @@ function! s:ResolveEnvFile()
   elseif stridx(fname, "include/groupsock") >= 0
     let part = matchlist(fname, 'include/groupsock/\(.*\)')[1]
     let resolved = "/home/stef/live/groupsock/include/" . part
+  elseif stridx(fname, "hiredis") >= 0
+    let basename = fnamemodify(fname, ":t")
+    let resolved = "/home/stef/hiredis/" .. basename
   endif
 
   if filereadable(resolved)
@@ -182,6 +185,7 @@ function! JournalCompl(ArgLead, CmdLine, CursorPos)
   endif
   let files = ["/usr/lib/systemd/system/obsidian-video.service",
         \ "/usr/lib/systemd/system/qrcode-scanner.service",
+        \ "/usr/lib/systemd/system/rtsp-server-noauth.service",
         \ "/usr/lib/systemd/system/badge-and-face.service",
         \ "/usr/lib/systemd/system/rock-video.service"]
   return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
@@ -395,7 +399,7 @@ function! s:AppToClipboard(app)
   if exists('s:services_status')
     let systemd_name = s:AppServiceFile(a:app)
     let status = get(s:services_status, systemd_name, "inactive")
-    if status != "inactive"
+    if status != "inactive" && status != "failed"
       return init#Warn(printf("Service %s is %s!", systemd_name, status))
     endif
   endif
@@ -629,7 +633,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker",
         \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
         \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
-        \ "FakeImage", "ReverseImage", "FactoryReset", "Enrol", "Trust",
+        \ "FakeImage", "ReverseImage", "FactoryReset", "Enroll", "Trust",
         \ "HostDebugSyms", "PlotTrace", "BarfPlotTrace", "OpenCV",
         \ "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
@@ -811,28 +815,33 @@ function! s:FakeSdk()
   let repo_dir = FugitiveWorkTree()
   if stridx(repo_dir, "libalcatraz") >= 0
     let so_name = "libalcatraz.so"
-    let so_pattern = printf("%s/%s/alcatraz/libalcatraz.so*", repo_dir, g:BUILD_TYPE)
+    let so_dir = printf("%s/%s/alcatraz", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
     call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
   elseif stridx(repo_dir, "alcatraz-ml-library") >= 0
     let so_name = "libalcatraz_ml.so"
-    let so_pattern = printf("%s/%s/src/libalcatraz_ml.so*", repo_dir, g:BUILD_TYPE)
+    let so_dir = printf("%s/%s/src", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/%s/libalcatraz_ml.pc", repo_dir, g:BUILD_TYPE)
     call add(cmds, printf("rsync -rtv %s/include/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/ml", repo_dir, g:SDK_DIR))
     call add(cmds, printf("rsync -tv %s/include/rockchip/alcatraz_ml_sdk.h %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/ml", repo_dir, g:SDK_DIR))
   elseif stridx(repo_dir, 'mpp') >= 0
-    let so_pattern = printf("%s/%s/mpp/librockchip_mpp.so*", repo_dir, g:BUILD_TYPE)
-    let pc = printf("%s/%s/rockchip_mpp.pc", repo_dir, g:BUILD_TYPE)
+    let so_name = "librockchip_mpp.so"
+    let so_dir = printf("%s/%s/mpp", repo_dir, g:BUILD_TYPE)
+    let pc = printf("%s/rockchip_mpp.pc", so_dir)
+  elseif stridx(repo_dir, 'hiredis') >= 0
+    let so_name = "libhiredis.so"
+    let so_dir = printf("%s/%s", repo_dir, g:BUILD_TYPE)
+    let pc = printf("%s/hiredis.pc", so_dir)
   else
     echo "No repo matched!"
     return
   endif
 
   " Remove old versions of the library
-  call add(cmds, printf("rm  %s/sysroots/armv8a-aisys-linux/usr/lib/%s*", g:SDK_DIR, so_name))
-  call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/lib", so_pattern, g:SDK_DIR))
+  call add(cmds, printf("rm %s/sysroots/armv8a-aisys-linux/usr/lib/%s*", g:SDK_DIR, so_name))
+  call add(cmds, printf("rsync -Ltv %s/%s* %s/sysroots/armv8a-aisys-linux/usr/lib", so_dir, so_name, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc, g:SDK_DIR))
-  call add(cmds, printf("rsync -Ltv %s %s:/usr/lib", so_pattern, g:HOST))
+  call add(cmds, printf("rsync -Ltv %s/%s* %s:/usr/lib", so_dir, so_name, g:HOST))
 
   split
   enew
@@ -994,14 +1003,14 @@ endfunction
 function s:GetTargets()
   if stridx(g:DEVICE, "onyx") >= 0
     let targets = [
-          \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-          \ ["~/rock-video", "master", "rock-video_git.bb"],
-          \ ["~/badge-and-face-rock", "master", "badge-and-face_git.bb"]]
+          \ ["/home/stef/libalcatraz", "master", "libalcatraz_git.bb"],
+          \ ["/home/stef/rock-video", "master", "rock-video_git.bb"],
+          \ ["/home/stef/badge-and-face-rock", "master", "badge-and-face_git.bb"]]
   elseif stridx(g:DEVICE, "rockx") >= 0
     let targets = [
-          \ ["~/libalcatraz", "master", "libalcatraz_git.bb"],
-          \ ["~/obsidian-video", "main", "obsidian-video_git.bb"],
-          \ ["~/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
+          \ ["/home/stef/libalcatraz", "master", "libalcatraz_git.bb"],
+          \ ["/home/stef/obsidian-video", "main", "obsidian-video_git.bb"],
+          \ ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face-obsidian_git.bb"]]
   else
     throw "Unknown device: " .. g:DEVICE
   endif
@@ -1009,36 +1018,33 @@ function s:GetTargets()
 endfunction
 
 function! s:FakeImage()
-  let targets = s:GetTargets()
-  for [repo, branch, bitbake] in targets
-    " Find new hash
-    exe "e " .. repo
-    call git#CleanOrThrow()
+  let repo = FugitiveWorkTree()
+  let targets = filter(s:GetTargets(), 'v:val[0] == repo')
+  if empty(targets)
+    echo "Not inside repo!"
+    return
+  endif
 
-    " Check if unpushed
-    let new_branch = git#GetBranch()
-    if empty(new_branch)
-      throw "Repo " .. repo .. " does not have a branch!"
-    endif
-    let new_hash = git#HashOrThrow(new_branch)
-    if new_hash != git#HashOrThrow("origin/" .. new_branch)
-      let msg = "You have unpushed changes in " .. repo
-      call init#Warn(msg)
-    endif
+  let [_, branch, bitbake] = targets[0]
+  exe "e " .. repo
+  let new_branch = git#GetBranch()
+  if empty(new_branch)
+    throw "Repo " .. repo .. " does not have a branch!"
+  endif
+  let new_hash = git#HashOrThrow(new_branch)
+  " Find old hash
+  let id = qsearch#Find("~/aidistro/repo", "-regex", ".*" .. bitbake)
+  call jobwait([id])
+  if search("SRCREV") == 0
+    throw "Failed to find SRCREV"
+  endif
+  call setline('.', 'SRCREV ?= "' .. new_hash .. '"')
+  if search("SRCBRANCH") == 0
+    throw "Failed to find SRCBRANCH"
+  endif
+  call setline('.', 'SRCBRANCH ?= "' .. new_branch .. '"')
+  write
 
-    " Find old hash
-    let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
-    call jobwait([id])
-    if search("SRCREV") == 0
-      throw "Failed to find SRCREV"
-    endif
-    call setline('.', 'SRCREV ?= "' .. new_hash .. '"')
-    if search("SRCBRANCH") == 0
-      throw "Failed to find SRCBRANCH"
-    endif
-    call setline('.', 'SRCBRANCH ?= "' .. new_branch .. '"')
-    write
-  endfor
   " Display changes
   e ~/aidistro/repo
   G
@@ -1047,11 +1053,12 @@ function! s:FakeImage()
 endfunction
 
 function! s:ReverseImage()
+  throw "TODO"
   let targets = s:GetTargets()
   for [repo, branch, bitbake] in targets
     " Find hash
     sp
-    let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
+    let id = qsearch#Find("~/aidistro/repo", "-regex", ".*" .. bitbake)
     call jobwait([id])
     if search("SRCREV") == 0
       throw "Failed to find SRCREV"
@@ -1071,7 +1078,7 @@ function! s:FactoryReset()
   call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
 endfunction
 
-function! s:Enrol()
+function! s:Enroll()
   let cmds = []
   call add(cmds, 'redis-cli SET config:device.role "\"one-fa\""' )
   call add(cmds, 'redis-cli SET config:enrollment.enabled true' )
@@ -1106,6 +1113,20 @@ endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Ip call s:CopyIp(<q-args>)
 cabbr IP Ip
+
+function! s:CopyGstH264Str()
+  " let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
+  let h264_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_h264 latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink"
+  call init#ToClipboard(printf(h264_msg, s:GetIp()))
+endfunction
+
+function! s:CopyGstMjpegStr()
+  let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
+  call init#ToClipboard(printf(mjpeg_msg, s:GetIp()))
+endfunction
+
+command! -nargs=0 H264 call s:CopyGstH264Str()
+command! -nargs=0 Mjpeg call s:CopyGstMjpegStr()
 
 function! s:Reboot()
   let cmds = []
@@ -1168,7 +1189,7 @@ function! work#FetchAI()
     exe "e " .. repo
     let new_hash = git#HashOrThrow("origin/" .. branch)
     " Find old hash
-    let id = QuickFind("~/aidistro/repo", "-regex", ".*" .. bitbake)
+    let id = qsearch#Find("~/aidistro/repo", "-regex", ".*" .. bitbake)
     call jobwait([id])
     if search("SRCREV") == 0
       throw "Failed to find bitbake file"
@@ -1250,7 +1271,7 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let items = ["Fetch", "Test", "Commit", "Push", "CleanUp"]
+  let items = ["Fetch", "Commit", "Test", "Push", "CleanUp"]
   return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
@@ -1350,6 +1371,7 @@ command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 function! s:Disassemble(dyn, arg)
   let targets = s:GetDisassembleTargets()->FileFilter(a:arg)
   if len(targets) != 1
+    echo "Be more specific"
     return init#CustomBottomBuffer('Matches', targets)
   endif
   let exe = targets[0]
@@ -1565,10 +1587,15 @@ endfunction
 
 function! s:StartServiceMonitor(initial_activity)
   " XXX: Potential race condition but it makes the code look nicer so it's okay.
-  let s:services_status = #{}
   let services = work#GetServices()
+  let activity = filter(a:initial_activity, '!empty(v:val)')
+  if len(activity) != len(services)
+    " Possible if device is down.
+    return init#Warn("Cannot start service monitor!")
+  endif
+  let s:services_status = #{}
   for idx in range(len(services))
-    let s:services_status[services[idx]] = a:initial_activity[idx]
+    let s:services_status[services[idx]] = activity[idx]
   endfor
 
   let cmd = [
@@ -1593,12 +1620,16 @@ function work#OnSelectedService()
   let pos = line('.')
   let service = getline(pos)
   let status = get(s:services_status, service, "")
-  if status == "active"
-    call jobstart(["ssh", g:HOST, "systemctl stop " .. service])
-  elseif status == "inactive"
+  if status == "inactive"
     call jobstart(["ssh", g:HOST, "systemctl start " .. service])
   else
-    echo "Nothing to do, status is " .. status
+    let cmds = []
+    if status != "active"
+      call init#Warn("Status was " .. status .. ".")
+      call add(cmds, "systemctl disable " .. service)
+    endif
+    call add(cmds, "systemctl stop " .. service)
+    call jobstart(["ssh", g:HOST, join(cmds, ";")])
   endif
 endfunction
 
