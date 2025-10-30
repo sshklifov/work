@@ -101,9 +101,9 @@ function! work#GetMakeCommand(force_configure)
   return command
 endfunction
 
-command! -nargs=0 -bang Configure call Make(work#GetMakeCommand(v:true), "<bang>")
+command! -nargs=0 -bang Configure call qutil#Make(work#GetMakeCommand(v:true), "<bang>")
 command! -nargs=0 -bang Reconfigure Configure<bang>
-command! -nargs=0 -bang Make call Make(work#GetMakeCommand(v:false), "<bang>")
+command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(v:false), "<bang>")
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
@@ -223,7 +223,7 @@ function! s:SshfsOnSteroids(what)
     endif
   endif
   if len(files) > 1
-    call init#CreateOneShotQuickfix('Remote files', files, 'work#SelectRemoteFile')
+    call qutil#CreateOneShotQuickfix(files, 'Remote files', 'work#SelectRemoteFile')
   elseif len(files) == 1
     call init#Sshfs(g:HOST, files[0])
   else
@@ -253,7 +253,7 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 function! s:RemoteSync(arg, pat, ...)
-  function! OnStdout(id, data, event)
+  function! s:OnRsyncStdout(id, data, event)
     for data in a:data
       let text = substitute(data, '\n', '', 'g')
       if len(text) > 0
@@ -265,7 +265,7 @@ function! s:RemoteSync(arg, pat, ...)
     endfor
   endfunction
 
-  function! OnExit(id, code, event)
+  function! s:OnRsyncExit(id, code, event)
     if a:code == 0
       echom "Synced!"
     else
@@ -300,10 +300,10 @@ function! s:RemoteSync(arg, pat, ...)
   call add(cmd, '--exclude=*')
 
   call extend(cmd, ["--info=progress2", "--out-format='%n'", dir, remote_dir])
-  let id = jobstart(cmd, #{on_stdout: funcref("OnStdout"), on_exit: funcref("OnExit")})
+  let id = init#Jobstart(cmd, #{on_stdout: funcref("s:OnRsyncStdout"), on_exit: funcref("s:OnRsyncExit")})
   if load_results
     call map(exes, 'printf("/var/tmp/%s/%s", g:BUILD_TYPE, v:val)')
-    call init#CreateOneShotQuickfix('Target', exes, function('s:SelectTarget'))
+    call qutil#CreateOneShotQuickfix(exes, 'Target', function('s:SelectTarget'))
   endif
 endfunction
 
@@ -335,7 +335,7 @@ function! s:Resync()
   if !empty(pat)
     exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s', '%s')", dir, pat)
   endif
-  call Make(work#GetMakeCommand(v:false))
+  call qutil#Make(work#GetMakeCommand(v:false))
 endfunction
 
 " command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
@@ -366,8 +366,10 @@ function! s:PrepareApp(exe)
     return #{exe: nice_exe, user: "badge_and_face"}
   elseif a:exe =~ "profile_generator$"
     return #{exe: nice_exe}
-  else
+  elseif a:exe =~ 'obsidian-video$'
     return #{exe: nice_exe, user: "rock-video"}
+  else
+    return #{exe: nice_exe}
   endif
 endfunction
 
@@ -447,7 +449,7 @@ function! s:AppToSystemd(app)
   let id = termopen(["ssh", g:HOST, join(cmds, ' && ')])
   let systemd_file = JournalCompl(systemd_name, '', 0)
   if len(systemd_file) == 1
-    call init#OnJobFinished(id, function('s:Journal', ['!', systemd_file[0]]))
+    call init#OnTermClosed(id, function('s:Journal', ['!', systemd_file[0]]))
   else
     call init#Warn('Failed to find ' .. systemd_name)
   endif
@@ -810,17 +812,17 @@ endfunction
 
 function! s:RefreshImage()
   let id = s:BuildImage()
-  call init#OnJobFinished(id, function("s:InstallImage"))
+  call init#OnTermClosed(id, function("s:InstallImage"))
 endfunction
 
 function! s:RefreshSdk()
   let id = s:BuildSdk()
-  call init#OnJobFinished(id, function("s:InstallSdk"))
+  call init#OnTermClosed(id, function("s:InstallSdk"))
 endfunction
 
 function! s:Refresh()
   let id = s:RunDocker("bitbake rock-image && bitbake rock-image -c populate_sdk")
-  call init#OnJobFinished(id, function("s:InstallBoth"))
+  call init#OnTermClosed(id, function("s:InstallBoth"))
 endfunction
 
 function! s:InstallBoth()
@@ -1040,19 +1042,11 @@ function s:GetTargets()
   return targets
 endfunction
 
-function! work#AddAI()
-  let repos = map(s:GetTargets(), 'v:val[0]')
-  call init#CreateOneShotQuickfix('Add', repos, function('s:OnAIRepo'))
-endfunction
-
-function! s:OnAIRepo(repo)
-  call s:AddRepo(a:repo, v:false)
-endfunction
-
 function! s:Bb()
-  call s:AddRepo(FugitiveWorkTree(), v:true)
+  call s:AddRepo(FugitiveWorkTree())
 endfunction
 
+" TODO Da e po avtomatizirano pls
 function! s:AddRepo(repo, use_local)
   let repo = a:repo
   let targets = filter(s:GetTargets(), 'v:val[0] == repo')
@@ -1060,30 +1054,28 @@ function! s:AddRepo(repo, use_local)
     throw "Invalid repo: " .. repo
   endif
 
-  if a:use_local
-    let new_branch = git#GetBranch(repo)
-  else
-    let new_branch = targets[0][1]
+  let new_src_branch = git#GetBranch(repo)
+  if empty(new_src_branch)
+    throw "Failed to determine branch!"
   endif
+  if new_src_branch != targets[0][1]
+    call init#Warn('Branch differs from mainline.')
+  endif
+
+  let new_src_rev = git#HashOrThrow(new_src_branch)
   let bitbake = targets[0][2]
-  if empty(new_branch)
-    throw "Repo " .. repo .. " does not have a branch!"
-  endif
-  let new_hash = git#HashOrThrow(new_branch)
   " Find old hash
-  sp
   let id = qsearch#Find("/home/stef/aidistro", "-regex", ".*" .. bitbake)
   call jobwait([id])
   if search("SRCREV") == 0
     throw "Failed to find SRCREV"
   endif
-  call setline('.', 'SRCREV ?= "' .. new_hash .. '"')
+  call setline('.', 'SRCREV ?= "' .. new_src_rev .. '"')
   if search("SRCBRANCH") == 0
     throw "Failed to find SRCBRANCH"
   endif
-  call setline('.', 'SRCBRANCH ?= "' .. new_branch .. '"')
+  call setline('.', 'SRCBRANCH ?= "' .. new_src_branch .. '"')
   write
-  quit
 endfunction
 
 function! s:FactoryReset()
@@ -1189,13 +1181,6 @@ function! work#FetchAI()
   call git#ExecuteOrThrow(["checkout", "master"], "Failed to checkout aidistro master")
   call git#ExecuteOrThrow(["pull", "origin", "master"], "Failed to pull aidistro")
   call git#ExecuteOrThrow(["submodule", "update", "--init", "--recursive"])
-
-  for [repo, branch, _] in s:GetTargets()
-    " Find new hash
-    exe "e " .. repo
-    call git#ExecuteOrThrow(["fetch", "origin", branch], "Fetch in " .. repo .. " failed")
-  endfor
-
   echo "Fetching completed!"
 endfunction
 
@@ -1269,7 +1254,7 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let items = ["Fetch", "Add", "Commit", "Test", "Push", "CleanUp", "Reset"]
+  let items = ["Fetch", "Commit", "Test", "Push", "CleanUp", "Reset"]
   return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
@@ -1289,7 +1274,7 @@ function! s:ShowActivity()
   let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
   let branches = git#ExecuteOrThrow(cmd, "Failed to fetch recent commits!")
   call filter(branches, '!empty(v:val)')
-  call init#CreateOneShotQuickfix('Branches', branches, 'work#OnIssueSelected')
+  call qutil#CreateOneShotQuickfix(branches, 'Branches', 'work#OnIssueSelected')
 endfunction
 
 function! work#OnIssueSelected(branch)
@@ -1365,13 +1350,8 @@ command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 
 """"""""""""""""""""""""""""Disas"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:Disassemble(dyn, arg)
-  let targets = s:GetDisassembleTargets()->FileFilter(a:arg)
-  if len(targets) != 1
-    echo "Be more specific"
-    return init#CustomBottomBuffer('Matches', targets)
-  endif
-  let exe = targets[0]
+function! work#Disassemble(dyn, arg)
+  let exe = a:arg
   let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, exe))
   call map(funcs, 'split(v:val)')
   call filter(funcs, 'toupper(v:val[1]) == "W" || toupper(v:val[1]) == "T"')
@@ -1382,13 +1362,15 @@ function! s:Disassemble(dyn, arg)
   endif
   let unmangled = systemlist("c++filt", funcs)
   call map(unmangled, 'v:val[:180]')
-  call init#CreateCustomQuickfix('Symbols', unmangled, function('s:SelectSymbol', [exe]))
-  resize 15
-  " Much faster than binding it in above 'function'.
-  let b:mangled_names = funcs
+  let nr = qutil#CreateCustomQuickfix(unmangled, 'Symbols', 'work#SelectSymbol', exe)
+  if nr >= 0
+    " Much faster than binding it in above 'function'.
+    let b:mangled_names = funcs
+    call setbufvar(nr, '&modifiable', v:false)
+  endif
 endfunction
 
-function! s:SelectSymbol(exe)
+function! work#SelectSymbol(exe)
   let idx = line('.') - 1
   let mangled = b:mangled_names[idx]
 
@@ -1447,6 +1429,7 @@ function! s:SelectSymbol(exe)
     exe printf("lua GetSemanticTokens(%d, 'work#TransferExtmarks', {%d, %d})", nr, disas_nr, nr)
   endfor
 
+  quit
   exe "b " .. disas_nr
   call setbufvar(disas_nr, '&list', v:false)
 endfunction
@@ -1473,14 +1456,14 @@ function! s:GetDisassembleTargets()
   return systemlist(["find", dir, "-type", "f", "-executable"])
 endfunction
 
-command! -nargs=1 -bang -complete=customlist,DisassembleCompl Disassemble
-      \ call s:Disassemble(<bang>0 ? 'D' : '', <q-args>)
+command! -nargs=? -bang -complete=customlist,DisassembleCompl Disassemble
+      \ call s:GetDisassembleTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Disassemble', 'work#Disassemble', <bang>0 ? 'D' : '')
 
 function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  return s:GetDisassembleTargets()->TailItems(a:ArgLead)
+  return s:GetDisassembleTargets()->qutil#FileCompletionPass(a:ArgLead)
 endfunction
 "}}}
 
