@@ -455,74 +455,128 @@ function! s:AppToSystemd(app)
   endif
 endfunction
 
+function! s:DetermineConfig(host, Cb)
+  call init#OnJobOutput(["ssh", '-G', a:host], expand("<SID>") .. 'OnConfig', a:host, a:Cb)
+endfunction
+
+function! s:OnConfig(host, Cb, output)
+  let control = filter(copy(a:output), 'v:val =~ "^controlpath"')
+  if empty(control)
+    call init#Warn("Control file does not exist for " .. a:host)
+    let g:HOST_CONTROL = ""
+  else
+    let g:HOST_CONTROL = expand(split(control[0])[1])
+  endif
+
+  let ip = filter(copy(a:output), 'v:val =~ "^hostname"')
+  if empty(ip)
+    call init#Warn("Failed to determine IP for " .. a:host)
+    let g:HOST_IP = ""
+  else
+    let g:HOST_IP = expand(split(ip[0])[1])
+  endif
+
+  let g:HOST = a:host
+  call a:Cb()
+endfunction
+
 function! work#ControlFileExists()
-  let config = systemlist(["ssh", '-G', g:HOST])
-  call filter(config, 'v:val =~ "^controlpath"')
-  if empty(config)
-    call init#Warn("Control file does not exist for " .. g:HOST)
-    return v:false
-  endif
-  let path = expand(split(config[0])[1])
-  return filereadable(path)
+  return !empty(g:HOST_CONTROL) && filereadable(g:HOST_CONTROL)
 endfunction
 
-function! s:StopMaster()
-  if exists('s:master_job_id')
-    if jobstop(s:master_job_id)
-      call jobwait([s:master_job_id])
-    endif
+function! work#GetHostStatus()
+  if init#IsMainWorkspace()
+    return work#IsMasterRunning()
+  else
+    return get(s:, 'control_file_exists', v:false)
   endif
-  return !work#ControlFileExists()
 endfunction
 
-function! s:StartMaster()
-  if !s:StopMaster()
-    return v:false
-  endif
-  let cmd = ["ssh", "-o", "ConnectTimeout=1", "-N", "-M", g:HOST]
-  let id = jobstart(cmd, #{on_exit: 's:OnMasterExit'})
-  if id <= 0
-    echoerr "Failed to start SSH master!"
-    return v:false
-  endif
-  let s:master_job_id = id
-  return v:true
+function! s:MonitorControlFile()
+  call init#Jobstart("inotifywait -mq -e create,delete ~/.ssh", #{on_stdout: expand("<SID>") .. 'OnControlFileEvent'})
+  call s:OnControlFileEvent()
 endfunction
 
-function! s:OnMasterExit(...)
-  if !exists('s:no_died_message')
-    echom "SSH master died!"
+function! s:OnControlFileEvent(...)
+  let s:control_file_exists = work#ControlFileExists()
+  if s:control_file_exists
+    call s:DetermineSdk()
+  else
+    echom "SSH connection died..."
   endif
-  unlet s:master_job_id
+  redrawstatus!
 endfunction
 
 function! work#IsMasterRunning()
   return get(s:, 'master_job_id', 0) > 0
 endfunction
 
-function s:DetermineSdk()
-  let lines = systemlist(["ssh", g:HOST, "cat /var/lib/mender/device_type"])
-  if v:shell_error
-    return v:false
+function! s:StartMaster()
+  if exists('s:master_job_id')
+    call timer_stop(s:master_timer_id)
+    if jobstop(s:master_job_id)
+      call jobwait([s:master_job_id])
+    endif
   endif
-  if stridx(lines[0], "rockx-dm-p15") >= 0
+  call assert_false(work#ControlFileExists())
+
+  let cmd = "ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new -N -M " .. g:HOST
+  let s:master_job_id = init#OnJobExit(cmd, expand("<SID>") .. 'OnMasterExit')
+  let s:master_timer_id = timer_start(1100, 's:CheckMasterConnection')
+  call assert_true(s:master_job_id > 0)
+endfunction
+
+function! s:OnMasterExit(code)
+  echom "SSH master died! Waiting for connection..."
+  unlet s:master_job_id
+  redrawstatus!
+  call init#OnJobSuccess("ssh_wait_silent " .. g:HOST, expand("<SID>") .. 'StartMaster')
+endfunction
+
+function! s:CheckMasterConnection(...)
+  if work#IsMasterRunning()
+    redrawstatus!
+    call s:OnConnectedMaster()
+  endif
+endfunction
+
+function s:OnConnectedMaster()
+  call s:DetermineSdk()
+  call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
+  let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
+  call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+endfunction
+
+function! s:OnDeviceMounts(mnt)
+  let mnt = filter(a:mnt, 'stridx(v:val, "on /usr ") >= 0')
+  if empty(mnt)
+    return
+  endif
+  let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
+  if index(flags, "ro") >= 0
+    call init#Jobstart(["ssh", g:HOST, "mount -o remount,rw /usr"])
+  endif
+endfunction
+
+function s:DetermineSdk()
+  let cmd = ["ssh", g:HOST, "cat /var/lib/mender/device_type"]
+  call init#OnJobOutput(cmd, expand("<SID>") .. 'OnSdkOutput')
+endfunction
+
+function! s:OnSdkOutput(output)
+  if stridx(a:output[0], "rockx-dm-p15") >= 0
     let g:DEVICE = "rockx-dm-p15"
     let g:SDK_DIR = "/opt/aisys/obsidian_p15"
-    return v:true
-  elseif stridx(lines[0], "rockx-dm-r10") >= 0
+  elseif stridx(a:output[0], "rockx-dm-r10") >= 0
     let g:DEVICE = "rockx-dm-r10"
     let g:SDK_DIR = "/opt/aisys/obsidian_r10"
-    return v:true
-  elseif stridx(lines[0], "onyx-p1") >= 0
+  elseif stridx(a:output[0], "onyx-p1") >= 0
     let g:DEVICE = "onyx-p1"
     let g:SDK_DIR = "/opt/aisys/onyx_p1"
-    return v:true
-  elseif stridx(lines[0], "onyx-cr") >= 0
+  elseif stridx(a:output[0], "onyx-cr") >= 0
     let g:DEVICE = "onyx-cr"
     let g:SDK_DIR = "/opt/aisys/onyx_cr"
-    return v:true
   endif
-  return v:false
 endfunction
 
 function! s:InstallHostCommands()
@@ -558,64 +612,13 @@ function! s:InstallHostCommands()
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 endfunction
 
-function! s:OnConnectedHost()
-  if work#IsMasterRunning()
-    call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
-    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
-    call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
-  endif
-endfunction
-
-function! s:OnDeviceMounts(mnt)
-  let mnt = filter(a:mnt, 'stridx(v:val, "on /usr ") >= 0')
-  if empty(mnt)
-    return
-  endif
-  let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
-  if index(flags, "ro") >= 0
-    call jobstart(["ssh", g:HOST, "mount -o remount,rw /usr"])
-  endif
-endfunction
-
-function! s:ChangeHost(host, tried_to_trust)
-  if empty(a:host)
-    echo "Current host is: " .. g:HOST
-    return
-  endif
-  let host = a:host
-  call system(["ssh", "-o", "ConnectTimeout=1", host, "exit"])
-  if v:shell_error != 0
-    " Yikes recursion???
-    if !a:tried_to_trust
-      let id = s:Trust(host)
-      call init#OnJobFinished(id, function('s:ChangeHost', [a:host, v:true]))
-    else
-      call init#Warn("Failed to connect to host " . host)
-    endif
-    return
-  endif
-
-  let old_host = g:HOST
-  try
-    let g:HOST = host
-    call s:InstallHostCommands()
-    if !s:StartMaster()
-      throw "Failed to restart SSH master!"
-    endif
-    if !s:DetermineSdk()
-      throw "Failed to determine SDK! You must manually set g:DEVICE"
-    endif
-    mode
-    echo "SSH master restarted."
-    call s:OnConnectedHost()
-  catch
-    let g:HOST = old_host
-    call s:InstallHostCommands()
+function s:OnHostChange()
+  call s:InstallHostCommands()
+  if init#IsMainWorkspace()
     call s:StartMaster()
-    mode
-    echom v:exception
-    return
-  endtry
+  else
+    call s:MonitorControlFile()
+  endif
 endfunction
 
 function! HostCompl(ArgLead, CmdLine, CursorPos)
@@ -628,7 +631,9 @@ function! HostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>, v:false)
+" TODO Trust
+
+command! -nargs=? -complete=customlist,HostCompl Host call s:DetermineConfig(<q-args>, function('s:OnHostChange'))
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -649,8 +654,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
         \ "BuildSdk", "BuildImage", "BuildMfg", "InstallSdk", "ShowImage",
         \ "SaveImage", "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
-        \ "FactoryReset", "Enroll", "Trust", "HostDebugSyms", "PlotTrace",
-        \ "BarfPlotTrace", "OpenCV", "MemoryMonitor", "EnableCore"]
+        \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
+        \ "OpenCV", "MemoryMonitor", "EnableCore"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1047,7 +1052,7 @@ function! s:Bb()
 endfunction
 
 " TODO Da e po avtomatizirano pls
-function! s:AddRepo(repo, use_local)
+function! s:AddRepo(repo)
   let repo = a:repo
   let targets = filter(s:GetTargets(), 'v:val[0] == repo')
   if empty(targets)
@@ -1097,38 +1102,18 @@ function! s:Enroll()
   endif
 endfunction
 
-function! s:GetIp(...)
-  let host = get(a:000, 0, "")
-  if str2nr(host) > 0
-    let ip = "10.1.20." .. host
-  else
-    if empty(host)
-      let host = g:HOST
-    endif
-    let ssh_config = systemlist(["ssh", "-G", host])
-    call filter(ssh_config, 'v:val =~ "^hostname"')
-    let ip = split(ssh_config[0])[1]
-  endif
-  return ip
-endfunction
-
-function! s:CopyIp(args)
-  let ip = s:GetIp(a:args)
-  call init#ToClipboard(ip)
-endfunction
-
-command! -nargs=? -complete=customlist,HostCompl Ip call s:CopyIp(<q-args>)
+command! -nargs=? -complete=customlist,HostCompl Ip call init#ToClipboard(g:HOST_IP)
 cabbr IP Ip
 
 function! s:CopyGstH264Str()
   " let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
   let h264_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_h264 latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink"
-  call init#ToClipboard(printf(h264_msg, s:GetIp()))
+  call init#ToClipboard(printf(h264_msg, g:HOST_IP))
 endfunction
 
 function! s:CopyGstMjpegStr()
   let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
-  call init#ToClipboard(printf(mjpeg_msg, s:GetIp()))
+  call init#ToClipboard(printf(mjpeg_msg, g:HOST_IP))
 endfunction
 
 command! -nargs=0 H264 call s:CopyGstH264Str()
@@ -1145,28 +1130,6 @@ function! s:Reboot()
 endfunction
 
 command! -nargs=0 Reboot call s:Reboot()
-
-function! s:Trust(...)
-  let host = get(a:000, 0, g:HOST)
-  if str2nr(host) > 0
-    let ip = "10.1.20." .. host
-    let host = "root@" .. ip
-  else
-    let ssh_config = systemlist(["ssh", "-G", host])
-    call filter(ssh_config, 'v:val =~ "^hostname"')
-    let ip = split(ssh_config[0])[1]
-  endif
-  let cmds = []
-  call add(cmds, "ssh-keygen -R " .. ip)
-  call add(cmds, "echo 'Waiting for connection...'")
-  call add(cmds, "ssh_wait_silent " .. host)
-
-  botr split
-  enew
-  let id = termopen(join(cmds, ";"))
-  startinsert
-  return id
-endfunction
 
 command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
 "}}}
@@ -1521,52 +1484,56 @@ command! -nargs=? Orientation call s:Orientation(<q-args>)
 
 """"""""""""""""""""""""""""Services"""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function s:OnServicesChanged(_1, d, _2)
-  call extend(s:services_output, a:d)
-  while !empty(s:services_output)
-    let line = s:services_output[0]
-    call remove(s:services_output, 0)
-    if stridx(line, "path=/org/freedesktop/systemd1/unit/") < 0
-      continue
-    endif
+function! s:OpenServices()
+  let did_start = !exists('s:services_job')
+  if did_start
+    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
+    let activity = systemlist(["ssh", g:HOST, cmd])
+    call s:StartServiceMonitor(activity)
+  endif
+  let services = work#GetServices()
+  let nr = qutil#CreateCustomQuickfix(services, 'Services', expand("<SID>") .. 'OnSelectedService')
+  call s:UpdateServicesHl(nr)
+  if did_start
+    call assert_false(init#IsMainWorkspace())
+    call init#OnBufDelete(nr, expand("<SID>") .. "StopServiceMonitor")
+  endif
+endfunction
 
-    let dbus_name = matchstr(line, 'unit/\zs[^;]*')
-    let service_name = substitute(dbus_name, '_2d', '-', 'g')
-    let service_name = substitute(service_name, '_2e', '.', 'g')
-    if index(work#GetServices(), service_name) < 0
-      continue
+function s:OnSelectedService()
+  let pos = line('.')
+  let service = getline(pos)
+  let status = get(s:services_status, service, "")
+  if status == "inactive"
+    call init#Jobstart(["ssh", g:HOST, "systemctl start " .. service])
+  else
+    let cmds = []
+    if status != "active"
+      call init#Warn("Status was " .. status .. ".")
+      call add(cmds, "systemctl disable " .. service)
     endif
+    call add(cmds, "systemctl stop " .. service)
+    call init#Jobstart(["ssh", g:HOST, join(cmds, ";")])
+  endif
+endfunction
 
-    if len(s:services_output) > 10
-      for idx in range(10)
-        let line = s:services_output[idx]
-        if stridx(line, 'string "ActiveState"') < 0
-          continue
-        endif
-        let next_line = s:services_output[idx+1]
-        let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
-        if get(s:services_status, service_name, "") != activity
-          let s:services_status[service_name] = activity
-          if init#BufferIsOpen("Services")
-            call s:HighlightServices()
-          else
-            call init#Warn(printf("Service %s is %s!", service_name, activity))
-          endif
-        endif
-        call remove(s:services_output, 0, idx)
-        break
-      endfor
+function! s:StopServiceMonitor()
+  if exists('s:services_job')
+    if jobstop(s:services_job)
+      call jobwait([s:services_job])
     endif
-  endwhile
+    unlet s:services_job
+  endif
 endfunction
 
 function! s:StartServiceMonitor(initial_activity)
+  call s:StopServiceMonitor()
   " XXX: Potential race condition but it makes the code look nicer so it's okay.
   let services = work#GetServices()
   let activity = filter(a:initial_activity, '!empty(v:val)')
   if len(activity) != len(services)
     " Possible if device is down.
-    return init#Warn("Cannot start service monitor!")
+    return init#Warn("Unknown state of some of services!")
   endif
   let s:services_status = #{}
   for idx in range(len(services))
@@ -1577,59 +1544,50 @@ function! s:StartServiceMonitor(initial_activity)
         \ "dbus-monitor",
         \ "--system",
         \ string("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.freedesktop.systemd1.Unit'")]
-  let s:services_output = []
-  call jobstart(["ssh", g:HOST, join(cmd)], #{on_stdout: 's:OnServicesChanged'})
+  let s:services_job = init#Jobstart(["ssh", g:HOST, join(cmd)], #{on_stdout: expand("<SID>") .. 'OnServicesChanged'})
 endfunction
 
-function! s:OpenServices()
-  if !exists('s:services_status')
-    call init#Warn("Starting service monitor...")
-    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
-    let activity = systemlist(["ssh", g:HOST, cmd])
-    call s:StartServiceMonitor(activity)
-  endif
-  let services = work#GetServices()
-  let nr = init#CreateCustomQuickfix('Services', services, 'work#OnSelectedService')
-  call s:HighlightServices()
-endfunction
-
-function work#OnSelectedService()
-  let pos = line('.')
-  let service = getline(pos)
-  let status = get(s:services_status, service, "")
-  if status == "inactive"
-    call jobstart(["ssh", g:HOST, "systemctl start " .. service])
-  else
-    let cmds = []
-    if status != "active"
-      call init#Warn("Status was " .. status .. ".")
-      call add(cmds, "systemctl disable " .. service)
+function s:OnServicesChanged(_0, d, _1)
+  for idx in range(len(a:d))
+    let line = a:d[idx]
+    if stridx(line, "path=/org/freedesktop/systemd1/unit/") >= 0
+      let dbus_name = matchstr(line, 'unit/\zs[^;]*')
+      let service_name = substitute(dbus_name, '_2d', '-', 'g')
+      let service_name = substitute(service_name, '_2e', '.', 'g')
+      if index(work#GetServices(), service_name) >= 0
+        let s:services_last = service_name
+      endif
+    elseif stridx(line, 'string "ActiveState"') >= 0
+      let next_line = get(a:d, idx + 1, '')
+      let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
+      if exists('s:services_last') && s:services_status[s:services_last] != activity
+        let s:services_status[s:services_last] = activity
+        let nr = bufnr("Services")
+        if init#IsVisible(nr)
+          call s:UpdateServicesHl(nr)
+        else
+          call init#Warn(printf("Service %s is %s!", s:services_last, activity))
+        endif
+      endif
     endif
-    call add(cmds, "systemctl stop " .. service)
-    call jobstart(["ssh", g:HOST, join(cmds, ";")])
-  endif
+  endfor
 endfunction
 
-function! s:HighlightServices()
-  if !bufexists("Services")
-    return
-  endif
-  let bufnr = bufnr("Services")
-
-  let services = getbufline(bufnr, 1, '$')
+function! s:UpdateServicesHl(nr)
+  let services = getbufline(a:nr, 1, '$')
   let ns = nvim_create_namespace('services')
   for idx in range(len(services))
-    let activity = get(s:services_status, services[idx], "")
-    let extmarks = nvim_buf_get_extmarks(bufnr, ns, [idx, 0], [idx, 0], #{details: 1})
+    let activity = s:services_status[services[idx]]
+    let extmarks = nvim_buf_get_extmarks(a:nr, ns, [idx, 0], [idx, 0], #{details: 1})
     if !empty(extmarks)
-      call nvim_buf_del_extmark(bufnr, ns, extmarks[0][0])
+      call nvim_buf_del_extmark(a:nr, ns, extmarks[0][0])
     endif
     if activity == 'active'
-      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
+      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
     elseif activity == 'inactive'
-      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
     else
-      call nvim_buf_set_extmark(bufnr, ns, idx, 0, #{line_hl_group: 'Normal'})
+      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'Normal'})
     endif
   endfor
 endfunction
@@ -1639,11 +1597,11 @@ command! -nargs=0 Health call s:OpenServices()
 
 function! s:OnVimEnter()
   " Install commands for the first time
-  call s:InstallHostCommands()
-  call s:StartMaster()
-  call s:OnConnectedHost()
-  " Start RSI on the second workspace
-  call RsiEnableOn("2")
+  call s:OnHostChange()
+  " Run RSI plugin
+  if init#IsMainWorkspace()
+    call RsiEnable()
+  endif
 endfunction
 
 augroup Work
