@@ -107,7 +107,7 @@ command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(v:false), "<ban
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
-  call system(["ssh", g:HOST, "rm -r /var/tmp/" .. g:BUILD_TYPE])
+  call system(["ssh", g:HOST, printf("rm -r /%s/%s", g:RSYNC_DIR, g:BUILD_TYPE)])
   let g:BUILD_TYPE = a:new_type
 endfunction
 
@@ -247,34 +247,38 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let pat = "*" . a:ArgLead . "*"
-  let find = printf("find /var/tmp/%s -name %s -type f -executable", g:BUILD_TYPE, shellescape(pat))
+  let find = printf("find /%s/%s -name %s -type f -executable", g:RSYNC_DIR, g:BUILD_TYPE, shellescape(pat))
   let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
   return filter(result, 'v:val !~ ".sh$"')
 endfunction
 
-function! s:RemoteSync(arg, pat, ...)
-  function! s:OnRsyncStdout(id, data, event)
-    for data in a:data
-      let text = substitute(data, '\n', '', 'g')
-      if len(text) > 0
-        let m = matchlist(text, '[0-9]\+%')
-        if len(m) > 0 && !empty(m[0])
-          let g:statusline_dict['sync'] = m[0]
-        endif
+function! s:OnRsyncStdout(_0, data, _1)
+  for data in a:data
+    let text = substitute(data, '\n', '', 'g')
+    if len(text) > 0
+      let m = matchlist(text, '[0-9]\+%')
+      if len(m) > 0 && !empty(m[0])
+        let g:statusline_dict['sync'] = m[0]
       endif
-    endfor
-  endfunction
-
-  function! s:OnRsyncExit(id, code, event)
-    if a:code == 0
-      echom "Synced!"
-    else
-      echom "Sync failed!"
     endif
-    let g:statusline_dict['sync'] = ''
-  endfunction
+  endfor
+endfunction
 
-  let dir = a:arg
+function! s:OnRsyncExit(clipboard_str, _0, code, _1)
+  if a:code == 0
+    if !empty(a:clipboard_str)
+      call init#ToClipboard(a:clipboard_str)
+    else
+      echom "Synced!"
+    endif
+  else
+    echom "Sync failed!"
+  endif
+  let g:statusline_dict['sync'] = ''
+endfunction
+
+function! s:RemoteSyncExes(dir, exes, ...)
+  let dir = a:dir
   if !isdirectory(dir) && !filereadable(dir)
     echo "Not found: " . dir
     return
@@ -283,58 +287,59 @@ function! s:RemoteSync(arg, pat, ...)
   if dir[-1:-1] == '/'
     let dir = dir[0:-2]
   endif
-  const remote_dir = g:HOST . ":/var/tmp/"
+  const remote_dir = g:HOST . ":" . g:RSYNC_DIR
 
   let cmd = ["rsync", "-rlt"]
-
-  let load_results = a:0 > 0
-  let pat = printf(".*%s.*", a:pat)
   " Include all directories
   call add(cmd, '--include=*/')
   " Include all executables
-  let exes = systemlist(["find", dir, "-type", "f", "-executable", "-regex", pat, "-printf", "%P\n"])
-  for exe in exes
+  for exe in a:exes
     call add(cmd, '--include=' . exe)
   endfor
   " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
   call add(cmd, '--exclude=*')
-
   call extend(cmd, ["--info=progress2", "--out-format='%n'", dir, remote_dir])
-  let id = init#Jobstart(cmd, #{on_stdout: funcref("s:OnRsyncStdout"), on_exit: funcref("s:OnRsyncExit")})
-  if load_results
-    call map(exes, 'printf("/var/tmp/%s/%s", g:BUILD_TYPE, v:val)')
-    call qutil#CreateOneShotQuickfix(exes, 'Target', function('s:SelectTarget'))
-  endif
+
+  let clipboard_str = get(a:000, 0, "")
+  call init#Jobstart(cmd, #{on_stdout: funcref("s:OnRsyncStdout"), on_exit: funcref("s:OnRsyncExit", [clipboard_str])})
 endfunction
 
-function s:SelectTarget(contents)
-  call init#ToClipboard(a:contents)
+function! s:GetSyncTargets(...)
+  let pat = get(a:000, 0, '.*')
+  let dir = FugitiveFind(g:BUILD_TYPE)
+  let exes = systemlist(["find", dir, "-type", "f", "-executable", "-regex", pat, "-printf", "%P\n"])
+  return exes
 endfunction
 
-command! -nargs=? Sync call s:RemoteSync(FugitiveFind(g:BUILD_TYPE), <q-args>, 1)
+function! s:RemoteSyncAll(dir)
+  let exes = s:GetSyncTargets()
+  call s:RemoteSyncExes(a:dir, exes)
+endfunction
 
-function! s:GetSyncPattern()
-  let s:full_sync = v:true
-  if s:full_sync
-    return ".*"
+function work#SyncOne(dir, exe)
+  let remote_exe = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
+  let opts = s:PrepareApp(remote_exe)
+  if has_key(opts, 'user')
+    let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
+  else
+    let cmd = opts['exe']
   endif
+  call s:RemoteSyncExes(a:dir, [a:exe], cmd)
+endfunction
 
-  if stridx(dir, "obsidian-video") >= 0
-    return "obsidian-video"
-  elseif stridx(dir, "badge-and-face") >= 0
-    return "badge_and_face"
-  elseif stridx(dir, "libalcatraz") >= 0 || stridx(dir, "alcatraz-ml-library") >= 0
-    return ""
+command! -nargs=? -complete=customlist,SyncCompl Sync
+      \ call s:GetSyncTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Sync', 'work#SyncOne', FugitiveFind(g:BUILD_TYPE))
+
+function! SyncCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
   endif
-  return ".*"
+  return s:GetSyncTargets()->qutil#FileCompletionPass(a:ArgLead)
 endfunction
 
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
-  let pat = s:GetSyncPattern()
-  if !empty(pat)
-    exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSync('%s', '%s')", dir, pat)
-  endif
+  exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSyncAll('%s')", dir)
   call qutil#Make(work#GetMakeCommand(v:false))
 endfunction
 
@@ -399,7 +404,7 @@ function! work#File(exe)
 endfunction
 
 function! s:AppToClipboard(app)
-  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
+  let app = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:app)
   let opts = s:PrepareApp(app)
   if has_key(opts, 'user')
     let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
@@ -430,7 +435,7 @@ function! s:AppServiceFile(app)
 endfunction
 
 function! s:AppToSystemd(app)
-  let app = printf("/var/tmp/%s/%s", g:BUILD_TYPE, a:app)
+  let app = printf("/%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:app)
   let exe_name = fnamemodify(app, ":t")
   let systemd_name = s:AppServiceFile(app)
   if empty(systemd_name)
@@ -527,10 +532,22 @@ function! s:StartMaster()
 endfunction
 
 function! s:OnMasterExit(code)
-  echom "SSH master died! Waiting for connection..."
+  if !exists('s:master_retries')
+    let s:master_retries = 0
+  endif
+  let s:master_retries += 1
+
   unlet s:master_job_id
   redrawstatus!
-  call init#OnJobSuccess("ssh_wait_silent " .. g:HOST, expand("<SID>") .. 'StartMaster')
+
+
+  const max_retries = 5
+  if s:master_retries <= max_retries
+    echom printf("SSH master died! Retrying %d/%d...", s:master_retries, 5)
+    call init#OnJobSuccess("ssh_wait_silent " .. g:HOST, expand("<SID>") .. 'StartMaster')
+  else
+    call init#Warn("REACHED THE MAXIMUM NUMBER OF SSH MASTER RETRIES!")
+  endif
 endfunction
 
 function! s:CheckMasterConnection(...)
@@ -633,7 +650,15 @@ endfunction
 
 " TODO Trust
 
-command! -nargs=? -complete=customlist,HostCompl Host call s:DetermineConfig(<q-args>, function('s:OnHostChange'))
+function s:ChangeHost(host)
+  if empty(a:host)
+    echo "Current host is: " .. g:HOST
+  else
+    call s:DetermineConfig(a:host, function('s:OnHostChange'))
+  endif
+endfunction
+
+command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -1015,7 +1040,7 @@ function! s:MemoryMonitor(...)
   endif
   let input = "/tmp/" .. input[0]
 
-  let executable = printf("/var/tmp/%s/application/obsidian-video", g:BUILD_TYPE)
+  let executable = printf("%s/%s/application/obsidian-video", g:RSYNC_DIR, g:BUILD_TYPE)
 
   let cmd = printf("%s %s -e=%s", tool, input, executable)
   echo printf('Running tool on %s..', input)
@@ -1533,7 +1558,7 @@ function! s:StartServiceMonitor(initial_activity)
   let activity = filter(a:initial_activity, '!empty(v:val)')
   if len(activity) != len(services)
     " Possible if device is down.
-    return init#Warn("Unknown state of some of services!")
+    return init#Warn("Unknown state of some services!")
   endif
   let s:services_status = #{}
   for idx in range(len(services))
