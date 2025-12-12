@@ -12,9 +12,14 @@ function! s:OnNewCommit()
   setlocal tw=90
   setlocal cc=91
 
+  const whitelist = map(s:GetTargets(), 'v:val[0]')
+  if index(whitelist, FugitiveWorkTree()) < 0
+    return
+  endif
+
   let branch = git#GetBranch()
   if branch == 'master' || branch == 'obsidian-master' || branch == 'main'
-    return init#Warn(printf('Current branch is %s!', branch))
+    return init#Warn('Current branch is %s!', branch)
   endif
 
   let issue = work#BranchIssueNumber()
@@ -29,7 +34,8 @@ autocmd FileType gitcommit call s:OnNewCommit()
 
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#GetMakeCommand(force_configure)
+function! work#GetMakeCommand(...)
+  let force_configure = get(a:000, 0, v:false)
   let repo = FugitiveWorkTree()
   if empty(repo)
     echo "Not inside repo"
@@ -67,7 +73,7 @@ function! work#GetMakeCommand(force_configure)
   endif
 
   if repo == 'libalcatraz'
-    let cmake .= " -DBUILD_TESTS=0 -DPRELOAD_OPENCV_MAT_SUPPORT=1"
+    let cmake .= " -DBUILD_TESTS=0"
     if stridx(g:DEVICE, "onyx") >= 0
       let cmake .= " -DPLATFORM=onyx"
     elseif stridx(g:DEVICE, "rockx") >= 0
@@ -93,7 +99,7 @@ function! work#GetMakeCommand(force_configure)
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
   let build_dir = printf("%s/%s", FugitiveWorkTree(), g:BUILD_TYPE)
-  if a:force_configure || !isdirectory(build_dir)
+  if force_configure || !isdirectory(build_dir)
     call add(cmds, cmake)
   endif
   call add(cmds, build)
@@ -103,7 +109,7 @@ endfunction
 
 command! -nargs=0 -bang Configure call qutil#Make(work#GetMakeCommand(v:true), "<bang>")
 command! -nargs=0 -bang Reconfigure Configure<bang>
-command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(v:false), "<bang>")
+command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), "<bang>")
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
@@ -159,9 +165,10 @@ nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:Journal(bang, arg)
-  let output = init#SystemOrThrow(["ssh", g:HOST, 'cat ' .. a:arg])
-  let service_name = fnamemodify(a:arg, ':t:r')
+function! s:GetJournalCmd(service_name)
+  let service_path = "/usr/lib/systemd/system/" .. a:service_name
+  let output = init#SystemOrThrow(["ssh", g:HOST, 'cat ' .. service_path])
+  let service_name = fnamemodify(service_path, ':t:r')
   let m = matchstrlist(output, 'Description=\(.*\)', #{submatches: v:true})
   if !exists("m[0].submatches[0]")
     echo "Failed to parse description in systemd file!"
@@ -179,13 +186,34 @@ function! s:Journal(bang, arg)
   let output = init#SystemOrThrow(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
   let since = output[0]
   let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
+  return cmd
+endfunction
 
+function! s:Journal(bang, service_name)
+  let cmd = s:GetJournalCmd(a:service_name)
   if !empty(a:bang)
     sp enew
     call termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
-    call init#CustomBottomBuffer('Journal ' .. service_name, lines)
+    call init#CustomBottomBuffer('Journal ' .. a:service_name, lines)
+  endif
+endfunction
+
+function! s:JournalPriority(bang, args)
+  let prio = ["err", "warning", "info"]
+  call qutil#CreateOneShotQuickfix(prio, "Priorities", function("s:OnPriority", [a:bang, a:args]))
+endfunction
+
+function! s:OnPriority(bang, args, prio)
+  let cmd = s:GetJournalCmd(a:args)
+  let cmd = printf("%s -p %s", cmd, a:prio)
+  if !empty(a:bang)
+    sp enew
+    call termopen(["ssh", g:HOST, cmd .. " -f"])
+  else
+    let lines = systemlist(["ssh", g:HOST, cmd])
+    call init#CustomBottomBuffer('Journal ' .. a:args, lines)
   endif
 endfunction
 
@@ -193,15 +221,14 @@ function! JournalCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let files = ["/usr/lib/systemd/system/obsidian-video.service",
-        \ "/usr/lib/systemd/system/qrcode-scanner.service",
-        \ "/usr/lib/systemd/system/rtsp-server-noauth.service",
-        \ "/usr/lib/systemd/system/badge-and-face.service",
-        \ "/usr/lib/systemd/system/rock-video.service"]
-  return filter(files, 'stridx(v:val, a:ArgLead) >= 0')
+  let services = s:GetServices()
+  return filter(services, 'stridx(v:val, a:ArgLead) >= 0')
 endfunction
 
 command! -nargs=1 -bang -complete=customlist,JournalCompl Journal call s:Journal("<bang>", <q-args>)
+command! -nargs=1 -bang -complete=customlist,JournalCompl JP call s:JournalPriority("<bang>", <q-args>)
+
+cabbr J Journal
 
 function! s:SshTerminal()
   below sp
@@ -211,7 +238,7 @@ endfunction
 
 command! -nargs=0 T call s:SshTerminal()
 
-function! s:SshfsOnSteroids(what)
+function! s:RemoteFileCommand(what, cb)
   if empty(a:what)
     let files = init#RemoteRecentFiles(g:HOST)
   else
@@ -222,12 +249,10 @@ function! s:SshfsOnSteroids(what)
       let files = [a:what]
     endif
   endif
-  if len(files) > 1
-    call qutil#CreateOneShotQuickfix(files, 'Remote files', 'work#SelectRemoteFile')
-  elseif len(files) == 1
-    call init#Sshfs(g:HOST, files[0])
-  else
+  if len(files) <= 0
     echo "Nothing to show."
+  else
+    call qutil#CreateOneShotQuickfix(files, 'Remote files', a:cb)
   endif
 endfunction
 
@@ -247,7 +272,7 @@ function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let pat = "*" . a:ArgLead . "*"
-  let find = printf("find /%s/%s -name %s -type f -executable", g:RSYNC_DIR, g:BUILD_TYPE, shellescape(pat))
+  let find = printf("find %s/%s -name %s -type f -executable", g:RSYNC_DIR, g:BUILD_TYPE, shellescape(pat))
   let result = systemlist(["ssh", "-o", "ConnectTimeout=1", g:HOST, find])
   return filter(result, 'v:val !~ ".sh$"')
 endfunction
@@ -264,20 +289,19 @@ function! s:OnRsyncStdout(_0, data, _1)
   endfor
 endfunction
 
-function! s:OnRsyncExit(clipboard_str, _0, code, _1)
+function! s:OnRsyncExit(post_cmds, cb, _0, code, _1)
   if a:code == 0
-    if !empty(a:clipboard_str)
-      call init#ToClipboard(a:clipboard_str)
-    else
-      echom "Synced!"
+    if !empty(a:post_cmds)
+      call init#Jobstart(["ssh" , g:HOST, a:post_cmds])
     endif
+    call function(a:cb)()
   else
     echom "Sync failed!"
   endif
   let g:statusline_dict['sync'] = ''
 endfunction
 
-function! s:RemoteSyncExes(dir, exes, ...)
+function! s:RemoteSyncExes(dir, exes, cb)
   let dir = a:dir
   if !isdirectory(dir) && !filereadable(dir)
     echo "Not found: " . dir
@@ -293,15 +317,23 @@ function! s:RemoteSyncExes(dir, exes, ...)
   " Include all directories
   call add(cmd, '--include=*/')
   " Include all executables
+  let post_cmds = []
   for exe in a:exes
     call add(cmd, '--include=' . exe)
+    " Post cmd
+    let remote_exe = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, exe)
+    if exe =~ 'obsidian-video$' || exe =~ 'rock-video$'
+      call add(post_cmds, "setcap cap_sys_nice+ep " .. remote_exe)
+    elseif exe =~ 'mock_video$'
+      call add(post_cmds, "setcap cap_kill+ep " .. remote_exe)
+    endif
   endfor
   " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
   call add(cmd, '--exclude=*')
   call extend(cmd, ["--info=progress2", "--out-format='%n'", dir, remote_dir])
 
-  let clipboard_str = get(a:000, 0, "")
-  call init#Jobstart(cmd, #{on_stdout: funcref("s:OnRsyncStdout"), on_exit: funcref("s:OnRsyncExit", [clipboard_str])})
+  let OnExit = funcref("s:OnRsyncExit", [join(post_cmds, ';'), a:cb])
+  call init#Jobstart(cmd, #{on_stdout: funcref("s:OnRsyncStdout"), on_exit: OnExit})
 endfunction
 
 function! s:GetSyncTargets(...)
@@ -312,19 +344,33 @@ function! s:GetSyncTargets(...)
 endfunction
 
 function! s:RemoteSyncAll(dir)
+  function! s:ShowSyncMessage()
+    echo "Synced!"
+  endfunction
   let exes = s:GetSyncTargets()
-  call s:RemoteSyncExes(a:dir, exes)
+  call s:RemoteSyncExes(a:dir, exes, "s:ShowSyncMessage")
 endfunction
 
 function work#SyncOne(dir, exe)
-  let remote_exe = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
-  let opts = s:PrepareApp(remote_exe)
-  if has_key(opts, 'user')
-    let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
-  else
-    let cmd = opts['exe']
+  if exists('s:services_status')
+    let systemd_name = s:GetServiceName(a:exe)
+    let status = get(s:services_status, systemd_name, "inactive")
+    if status != "inactive" && status != "failed"
+      return init#Warn("Service %s is %s!", systemd_name, status)
+    endif
   endif
-  call s:RemoteSyncExes(a:dir, [a:exe], cmd)
+  " Build clipboard string.
+  let remote_exe = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
+  " Check if there is a configured user.
+  let [user, flags] = s:GetUserAndFlags(remote_exe)
+  let cmd = remote_exe
+  if !empty(user)
+    let cmd = printf("sudo -u %s %s", user, cmd)
+  endif
+  if !empty(flags)
+    let cmd = printf("%s %s", cmd, flags)
+  endif
+  call s:RemoteSyncExes(a:dir, [a:exe], function("init#ToClipboard", [cmd]))
 endfunction
 
 command! -nargs=? -complete=customlist,SyncCompl Sync
@@ -340,124 +386,93 @@ endfunction
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
   exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSyncAll('%s')", dir)
-  call qutil#Make(work#GetMakeCommand(v:false))
+  call qutil#Make(work#GetMakeCommand())
 endfunction
 
-" command -nargs=0 -bang Capability let g:CAPABILITIES = <bang>1
-
-function s:MakeNiceApp(exe)
-  if get(g:, 'CAPABILITIES', 1)
-    let exe = split(a:exe, " ")[0]
-    call init#SystemOrThrow(["ssh" , g:HOST, "setcap cap_sys_nice+ep " .. exe])
-  else
-    call init#Warn("Capabilities are disabled!")
-  endif
-  return a:exe
-endfunction
-
-function! s:PrepareApp(exe)
-  if a:exe =~ "qrcode-scanner$"
-    return #{exe: a:exe, user: "rock-bootstrap"}
-  elseif a:exe =~ "rock-video$"
-    return #{exe: a:exe, user: "rock-video"}
-  elseif a:exe =~ "device-health$"
-    return #{exe: a:exe, user: "device-health"}
-  endif
-  let nice_exe = s:MakeNiceApp(a:exe)
-  if a:exe =~ "rtsp-server$"
-    let nice_exe ..= " --noauth"
-    return #{exe: nice_exe, user: "rtsp-server"}
-  elseif a:exe =~ "badge_and_face$"
-    return #{exe: nice_exe, user: "badge_and_face"}
-  elseif a:exe =~ "profile_generator$"
-    return #{exe: nice_exe}
-  elseif a:exe =~ 'obsidian-video$'
-    return #{exe: nice_exe, user: "rock-video"}
-  else
-    return #{exe: nice_exe}
-  endif
-endfunction
-
-function! work#Debug(exe, opts)
-  let opts = extend(a:opts, s:PrepareApp(a:exe))
-  " TODO hacky code
-  let opts['exe'] = a:exe
+function! work#Debug(arg, opts)
+  let opts = a:opts
+  const exe = split(a:arg, ' ')[0]
+  let opts['exe'] = a:arg
   let opts['ssh'] = g:HOST
+
+  " Check if there is a configured user/flags.
+  let [user, flags] = s:GetUserAndFlags(exe)
+  if !empty(user)
+    let opts['user'] = user
+  endif
+  " Don't override flags set by a:arg
+  if a:arg == exe && !empty(flags)
+    let opts['exe'] = printf('%s %s', exe, flags)
+  endif
+
+  " Add a command to be executed once there is an inferior.
   if !has_key(opts, 'post_cmds')
     let opts['post_cmds'] = []
   endif
   let aisys_sdk_subst = printf('set substitute-path /usr/src/debug %s/sysroots/armv8a-aisys-linux/usr/src/debug', g:SDK_DIR)
   call add(opts['post_cmds'], aisys_sdk_subst)
+
+  " Call main debugging routine.
   call init#Debug(opts)
 endfunction
 
-function! work#Start(exe)
-  call work#Debug(a:exe, #{})
-endfunction
-
-function! work#Run(exe)
-  call work#Debug(a:exe, #{br: init#GetDebugLoc()})
-endfunction
-
-function! work#File(exe)
-  call work#Debug(a:exe, #{wait: 1})
-endfunction
-
-function! s:AppToClipboard(app)
-  let app = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:app)
-  let opts = s:PrepareApp(app)
-  if has_key(opts, 'user')
-    let cmd = printf("sudo -u %s %s", opts['user'], opts['exe'])
-  else
-    let cmd = opts['exe']
+function! s:GetApps()
+  let apps = #{
+        \ rtsp-server: #{user: "rtsp-server", service: "rtsp-server.service"},
+        \ badge_and_face: #{user: "badge_and_face", service: "badge-and-face.service"},
+        \ qrcode-scanner: #{user: "rock-bootstrap", service:"qrcode-scanner.service"},
+        \ device-health: #{user: "device-health", service: "device-health.service"},
+        \ }
+  if stridx(g:DEVICE, "rockx") >= 0
+    let apps["obsidian-video"] = #{user: "rock-video", service: "obsidian-video.service"}
+  elseif stridx(g:DEVICE, "onyx") >= 0
+    let apps["rock-video"] = #{user: "rock-video", service: "rock-video.service"}
   endif
-  " Sanity check
-  if exists('s:services_status')
-    let systemd_name = s:AppServiceFile(a:app)
-    let status = get(s:services_status, systemd_name, "inactive")
-    if status != "inactive" && status != "failed"
-      return init#Warn(printf("Service %s is %s!", systemd_name, status))
-    endif
-  endif
-  call init#ToClipboard(cmd)
+  return apps
 endfunction
 
-function! s:AppServiceFile(app)
-  let exe_name = fnamemodify(a:app, ':t')
-  if exe_name == 'obsidian-video'
-    return "obsidian-video.service"
-  elseif exe_name == 'badge_and_face'
-    return 'badge-and-face.service'
-  elseif exe_name == 'rock-video'
-    return 'rock-video.service'
+function! s:GetUserAndFlags(exe)
+  let key = fnamemodify(a:exe, ':t')
+  let apps = s:GetApps()
+  if has_key(apps, key)
+    let user = get(apps[key], 'user', '')
+    return [user, '']
   endif
-  return ''
+  if key == 'mock_video'
+    return ['rock-video', '/tmp/capture']
+  elseif key == 'capture-video'
+    return ['rock-video', '-n=100']
+  endif
+  return ['', '']
 endfunction
 
-function! s:AppToSystemd(app)
-  let app = printf("/%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:app)
-  let exe_name = fnamemodify(app, ":t")
-  let systemd_name = s:AppServiceFile(app)
+function! s:GetServiceName(exe)
+  let key = fnamemodify(a:exe, ':t')
+  return init#Get(s:GetApps(), key, 'service', '')
+endfunction
+
+function! s:RunAsService(exe)
+  let remote_path = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
+  let exe_name = fnamemodify(remote_path, ":t")
+  let systemd_name = s:GetServiceName(a:exe)
   if empty(systemd_name)
-    return "Unsupported app: " .. a:app
+    return "Unsupported: " .. exe_name
   endif
   let cmds = []
   call add(cmds, printf("echo Stopping %s...", systemd_name))
   call add(cmds, "systemctl stop " .. systemd_name)
-  call add(cmds, printf("cp %s /usr/bin/%s", app, exe_name))
-  call add(cmds, "setcap cap_sys_nice+ep /usr/bin/" .. exe_name)
+  call add(cmds, printf("cp %s /usr/bin/%s", remote_path, exe_name))
+  call add(cmds, printf("rsync -a --xattrs %s /usr/bin/", remote_path))
   call add(cmds, printf("echo Starting %s...", systemd_name))
   call add(cmds, "systemctl start " .. systemd_name)
+
+  " TESTING
+  throw string(cmds)
 
   sp
   enew
   let id = termopen(["ssh", g:HOST, join(cmds, ' && ')])
-  let systemd_file = JournalCompl(systemd_name, '', 0)
-  if len(systemd_file) == 1
-    call init#OnTermClosed(id, function('s:Journal', ['!', systemd_file[0]]))
-  else
-    call init#Warn('Failed to find ' .. systemd_name)
-  endif
+  call init#OnTermSuccess(id, function('s:Journal', ['!', systemd_name]))
 endfunction
 
 function! s:DetermineConfig(host, Cb)
@@ -509,7 +524,6 @@ function! s:OnControlFileEvent(...)
   else
     echom "SSH connection died..."
   endif
-  redrawstatus!
 endfunction
 
 function! work#IsMasterRunning()
@@ -518,35 +532,26 @@ endfunction
 
 function! s:StartMaster()
   if exists('s:master_job_id')
+    let s:master_stop_request = 1
     call timer_stop(s:master_timer_id)
     if jobstop(s:master_job_id)
       call jobwait([s:master_job_id])
     endif
+    unlet s:master_stop_request
   endif
-  call assert_false(work#ControlFileExists())
 
-  let cmd = "ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new -N -M " .. g:HOST
+  let cmd = "ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new -M -N " .. g:HOST
   let s:master_job_id = init#OnJobExit(cmd, expand("<SID>") .. 'OnMasterExit')
   let s:master_timer_id = timer_start(1100, 's:CheckMasterConnection')
   call assert_true(s:master_job_id > 0)
 endfunction
 
 function! s:OnMasterExit(code)
-  if !exists('s:master_retries')
-    let s:master_retries = 0
-  endif
-  let s:master_retries += 1
-
   unlet s:master_job_id
   redrawstatus!
 
-
-  const max_retries = 5
-  if s:master_retries <= max_retries
-    echom printf("SSH master died! Retrying %d/%d...", s:master_retries, 5)
-    call init#OnJobSuccess("ssh_wait_silent " .. g:HOST, expand("<SID>") .. 'StartMaster')
-  else
-    call init#Warn("REACHED THE MAXIMUM NUMBER OF SSH MASTER RETRIES!")
+  if !exists('s:master_stop_request')
+    echom "SSH master died!"
   endif
 endfunction
 
@@ -560,8 +565,9 @@ endfunction
 function s:OnConnectedMaster()
   call s:DetermineSdk()
   call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
-  let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
+  let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
   call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+  call init#OnJobOutput(["ssh", g:HOST, "df --output=avail " .. g:RSYNC_DIR], function('s:OnRsyncSpaceAvailable'))
 endfunction
 
 function! s:OnDeviceMounts(mnt)
@@ -572,6 +578,16 @@ function! s:OnDeviceMounts(mnt)
   let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
   if index(flags, "ro") >= 0
     call init#Jobstart(["ssh", g:HOST, "mount -o remount,rw /usr"])
+  endif
+endfunction
+
+function! s:OnRsyncSpaceAvailable(space)
+  if len(a:space) < 2
+    return
+  endif
+  let mb = a:space[1] / 1024
+  if mb < 500
+    call init#Warn('RSYNC directory has only %dMB available storage!', mb)
   endif
 endfunction
 
@@ -597,31 +613,29 @@ function! s:OnSdkOutput(output)
 endfunction
 
 function! s:InstallHostCommands()
-  command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#Start', <q-args>)
-  command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#Run', <q-args>)
-  command! -nargs=? -complete=customlist,RemoteExeCompl File call init#TryCall('work#File', <q-args>)
+  command! -nargs=? -complete=customlist,RemoteExeCompl Start call init#TryCall('work#Debug', <q-args>, #{})
+  command! -nargs=? -complete=customlist,RemoteExeCompl Run call init#TryCall('work#Debug', <q-args>, #{br: init#GetDebugLoc()})
+  command! -nargs=? -complete=customlist,RemoteExeCompl File call init#TryCall('work#Debug', <q-args>, #{wait: 1})
 
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
-  exe printf("command! -nargs=? -bang Sshfind call init#RemoteRecentFiles('<bang>', '%s', <q-args>)", g:HOST)
-  exe printf("command! -nargs=? -complete=customlist,SshfsCompl Scp call init#Scp('%s', empty(<q-args>) ? '/tmp' : <q-args>)", g:HOST)
+  exe printf("command! -nargs=? -bang -complete=customlist,SshfsCompl Scp call init#Scp('%s', '<bang>', empty(<q-args>) ? '/tmp' : <q-args>)", g:HOST)
 
-  command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:SshfsOnSteroids(<q-args>)
+  command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
   cabbr SSfs Ssfs
 
-  nnoremap <silent> <leader>rb <cmd>call <SID>AppToClipboard("bin/badge_and_face")<CR>
-  nnoremap <silent> <leader>sb <cmd>call <SID>AppToSystemd("bin/badge_and_face")<CR>
+  nnoremap <silent> <leader>rb <cmd>Sync badge_and_face<CR>
+  nnoremap <silent> <leader>sb <cmd>call <SID>RunAsService("bin/badge_and_face")<CR>
+  nnoremap <silent> <leader>rs <cmd>Sync rtsp-server<CR>
   if stridx(g:DEVICE, "onyx") >= 0
-    nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("pipeline/rock-video")<CR>
-    nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("pipeline/rtsp-server")<CR>
-    nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("pipeline/rock-video")<CR>
+    nnoremap <silent> <leader>rv <cmd>Sync rock-video<CR>
+    nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("pipeline/rock-video")<CR>
   elseif stridx(g:DEVICE, "rockx") >= 0
-    nnoremap <silent> <leader>rv <cmd>call <SID>AppToClipboard("application/obsidian-video")<CR>
-    nnoremap <silent> <leader>rf <cmd>call <SID>AppToClipboard("application/focus-tool")<CR>
-    nnoremap <silent> <leader>rq <cmd>call <SID>AppToClipboard("application/qrcode-scanner")<CR>
-    nnoremap <silent> <leader>rs <cmd>call <SID>AppToClipboard("application/rtsp-server")<CR>
-    nnoremap <silent> <leader>sv <cmd>call <SID>AppToSystemd("application/obsidian-video")<CR>
+    nnoremap <silent> <leader>rv <cmd>Sync obsidian-video<CR>
+    nnoremap <silent> <leader>rf <cmd>Sync focus-tool<CR>
+    nnoremap <silent> <leader>rq <cmd>Sync qrcode-scanner<CR>
+    nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("application/obsidian-video")<CR>
   else
     call init#Warn("Not installing host specific maps!")
   endif
@@ -648,17 +662,45 @@ function! HostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-" TODO Trust
-
-function s:ChangeHost(host)
-  if empty(a:host)
+function! s:ChangeHost(bang, host)
+  if !empty(a:bang)
+    if !empty(a:host)
+      return init#Warn("Expecting no arguments with '!'")
+    endif
+    call init#OnJobExit(["ssh_wait_silent", g:HOST], function('s:TryReconnect'))
+  elseif empty(a:host)
     echo "Current host is: " .. g:HOST
   else
-    call s:DetermineConfig(a:host, function('s:OnHostChange'))
+    call s:DetermineConfig(a:host, function('s:OnHostResolvedIP'))
   endif
 endfunction
 
-command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
+function! s:TryReconnect(code)
+  if a:code == 0
+    call s:OnHostChange()
+  else
+    call init#Warn("Connection to '%s': Timed out.", g:HOST)
+  endif
+endfunction
+
+function! s:OnHostResolvedIP()
+  let cmds = []
+  call add(cmds, "ssh-keygen -R " .. g:HOST_IP)
+  call add(cmds, "echo 'Waiting for connection...'")
+  call add(cmds, "ssh_wait_silent " .. g:HOST)
+
+  botr split
+  enew
+  let id = termopen(join(cmds, ";"))
+  call init#OnTermSuccess(id, expand("<SID>") .. "OnHostChange")
+  startinsert
+endfunction
+
+function! s:OnHostTrusted()
+  call s:OnHostChange()
+endfunction
+
+command! -nargs=? -bang -complete=customlist,HostCompl Host call s:ChangeHost("<bang>", <q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -680,37 +722,27 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
         \ "BuildSdk", "BuildImage", "BuildMfg", "InstallSdk", "ShowImage",
         \ "SaveImage", "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
-        \ "OpenCV", "MemoryMonitor", "EnableCore"]
+        \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-function work#GetServices()
-  let services = [
-        \ "rtsp-server-noauth.service",
-        \ "rtsp-server.socket",
-        \ "rtsp-server.service",
-        \ "badge-and-face.service",
-        \ "qrcode-scanner.service",
-        \ "device-health.service",
-        \ ]
-  if stridx(g:DEVICE, "rockx") >= 0
-    call add(services, "obsidian-video.service")
-  elseif stridx(g:DEVICE, "onyx") >= 0
-    call add(services, "rock-video.service")
-  endif
+function s:GetServices()
+  let services = map(values(s:GetApps()), 'v:val.service')
+  call add(services, "rtsp-server-noauth.service")
+  call add(services, "rtsp-server.socket")
   return services
 endfunction
 
 function! s:StopServices()
-  let stop_list = work#GetServices()
-  let cmds = []
+  call s:OpenServices()
+
+  let stop_list = s:GetServices()
+  let cmd = "systemctl stop"
   for service in stop_list
-    let cmd = "systemctl stop " . service
-    call add(cmds, cmd)
+    let cmd ..= " " . service
   endfor
 
-  call init#SystemOrThrow(["ssh", g:HOST, join(cmds, ";")])
-  echo "Stopped."
+  call init#Jobstart(["ssh", g:HOST, cmd])
 endfunction
 
 function! s:DropClients()
@@ -842,17 +874,17 @@ endfunction
 
 function! s:RefreshImage()
   let id = s:BuildImage()
-  call init#OnTermClosed(id, function("s:InstallImage"))
+  call init#OnTermSuccess(id, function("s:InstallImage"))
 endfunction
 
 function! s:RefreshSdk()
   let id = s:BuildSdk()
-  call init#OnTermClosed(id, function("s:InstallSdk"))
+  call init#OnTermSuccess(id, function("s:InstallSdk"))
 endfunction
 
 function! s:Refresh()
   let id = s:RunDocker("bitbake rock-image && bitbake rock-image -c populate_sdk")
-  call init#OnTermClosed(id, function("s:InstallBoth"))
+  call init#OnTermSuccess(id, function("s:InstallBoth"))
 endfunction
 
 function! s:InstallBoth()
@@ -882,10 +914,10 @@ function! s:FakeSdk()
     let so_name = "libhiredis.so"
     let so_dir = printf("%s/%s", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/hiredis.pc", so_dir)
-  elseif stridx(repo_dir, 'csdblib') >= 0
-    let so_name = "libcsdb.so"
-    let so_dir = printf("%s/%s", repo_dir, g:BUILD_TYPE)
-    let pc = printf("%s/libcsdb.pc", so_dir)
+  elseif stridx(repo_dir, 'device-health') >= 0
+    " Header only library. This command is sufficient
+    let cmd = printf("rsync -rtv %s/include/device_health_api.h %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/health", repo_dir, g:SDK_DIR)
+    return termopen(cmd)
   else
     echo "No repo matched!"
     return
@@ -931,7 +963,7 @@ function! s:HostDebugSyms(...)
 endfunction
 
 function! s:PlotTrace(name)
-  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-trace/", g:HOST))
+  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-profiling/", g:HOST))
   if empty(trace_txt)
     echo "No trace"
     return
@@ -943,14 +975,13 @@ function! s:PlotTrace(name)
   let plot_output = "~/Downloads/tracing/plot/" .. a:name
 
   if g:BUILD_TYPE != "Release"
-    let msg = "Build type is " .. g:BUILD_TYPE .. "."
-    call init#Warn(msg)
+    call init#Warn("Build type is %s.", g:BUILD_TYPE)
   endif
 
   let cmds = []
   call add(cmds, "mkdir -p " .. parse_input)
   call add(cmds, "mkdir -p " .. plot_output)
-  call add(cmds, printf("scp %s:/tmp/obsidian-trace/%s %s", g:HOST, trace_txt, parse_input))
+  call add(cmds, printf("scp %s:/tmp/obsidian-profiling/%s %s", g:HOST, trace_txt, parse_input))
   call add(cmds, "source ~/tracing_venv/bin/activate")
   call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
   call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
@@ -969,8 +1000,7 @@ function! s:BarfPlotTrace(name)
   let trace_txt = trace_txt[0]
 
   if g:BUILD_TYPE != "Release"
-    let msg = "Build type is " .. g:BUILD_TYPE .. "."
-    call init#Warn(msg)
+    call init#Warn("Build type is %s.", g:BUILD_TYPE)
   endif
 
   echo "Removing extra columns from file..."
@@ -1054,21 +1084,20 @@ function! s:EnableCore()
   call init#ToClipboard("cd /tmp && ulimit -c unlimited")
 endfunction
 
+function! s:CheckHealth()
+  let cmd = "redis-cli -s /run/ctlsys/redis.sock publish device-health:print 1"
+  call system(["ssh", g:HOST, cmd])
+endfunction
+
 function s:GetTargets()
   " Note: Ordered by priority
   let targets = [
           \ ["/home/stef/libalcatraz", "master", "libalcatraz_git.bb"],
           \ ["/home/stef/alcatraz-ml-library", "main", "alcatraz-ml_git.bb"],
           \ ["/home/stef/device-health", "main", "device-health_git.bb"]]
-  if stridx(g:DEVICE, "onyx") >= 0
-    call add(targets, ["/home/stef/rock-video", "master", "rock-video_git.bb"])
-    call add(targets, ["/home/stef/badge-and-face", "master", "badge-and-face_git.bb"])
-  elseif stridx(g:DEVICE, "rockx") >= 0
-    call add(targets, ["/home/stef/obsidian-video", "main", "obsidian-video_git.bb"])
-    call add(targets, ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face_git.bb"])
-  else
-    throw "Unknown device: " .. g:DEVICE
-  endif
+  call add(targets, ["/home/stef/rock-video", "master", "rock-video_git.bb"])
+  call add(targets, ["/home/stef/obsidian-video", "main", "obsidian-video_git.bb"])
+  call add(targets, ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face_git.bb"])
   return targets
 endfunction
 
@@ -1076,7 +1105,6 @@ function! s:Bb()
   call s:AddRepo(FugitiveWorkTree())
 endfunction
 
-" TODO Da e po avtomatizirano pls
 function! s:AddRepo(repo)
   let repo = a:repo
   let targets = filter(s:GetTargets(), 'v:val[0] == repo')
@@ -1258,6 +1286,14 @@ function! work#OpenJira(issue)
   endif
 endfunction
 
+function! s:OpenMR()
+  let url = git#ExecuteOrThrow(['remote', 'get-url', 'origin'])[0]
+  let url = substitute(url, '^git@gitlab.com:', 'https://gitlab.com/', '')
+  let url = substitute(url, '\.git$', '', '')
+  let url ..= '/-/merge_requests'
+  call init#ToClipboard(url)
+endfunction
+
 function! s:ShowActivity()
   let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
   let branches = git#ExecuteOrThrow(cmd, "Failed to fetch recent commits!")
@@ -1329,7 +1365,7 @@ function! IssueCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent",
         \ "CopyBranch", "CopyHash", "MessageSearch",
-        \ "CodeSearch", "AuthorSearch"]
+        \ "CodeSearch", "AuthorSearch", "OpenMR"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1501,7 +1537,6 @@ function! s:Orientation(deg)
   call append(pos, config)
   write
   quit
-  " call init#SystemOrThrow(["ssh", g:HOST, "systemctl restart obsidian-video"])
 endfunction
 
 command! -nargs=? Orientation call s:Orientation(<q-args>)
@@ -1510,17 +1545,14 @@ command! -nargs=? Orientation call s:Orientation(<q-args>)
 """"""""""""""""""""""""""""Services"""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:OpenServices()
-  let did_start = !exists('s:services_job')
-  if did_start
-    let cmd = "systemctl is-active " .. join(work#GetServices(), " ")
-    let activity = systemlist(["ssh", g:HOST, cmd])
-    call s:StartServiceMonitor(activity)
-  endif
-  let services = work#GetServices()
+  let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
+  let activity = systemlist(["ssh", g:HOST, cmd])
+  call s:StartServiceMonitor(activity)
+
+  let services = s:GetServices()
   let nr = qutil#CreateCustomQuickfix(services, 'Services', expand("<SID>") .. 'OnSelectedService')
   call s:UpdateServicesHl(nr)
-  if did_start
-    call assert_false(init#IsMainWorkspace())
+  if !init#IsMainWorkspace()
     call init#OnBufDelete(nr, expand("<SID>") .. "StopServiceMonitor")
   endif
 endfunction
@@ -1534,7 +1566,7 @@ function s:OnSelectedService()
   else
     let cmds = []
     if status != "active"
-      call init#Warn("Status was " .. status .. ".")
+      call init#Warn("Status was %s.", status)
       call add(cmds, "systemctl disable " .. service)
     endif
     call add(cmds, "systemctl stop " .. service)
@@ -1554,7 +1586,7 @@ endfunction
 function! s:StartServiceMonitor(initial_activity)
   call s:StopServiceMonitor()
   " XXX: Potential race condition but it makes the code look nicer so it's okay.
-  let services = work#GetServices()
+  let services = s:GetServices()
   let activity = filter(a:initial_activity, '!empty(v:val)')
   if len(activity) != len(services)
     " Possible if device is down.
@@ -1572,6 +1604,20 @@ function! s:StartServiceMonitor(initial_activity)
   let s:services_job = init#Jobstart(["ssh", g:HOST, join(cmd)], #{on_stdout: expand("<SID>") .. 'OnServicesChanged'})
 endfunction
 
+function! work#ServicesStatus()
+  if !exists('s:services_status')
+    echo "No services monitored!"
+    return
+  endif
+
+  let lines = []
+  for service in keys(s:services_status)
+    let line = printf("%s: %s", service, s:services_status[service])
+    call add(lines, line)
+  endfor
+  let nr = init#CustomBottomBuffer('Services', lines)
+endfunction
+
 function s:OnServicesChanged(_0, d, _1)
   for idx in range(len(a:d))
     let line = a:d[idx]
@@ -1579,19 +1625,24 @@ function s:OnServicesChanged(_0, d, _1)
       let dbus_name = matchstr(line, 'unit/\zs[^;]*')
       let service_name = substitute(dbus_name, '_2d', '-', 'g')
       let service_name = substitute(service_name, '_2e', '.', 'g')
-      if index(work#GetServices(), service_name) >= 0
-        let s:services_last = service_name
-      endif
+      let s:services_last = service_name
     elseif stridx(line, 'string "ActiveState"') >= 0
       let next_line = get(a:d, idx + 1, '')
       let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
-      if exists('s:services_last') && s:services_status[s:services_last] != activity
-        let s:services_status[s:services_last] = activity
-        let nr = bufnr("Services")
-        if init#IsVisible(nr)
-          call s:UpdateServicesHl(nr)
-        else
-          call init#Warn(printf("Service %s is %s!", s:services_last, activity))
+      " TODO DEBUG THIS BAD BOY
+      if empty(activity)
+        call init#Warn(next_line)
+      endif
+      if exists('s:services_last') && has_key(s:services_status, s:services_last)
+        let changed = s:services_status[s:services_last] != activity
+        if changed
+          let s:services_status[s:services_last] = activity
+          let nr = bufnr("Services")
+          if init#IsVisible(nr)
+            call s:UpdateServicesHl(nr)
+          else
+            call init#Warn("Service %s is %s!", s:services_last, activity)
+          endif
         endif
       endif
     endif
