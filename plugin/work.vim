@@ -34,14 +34,21 @@ autocmd FileType gitcommit call s:OnNewCommit()
 
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#GetMakeCommand(...)
-  let force_configure = get(a:000, 0, v:false)
-  let repo = FugitiveWorkTree()
-  if empty(repo)
+function! work#GetMakeCommand()
+  let repo = split(FugitiveWorkTree(), "/")[-1]
+  if repo == "worktree"
+    let orig = git#ExecuteOrThrow(["rev-parse", "--git-common-dir"])[0]
+    let repo = split(orig, "/")[-2]
+  endif
+  return work#GetMakeCommandFor(repo)
+endfunction
+
+function! work#GetMakeCommandFor(repo)
+  if empty(a:repo)
     echo "Not inside repo"
     return
   endif
-  let repo = split(FugitiveWorkTree(), "/")[-1]
+  const repo = split(a:repo, "/")[-1]
   let whitelist_repos = ["obsidian-video", "libalcatraz", "mpp",
         \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
         \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
@@ -58,9 +65,11 @@ function! work#GetMakeCommand(...)
     call add(cmds, "export ParavisionSDKType=ROCKCHIP")
   endif
 
+  let libstdcpp = "11.5.0"
   let sdk_flags = [
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.5.0/", g:SDK_DIR),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/11.5.0/aarch64-aisys-linux", g:SDK_DIR), "-ffast-math", "-ftree-vectorize"]
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/", g:SDK_DIR, libstdcpp),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/aarch64-aisys-linux", g:SDK_DIR, libstdcpp),
+        \ ]
   call add(cmds, "export CXXFLAGS=" . string(join(sdk_flags)))
 
   if repo == 'camera_engine_rkaiq'
@@ -79,6 +88,7 @@ function! work#GetMakeCommand(...)
     elseif stridx(g:DEVICE, "rockx") >= 0
       let cmake .= " -DPLATFORM=obsidian-dm"
     endif
+    let cmake .= " -DPRELOAD_OPENCV_MAT_SUPPORT=1"
   elseif repo == 'alcatraz-ml-library' || repo == 'badge-and-face' || repo == 'device-health'
     if stridx(g:DEVICE, "onyx") >= 0
       let cmake .= " -DDEVICE=onyx"
@@ -87,19 +97,23 @@ function! work#GetMakeCommand(...)
     endif
   endif
 
+  if repo == 'device-health'
+    let cmake .= " -DBUILD_TESTS=ON"
+  endif
+
   " Build specific flags
   if g:BUILD_TYPE == 'Release'
     let cmake .= ' -DCMAKE_CXX_FLAGS_RELEASE="-g1 -fno-omit-frame-pointer"'
   elseif g:BUILD_TYPE == 'RelWithDebinfo'
     let cmake .= ' -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-Og -g2"'
   elseif g:BUILD_TYPE == 'Debug'
-    let cmake .= ' -DCMAKE_CXX_FLAGS_DEBUG="-O0 -ggdb -U_FORTIFY_SOURCE"'
+    let cmake .= ' -DCMAKE_CXX_FLAGS_DEBUG="-O0 -g -ggdb -U_FORTIFY_SOURCE"'
   endif
 
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
   let build_dir = printf("%s/%s", FugitiveWorkTree(), g:BUILD_TYPE)
-  if force_configure || !isdirectory(build_dir)
+  if !isdirectory(build_dir)
     call add(cmds, cmake)
   endif
   call add(cmds, build)
@@ -107,8 +121,6 @@ function! work#GetMakeCommand(...)
   return command
 endfunction
 
-command! -nargs=0 -bang Configure call qutil#Make(work#GetMakeCommand(v:true), "<bang>")
-command! -nargs=0 -bang Reconfigure Configure<bang>
 command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), "<bang>")
 
 function! s:ChangeBuildType(new_type)
@@ -258,6 +270,23 @@ endfunction
 
 function! work#SelectRemoteFile(file)
   call init#Sshfs(g:HOST, a:file)
+endfunction
+
+function! work#DownloadRemoteFile(file)
+  let url = printf("%s:%s", g:HOST, a:file)
+  call init#SystemOrThrow(["rsync", url, expand("~/Downloads")])
+  let result = expand("~/Downloads/" .. fnamemodify(a:file, ":t"))
+  if filereadable(result)
+    call init#ToClipboard(result)
+    let bytes = readfile(result, 'b', 200)
+    for l in bytes
+      if l =~# '[^\x09\x0A\x0D\x20-\x7E]'
+        echo "Download " .. result
+        return
+      endif
+    endfor
+    exe "e " .. result
+  endif
 endfunction
 
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
@@ -460,14 +489,10 @@ function! s:RunAsService(exe)
   endif
   let cmds = []
   call add(cmds, printf("echo Stopping %s...", systemd_name))
-  call add(cmds, "systemctl stop " .. systemd_name)
-  call add(cmds, printf("cp %s /usr/bin/%s", remote_path, exe_name))
-  call add(cmds, printf("rsync -a --xattrs %s /usr/bin/", remote_path))
+  call add(cmds, "sudo systemctl stop " .. systemd_name)
+  call add(cmds, printf("sudo rsync -a --xattrs %s /usr/bin/", remote_path))
   call add(cmds, printf("echo Starting %s...", systemd_name))
-  call add(cmds, "systemctl start " .. systemd_name)
-
-  " TESTING
-  throw string(cmds)
+  call add(cmds, "sudo systemctl start " .. systemd_name)
 
   sp
   enew
@@ -519,9 +544,7 @@ endfunction
 
 function! s:OnControlFileEvent(...)
   let s:control_file_exists = work#ControlFileExists()
-  if s:control_file_exists
-    call s:DetermineSdk()
-  else
+  if !s:control_file_exists
     echom "SSH connection died..."
   endif
 endfunction
@@ -563,11 +586,9 @@ function! s:CheckMasterConnection(...)
 endfunction
 
 function s:OnConnectedMaster()
-  call s:DetermineSdk()
   call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
   let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
   call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
-  call init#OnJobOutput(["ssh", g:HOST, "df --output=avail " .. g:RSYNC_DIR], function('s:OnRsyncSpaceAvailable'))
 endfunction
 
 function! s:OnDeviceMounts(mnt)
@@ -578,16 +599,6 @@ function! s:OnDeviceMounts(mnt)
   let flags = split(matchstr(mnt[0], '([a-zA-Z,]*)')[1:-2], ",")
   if index(flags, "ro") >= 0
     call init#Jobstart(["ssh", g:HOST, "mount -o remount,rw /usr"])
-  endif
-endfunction
-
-function! s:OnRsyncSpaceAvailable(space)
-  if len(a:space) < 2
-    return
-  endif
-  let mb = a:space[1] / 1024
-  if mb < 500
-    call init#Warn('RSYNC directory has only %dMB available storage!', mb)
   endif
 endfunction
 
@@ -610,6 +621,7 @@ function! s:OnSdkOutput(output)
     let g:DEVICE = "onyx-cr"
     let g:SDK_DIR = "/opt/aisys/onyx_cr"
   endif
+  let g:objdump_exe = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
 endfunction
 
 function! s:InstallHostCommands()
@@ -620,9 +632,10 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
-  exe printf("command! -nargs=? -bang -complete=customlist,SshfsCompl Scp call init#Scp('%s', '<bang>', empty(<q-args>) ? '/tmp' : <q-args>)", g:HOST)
+  exe printf("command! -nargs=? -bang -complete=customlist,SshfsCompl Scp call init#Scp('%s', '<bang>', empty(<q-args>) ? g:RSYNC_DIR : <q-args>)", g:HOST)
 
   command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
+  command! -nargs=? -complete=customlist,SshfsCompl Download call s:RemoteFileCommand(<q-args>, 'work#DownloadRemoteFile')
   cabbr SSfs Ssfs
 
   nnoremap <silent> <leader>rb <cmd>Sync badge_and_face<CR>
@@ -645,6 +658,9 @@ endfunction
 
 function s:OnHostChange()
   call s:InstallHostCommands()
+  call s:DetermineSdk()
+  call s:DetermineRsyncDir()
+  call s:CheckMenderCommit()
   if init#IsMainWorkspace()
     call s:StartMaster()
   else
@@ -662,13 +678,8 @@ function! HostCompl(ArgLead, CmdLine, CursorPos)
   return filter(hosts, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
-function! s:ChangeHost(bang, host)
-  if !empty(a:bang)
-    if !empty(a:host)
-      return init#Warn("Expecting no arguments with '!'")
-    endif
-    call init#OnJobExit(["ssh_wait_silent", g:HOST], function('s:TryReconnect'))
-  elseif empty(a:host)
+function! s:ChangeHost(host)
+  if empty(a:host)
     echo "Current host is: " .. g:HOST
   else
     call s:DetermineConfig(a:host, function('s:OnHostResolvedIP'))
@@ -696,11 +707,7 @@ function! s:OnHostResolvedIP()
   startinsert
 endfunction
 
-function! s:OnHostTrusted()
-  call s:OnHostChange()
-endfunction
-
-command! -nargs=? -bang -complete=customlist,HostCompl Host call s:ChangeHost("<bang>", <q-args>)
+command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -865,10 +872,10 @@ function! s:InstallImage()
   enew
   let cmds = []
   call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
-  call add(cmds, printf("scp %s %s:/tmp/image.mender", most_recent_image, g:HOST))
-  call add(cmds, printf("ssh %s 'mender install /tmp/image.mender && reboot'", g:HOST))
+  call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
+  call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
   call add(cmds, "ssh_wait_silent " .. g:HOST)
-  call termopen(join(cmds, ";"))
+  call termopen(join(cmds, " && "))
   startinsert
 endfunction
 
@@ -900,6 +907,10 @@ function! s:FakeSdk()
     let so_dir = printf("%s/%s/alcatraz", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/%s/libalcatraz.pc", repo_dir, g:BUILD_TYPE)
     call add(cmds, printf("rsync -rtv %s/include/alcatraz/ %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz", repo_dir, g:SDK_DIR))
+
+    let health_api = printf("%s/include/alcatraz/health/device_health_api.h", repo_dir)
+    let sdk_header_dir = printf("%s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/health", g:SDK_DIR)
+    call add(cmds, printf("rsync -rtv %s %s", health_api, sdk_header_dir))
   elseif stridx(repo_dir, "alcatraz-ml-library") >= 0
     let so_name = "libalcatraz_ml.so"
     let so_dir = printf("%s/%s/src", repo_dir, g:BUILD_TYPE)
@@ -914,10 +925,6 @@ function! s:FakeSdk()
     let so_name = "libhiredis.so"
     let so_dir = printf("%s/%s", repo_dir, g:BUILD_TYPE)
     let pc = printf("%s/hiredis.pc", so_dir)
-  elseif stridx(repo_dir, 'device-health') >= 0
-    " Header only library. This command is sufficient
-    let cmd = printf("rsync -rtv %s/include/device_health_api.h %s/sysroots/armv8a-aisys-linux/usr/include/alcatraz/health", repo_dir, g:SDK_DIR)
-    return termopen(cmd)
   else
     echo "No repo matched!"
     return
@@ -963,11 +970,19 @@ function! s:HostDebugSyms(...)
 endfunction
 
 function! s:PlotTrace(name)
-  let trace_txt = systemlist(printf("ssh %s ls -t /tmp/obsidian-profiling/", g:HOST))
+  if stridx(g:DEVICE, "onyx") >= 0
+    let dir = "/tmp/rock-tracing"
+  elseif stridx(g:DEVICE, "rockx") >= 0
+    let dir = "/tmp/obsidian-profiling"
+  else
+    return init#Warn("Unknown device")
+  endif
+  let trace_txt = init#SystemOrThrow(printf("ssh %s ls -t %s", g:HOST, dir))
   if empty(trace_txt)
     echo "No trace"
     return
   endif
+
   let trace_txt = trace_txt[0]
   let parse_input = "~/Downloads/tracing/input/" .. a:name
   let parse_output = printf("~/Downloads/tracing/output/%s",  a:name)
@@ -978,17 +993,27 @@ function! s:PlotTrace(name)
     call init#Warn("Build type is %s.", g:BUILD_TYPE)
   endif
 
+  if !isdirectory(expand("~/tracing_venv"))
+    let errors = ["You do not have a python venv set up! You can run (at your own risk):"]
+    call add(errors, "python -m venv tracing_venv")
+    call add(errors, "source tracing_venv/bin/activate")
+    call add(errors, "cd ~/libalcatraz/tracing/scripts/")
+    call add(errors, "python -m pip install requirements.txt")
+    return init#ShowErrors(errors)
+  endif
+
   let cmds = []
   call add(cmds, "mkdir -p " .. parse_input)
   call add(cmds, "mkdir -p " .. plot_output)
-  call add(cmds, printf("scp %s:/tmp/obsidian-profiling/%s %s", g:HOST, trace_txt, parse_input))
+  call add(cmds, printf("scp %s:%s/%s %s", g:HOST, dir, trace_txt, parse_input))
   call add(cmds, "source ~/tracing_venv/bin/activate")
   call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
   call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
   botr split
   lcd ~/libalcatraz/tracing/scripts
   enew
-  call termopen(join(cmds, " && "), #{})
+  throw string(cmds)
+  " call termopen(join(cmds, " && "), #{})
 endfunction
 
 function! s:BarfPlotTrace(name)
@@ -1105,6 +1130,28 @@ function! s:Bb()
   call s:AddRepo(FugitiveWorkTree())
 endfunction
 
+function! s:OpenBitbake(repo)
+  let repo = a:repo
+  let targets = filter(s:GetTargets(), 'v:val[0] == repo')
+  if empty(targets)
+    throw "Invalid repo: " .. repo
+  endif
+
+  let bitbake = targets[0][2]
+  " Find old hash
+  let files = qsearch#GetFiles("/home/stef/aidistro", "-regex", ".*" .. bitbake)
+  if empty(files)
+    throw "Could not find: " .. bitbake
+  endif
+  if len(files) > 1
+    throw "Multiple results for : " .. bitbake
+  endif
+  exe "e " .. files[0]
+  if search("SRCREV") == 0
+    throw "Failed to find SRCREV"
+  endif
+endfunction
+
 function! s:AddRepo(repo)
   let repo = a:repo
   let targets = filter(s:GetTargets(), 'v:val[0] == repo')
@@ -1116,18 +1163,10 @@ function! s:AddRepo(repo)
   if empty(new_src_branch)
     throw "Failed to determine branch!"
   endif
-  if new_src_branch != targets[0][1]
-    call init#Warn('Branch differs from mainline.')
-  endif
-
   let new_src_rev = git#HashOrThrow(new_src_branch)
-  let bitbake = targets[0][2]
-  " Find old hash
-  let id = qsearch#Find("/home/stef/aidistro", "-regex", ".*" .. bitbake)
-  call jobwait([id])
-  if search("SRCREV") == 0
-    throw "Failed to find SRCREV"
-  endif
+
+  call s:OpenBitbake(a:repo)
+
   call setline('.', 'SRCREV ?= "' .. new_src_rev .. '"')
   if search("SRCBRANCH") == 0
     throw "Failed to find SRCBRANCH"
@@ -1157,20 +1196,6 @@ endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Ip call init#ToClipboard(g:HOST_IP)
 cabbr IP Ip
-
-function! s:CopyGstH264Str()
-  " let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
-  let h264_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_h264 latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink"
-  call init#ToClipboard(printf(h264_msg, g:HOST_IP))
-endfunction
-
-function! s:CopyGstMjpegStr()
-  let mjpeg_msg = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/adaptive_mjpeg latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
-  call init#ToClipboard(printf(mjpeg_msg, g:HOST_IP))
-endfunction
-
-command! -nargs=0 H264 call s:CopyGstH264Str()
-command! -nargs=0 Mjpeg call s:CopyGstMjpegStr()
 
 function! s:Reboot()
   let cmds = []
@@ -1286,13 +1311,25 @@ function! work#OpenJira(issue)
   endif
 endfunction
 
-function! s:OpenMR()
-  let url = git#ExecuteOrThrow(['remote', 'get-url', 'origin'])[0]
+function! s:ChooseRepo(arg)
+  if empty(a:arg)
+    call work#OpenMR(FugitiveWorkTree())
+  else
+    call qutil#GetRepos()->qutil#CommandPass(a:arg)->qutil#CreateOneShotQuickfix("Repos", 'work#OpenMR')
+  endif
+endfunction
+
+function! work#OpenMR(repo)
+  let git_dir = a:repo .. "/.git"
+  let url = git#ExecuteOrThrow([git_dir, 'remote', 'get-url', 'origin'])[0]
   let url = substitute(url, '^git@gitlab.com:', 'https://gitlab.com/', '')
   let url = substitute(url, '\.git$', '', '')
   let url ..= '/-/merge_requests'
   call init#ToClipboard(url)
 endfunction
+
+command! -nargs=? -complete=customlist,qutil#ReposCompl MR call s:ChooseRepo(<q-args>)
+cabbr Mr MR
 
 function! s:ShowActivity()
   let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
@@ -1372,125 +1409,6 @@ endfunction
 command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 " }}}
 
-""""""""""""""""""""""""""""Disas"""""""""""""""""""""""""" {{{
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#Disassemble(dyn, arg)
-  let exe = a:arg
-  let funcs = systemlist(printf("nm -g%s --defined-only %s", a:dyn, exe))
-  call map(funcs, 'split(v:val)')
-  call filter(funcs, 'toupper(v:val[1]) == "W" || toupper(v:val[1]) == "T"')
-  call map(funcs, 'v:val[2]')
-  if empty(funcs)
-    echo "No symbols!"
-    return
-  endif
-  let unmangled = systemlist("c++filt", funcs)
-  call map(unmangled, 'v:val[:180]')
-  let nr = qutil#CreateCustomQuickfix(unmangled, 'Symbols', 'work#SelectSymbol', exe)
-  if nr >= 0
-    " Much faster than binding it in above 'function'.
-    let b:mangled_names = funcs
-    call setbufvar(nr, '&modifiable', v:false)
-  endif
-endfunction
-
-function! work#SelectSymbol(exe)
-  let idx = line('.') - 1
-  let mangled = b:mangled_names[idx]
-
-  let objdump = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
-  let disas = systemlist(printf('%s -Sl --disassemble=%s %s', objdump, mangled, a:exe))
-
-  let disas_nr = bufadd('Disassembly')
-  call setbufvar(disas_nr, '&buftype', 'nofile')
-  call setbufvar(disas_nr, '&bufhidden', 'wipe')
-  call bufload(disas_nr)
-
-  let file_line_map = #{}
-  let curr_lines = []
-  for i in range(len(disas))
-    let m = matchlist(disas[i], '^\(/.*\):\([0-9]\+\)')
-    if !empty(m)
-      let curr_file = m[1]
-      " Needed in order to get syntax (init#CopySyntax)
-      exe "e " .. curr_file
-      let curr_lines = getline(1, '$')
-      let curr_pos = 0
-    else
-      let m = matchlist(disas[i], '^\s*\x\+:')
-      if !empty(m)
-        call init#AppendChunksAtEnd(disas_nr, [[disas[i], '@module']])
-      elseif !empty(curr_lines)
-        let idx = index(curr_lines[curr_pos:], disas[i])
-        if idx >= 0
-          let curr_pos += idx + 1
-          call init#CopySyntax(curr_pos, disas_nr)
-          if !has_key(file_line_map, curr_file)
-            let file_line_map[curr_file] = #{}
-          endif
-          let line_map = file_line_map[curr_file]
-          if !has_key(line_map, curr_pos - 1)
-            let line_map[curr_pos - 1] = []
-          endif
-          call add(line_map[curr_pos - 1], nvim_buf_line_count(disas_nr) - 1)
-        else
-          let curr_lines = []
-        endif
-      endif
-    endif
-  endfor
-
-  call setbufvar(disas_nr, '&expandtab', v:false)
-  call setbufvar(disas_nr, '&smarttab', v:false)
-  call setbufvar(disas_nr, '&softtabstop', 0)
-  call setbufvar(disas_nr, '&tabstop', 8)
-  call setbufvar(disas_nr, 'file_line_map', file_line_map)
-
-  for filename in keys(file_line_map)
-    " Needed by LSP to process file
-    exe "e " .. filename
-    let nr = bufnr()
-    exe printf("lua GetSemanticTokens(%d, 'work#TransferExtmarks', {%d, %d})", nr, disas_nr, nr)
-  endfor
-
-  quit
-  exe "b " .. disas_nr
-  call setbufvar(disas_nr, '&list', v:false)
-endfunction
-
-function work#TransferExtmarks(dst_nr, src_nr, in_lnum, in_col, in_opt)
-  let ns = nvim_create_namespace('semantic_tokens')
-  let file_line_map = getbufvar(a:dst_nr, 'file_line_map')
-  let src_pathname = fnamemodify(bufname(a:src_nr), ':p')
-  let line_map = file_line_map[src_pathname]
-  if has_key(line_map, a:in_lnum)
-    let dst_lnums = line_map[a:in_lnum]
-    for dst_lnum in dst_lnums
-      call nvim_buf_set_extmark(a:dst_nr, ns, dst_lnum, a:in_col, a:in_opt)
-    endfor
-  endif
-endfunction
-
-function! s:GetDisassembleTargets()
-  let dir = FugitiveWorkTree()
-  if !isdirectory(dir)
-    return []
-  endif
-  let dir = printf("%s/%s", dir, g:BUILD_TYPE)
-  return systemlist(["find", dir, "-type", "f", "-executable"])
-endfunction
-
-command! -nargs=? -bang -complete=customlist,DisassembleCompl Disassemble
-      \ call s:GetDisassembleTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Disassemble', 'work#Disassemble', <bang>0 ? 'D' : '')
-
-function! DisassembleCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine)
-    return []
-  endif
-  return s:GetDisassembleTargets()->qutil#FileCompletionPass(a:ArgLead)
-endfunction
-"}}}
-
 """"""""""""""""""""""""""""Orientation"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:Orientation(deg)
@@ -1561,7 +1479,7 @@ function s:OnSelectedService()
   let pos = line('.')
   let service = getline(pos)
   let status = get(s:services_status, service, "")
-  if status == "inactive"
+  if status == "inactive" || status == "failed"
     call init#Jobstart(["ssh", g:HOST, "systemctl start " .. service])
   else
     let cmds = []
@@ -1670,6 +1588,297 @@ endfunction
 
 command! -nargs=0 Health call s:OpenServices()
 "}}}
+
+function work#CheckRtspConnection(bang, ip)
+  if !executable("nc")
+    echom "nc is not executable (package netcat)"
+    return
+  endif
+  if !empty(a:ip)
+    let ip = a:ip
+  else
+    let ip = g:HOST_IP
+  endif
+
+  call systemlist(["ping", "-c", "1", ip])
+  if v:shell_error
+    return init#Warn("No connection to " .. ip)
+  endif
+  call system(["nc", "-w", "1", "-z", ip, 8554])
+  if v:shell_error
+    return init#Warn("Port 8554 is not open!")
+  endif
+
+  call system(["nc", "-w", "1", "-z", ip, 8554])
+
+  let cmd = "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"
+  let output = systemlist(printf("timeout -p 0.1 nc %s 8554", ip), cmd)
+  if stridx(join(output), "DESCRIBE") < 0
+    return init#Warn("No DESCRIBE command!")
+  endif
+
+  if stridx(g:DEVICE, "onyx") >= 0
+    let streams = ["ircamera", "mircamera", "depthcamera", "mdepthcamera", "rgbcamera", "mrgbcamera"]
+  elseif stridx(g:DEVICE, "rockx") >= 0
+    let streams = ["adaptive_h264", "adaptive_mjpeg", "near-rtsp", "far-rtsp", "center-rtsp", "intercom"]
+  endif
+
+  let cmd = ""
+  let seq = 2
+  for stream in streams
+    let cmd .= printf("DESCRIBE rtsp://%s:8554/%s RTSP/1.0\r\n", ip, stream) .
+          \ printf("CSeq: %d\r\n", seq) .
+          \ "Accept: application/sdp\r\n" .
+          \ "\r\n"
+    let seq += 1
+  endfor
+
+  let output = system(printf("timeout -p 4 nc %s 8554", ip), cmd)
+  let output = split(output, "\r\n")
+
+  let ok = filter(copy(output), 'v:val =~# "RTSP/[0-9.]* 200 OK"')
+  if empty(ok) || !empty(a:bang)
+    echo printf("Found %d streams", len(ok))
+    return init#CustomBottomBuffer("RTSP", output)
+  endif
+
+  let content_base = filter(copy(output), 'v:val =~# "^Content-Base:"')
+  let rtpmap = filter(copy(output), 'v:val =~# "^a=rtpmap"')
+  if len(ok) != len(content_base) || len(ok) != len(rtpmap)
+    return init#Warn("Parse error")
+  endif
+
+  let found_streams = []
+  for i in range(len(ok))
+    let stream = matchstr(content_base[i], '/\zs[^/]\+\ze/\?$')
+    if stridx(rtpmap[i], "H264") >= 0
+      call add(found_streams, "H264: " . stream)
+    elseif stridx(rtpmap[i], "JPEG") >= 0
+      call add(found_streams, "MJPEG: " . stream)
+    else
+      call init#Warn("Unknown encoder: %s", rtpmap[i])
+    endif
+  endfor
+
+  call qutil#CreateCustomQuickfix(found_streams, 'Streams', 'work#SelectStream', ip)
+endfunction
+
+function work#SelectStream(ip)
+  let pos = line('.')
+  let line = getline(pos)
+  let [type, name] = split(line, ": ")
+  if type == "H264"
+    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink"
+  elseif type == "MJPEG"
+    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
+  endif
+  let msg = printf(fmt, a:ip, name)
+  call init#ToClipboard(msg)
+endfunction
+
+command! -bang -nargs=? Rtsp call work#CheckRtspConnection("<bang>", <q-args>)
+
+function s:DetermineImage()
+  let artifact = init#SystemOrThrow(["ssh", g:HOST, "mender show-artifact"])
+  let commitish = matchstr(artifact[0],  '-g\([0-9a-f]\+\)')[2:]
+  if empty(commitish)
+    echo "Operation failed."
+    return
+  endif
+  Repo aidistro
+  let aidistro_commitish = git#HashOrThrow("HEAD")
+  let len = min([len(aidistro_commitish), len(commitish)])
+  if aidistro_commitish[:len-1] != commitish[:len-1]
+    call init#Warn("Commit differs from ~/aidistro!")
+  else
+    echo "Commit matched with ~/aidistro"
+  endif
+  exe printf("G log %s -n 10", commitish)
+  silent only
+endfunction
+
+command -nargs=0 Artifact call s:DetermineImage()
+command -nargs=0 Mender call s:DetermineImage()
+
+function s:GetRepoStatus(repo, ...)
+  let repo = FugitiveExtractGitDir(a:repo)
+  if !git#IsClean(repo)
+    return "Dirty."
+  endif
+
+  let branch = git#GetBranch(repo)
+  if empty(branch)
+    return "Detached HEAD."
+  endif
+  if a:0 > 0 && branch != a:1
+    return printf("Checked out wrong branch '%s'.", branch)
+  endif
+
+  let dict = git#ExecuteOrThrow([repo, "rev-list", "--left-right", "--count", printf("%s...origin/%s", branch, branch)])
+  if dict['exit_status'] != 0
+    return "Unknown remote branch!"
+  endif
+
+  let output = dict['stdout']
+  if type(output) == v:t_list
+    let [ahead, behind] = split(join(output))
+    if ahead != 0 || behind != 0
+      if ahead == 0
+        return printf("Branch is %d commits behind.", behind)
+      else
+        return printf("Branch is %d commits behind and % commits ahead.", ahead)
+      endif
+    endif
+  endif
+  return v:null
+endfunction
+
+function s:CheckRepo(repo, ...)
+  if a:0 > 0 && !empty(a:1)
+    let status = s:GetRepoStatus(a:repo, a:1)
+  else
+    let status = s:GetRepoStatus(a:repo)
+  endif
+  if !empty(status)
+    exe "split " .. a:repo
+    let w = win_getid()
+    G
+    call win_execute(w, 'close')
+    call nvim_echo([[status, "Normal"]], v:false, #{})
+  else
+    let branch = git#GetBranch(a:repo)
+    echo printf("%s is clean and up to date!", branch)
+  endif
+endfunction
+
+function s:ForceUpdateRepo(repo, ...)
+  let repo = FugitiveExtractGitDir(a:repo)
+  if a:0 > 0
+    let branch = a:1
+    call git#ExecuteOrThrow([repo, "reset", "--hard"])
+    call git#ExecuteOrThrow([repo, "checkout", branch])
+  else
+    let branch = git#GetBranch(a:repo)
+    if empty(branch)
+      echo "Detached HEAD!"
+      return
+    endif
+  endif
+
+  call git#ExecuteOrThrow([repo, "fetch", "origin", branch])
+  call git#ExecuteOrThrow([repo, "reset", "--hard", "origin/" .. branch])
+  call git#UpdateSubmodule(repo)
+
+  if !git#IsClean(repo)
+    exe "split " .. a:repo
+    let w = win_getid()
+    G
+    call win_execute(w, 'close')
+    echo "Untracked files."
+  else
+    echo printf("%s is clean and up to date!", branch)
+  endif
+endfunction
+
+function s:CheckAidistro(bang, branch)
+  let repo = expand("~/aidistro")
+  if empty(a:bang)
+    call s:CheckRepo(repo, a:branch)
+  elseif empty(a:branch)
+    call s:ForceUpdateRepo(repo)
+  else
+    call s:ForceUpdateRepo(repo, a:branch)
+  endif
+endfunction
+
+function! AidistroCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  return git#GetRefs('refs/heads/', a:ArgLead, "~/aidistro")
+endfunction
+
+command! -bang -nargs=? -complete=customlist,AidistroCompl Aidistro call s:CheckAidistro("<bang>", <q-args>)
+
+function! s:ShowRepoStatus(pat)
+  let list = []
+  let targets = add(s:GetTargets(), [expand("~/aidistro"), "master", ""])
+  let targets = filter(targets, "stridx(v:val[0], a:pat) >= 0")
+  for [repo, branch, _] in targets
+    let status = s:GetRepoStatus(repo, branch)
+    if empty(status)
+      let status = "OK"
+    endif
+    let short_repo = fnamemodify(repo, ':t')
+    call add(list, printf("%s: %s", short_repo, status))
+  endfor
+  call qutil#CreateCustomQuickfix(list, "Check", "work#FixRepoStatus")
+endfunction
+
+function work#FixRepoStatus()
+  let line = line('.')
+  let short_repo = split(getline('.'), ":")[0]
+  let targets = add(s:GetTargets(), [expand("~/aidistro", "master", "")])
+  let targets = filter(targets, "stridx(v:val[0], short_repo) >= 0")
+  call assert_true(len(targets) == 1)
+  " throw string(targets)
+  let [repo, branch; _] = targets[0]
+  call s:ForceUpdateRepo(repo, branch)
+  " Update status
+  let status = s:GetRepoStatus(repo, branch)
+  if empty(status)
+    let status = "OK"
+  endif
+  call setline(line, printf("%s: %s", short_repo, status))
+endfunction
+
+command! -nargs=? -complete=customlist,CheckCompl Check call s:ShowRepoStatus(<q-args>)
+
+function! CheckCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  let repos = map(s:GetTargets(), "v:val[0]")
+  let repos = filter(repos, 'stridx(v:val, a:ArgLead) >= 0')
+  return map(repos, 'fnamemodify(v:val, ":t")')
+endfunction
+
+function s:DetermineRsyncDir()
+  let cmd = "df -h --output=source,avail,target | tail +2 | sort -r -h -k2"
+  call init#OnJobOutput(["ssh", g:HOST, cmd], 'work#OnDiskFree')
+endfunction
+
+function work#OnDiskFree(fs)
+  let fs = filter(a:fs, '!empty(v:val)')
+  " Try to auto-select the first entrry
+  if !empty(fs)
+    call filter(fs, 'split(v:val)[2] != "/tmp"')
+    let [source, avail, target] = split(fs[0])
+    const whitelist = ["/dev/shm", "/var/sync"]
+    if index(whitelist, target) >= 0
+      return work#OnFilesystem(fs[0])
+    endif
+  endif
+  call qutil#CreateOneShotQuickfix(fs, "Choose RSYNC directory", "work#OnFilesystem")
+endfunction
+
+function work#OnFilesystem(entry)
+  let [source, avail, target] = split(a:entry)
+  let g:RSYNC_DIR = target
+  if stridx(avail, "G") < 0
+    call init#Warn("Have for %s RSYNC", avail)
+  endif
+endfunction
+
+function s:CheckMenderCommit()
+  call init#OnJobExit(["ssh", g:HOST, "test -f /var/lib/mender/upgrade_available"], 'work#OnCheckUpdate')
+endfunction
+
+function work#OnCheckUpdate(code)
+  if a:code == 0
+    call init#Warn("Uncommited changes with mender!")
+  endif
+endfunction
 
 function! s:OnVimEnter()
   " Install commands for the first time
