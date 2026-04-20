@@ -268,6 +268,16 @@ function! s:RemoteFileCommand(what, cb)
   endif
 endfunction
 
+function! work#Scp(pat)
+  if !empty(a:pat)
+    let files = init#RemoteFindFiles(g:HOST, a:pat)
+    call qutil#CreateOneShotQuickfix(files, 'Scp', function('init#Scp', [g:HOST]))
+  else
+    let name = expand("%:t")
+    call init#Scp(g:HOST, printf("%s/%s", g:RSYNC_DIR, name))
+  endif
+endfunction
+
 function! work#SelectRemoteFile(file)
   call init#Sshfs(g:HOST, a:file)
 endfunction
@@ -294,6 +304,13 @@ function! SshfsCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   return init#RemoteFindFiles(g:HOST, a:ArgLead)
+endfunction
+
+function! ScpCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  return init#RemoteFindBasenames(g:HOST, a:ArgLead)
 endfunction
 
 function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
@@ -632,8 +649,8 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
-  exe printf("command! -nargs=? -bang -complete=customlist,SshfsCompl Scp call init#Scp('%s', '<bang>', empty(<q-args>) ? g:RSYNC_DIR : <q-args>)", g:HOST)
 
+  command! -nargs=? -bang -complete=customlist,ScpCompl Scp call work#Scp(<q-args>)
   command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
   command! -nargs=? -complete=customlist,SshfsCompl Download call s:RemoteFileCommand(<q-args>, 'work#DownloadRemoteFile')
   cabbr SSfs Ssfs
@@ -1589,6 +1606,8 @@ endfunction
 command! -nargs=0 Health call s:OpenServices()
 "}}}
 
+""""""""""""""""""""""""""""RTSP"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function work#CheckRtspConnection(bang, ip)
   if !executable("nc")
     echom "nc is not executable (package netcat)"
@@ -1677,29 +1696,10 @@ function work#SelectStream(ip)
 endfunction
 
 command! -bang -nargs=? Rtsp call work#CheckRtspConnection("<bang>", <q-args>)
+"}}}
 
-function s:DetermineImage()
-  let artifact = init#SystemOrThrow(["ssh", g:HOST, "mender show-artifact"])
-  let commitish = matchstr(artifact[0],  '-g\([0-9a-f]\+\)')[2:]
-  if empty(commitish)
-    echo "Operation failed."
-    return
-  endif
-  Repo aidistro
-  let aidistro_commitish = git#HashOrThrow("HEAD")
-  let len = min([len(aidistro_commitish), len(commitish)])
-  if aidistro_commitish[:len-1] != commitish[:len-1]
-    call init#Warn("Commit differs from ~/aidistro!")
-  else
-    echo "Commit matched with ~/aidistro"
-  endif
-  exe printf("G log %s -n 10", commitish)
-  silent only
-endfunction
-
-command -nargs=0 Artifact call s:DetermineImage()
-command -nargs=0 Mender call s:DetermineImage()
-
+""""""""""""""""""""""""""""Clean repo"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function s:GetRepoStatus(repo, ...)
   let repo = FugitiveExtractGitDir(a:repo)
   if !git#IsClean(repo)
@@ -1818,10 +1818,9 @@ endfunction
 function work#FixRepoStatus()
   let line = line('.')
   let short_repo = split(getline('.'), ":")[0]
-  let targets = add(s:GetTargets(), [expand("~/aidistro", "master", "")])
+  let targets = add(s:GetTargets(), [expand("~/aidistro"), "master", ""])
   let targets = filter(targets, "stridx(v:val[0], short_repo) >= 0")
   call assert_true(len(targets) == 1)
-  " throw string(targets)
   let [repo, branch; _] = targets[0]
   call s:ForceUpdateRepo(repo, branch)
   " Update status
@@ -1839,9 +1838,35 @@ function! CheckCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let repos = map(s:GetTargets(), "v:val[0]")
+  call add(repos, expand("~/aidistro"))
   let repos = filter(repos, 'stridx(v:val, a:ArgLead) >= 0')
   return map(repos, 'fnamemodify(v:val, ":t")')
 endfunction
+"}}}
+
+""""""""""""""""""""""""""""Mender"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function s:DetermineImage()
+  let artifact = init#SystemOrThrow(["ssh", g:HOST, "mender show-artifact"])
+  let commitish = matchstr(artifact[0],  '-g\([0-9a-f]\+\)')[2:]
+  if empty(commitish)
+    echo "Operation failed."
+    return
+  endif
+  Repo aidistro
+  let aidistro_commitish = git#HashOrThrow("HEAD")
+  let len = min([len(aidistro_commitish), len(commitish)])
+  if aidistro_commitish[:len-1] != commitish[:len-1]
+    call init#Warn("Commit differs from ~/aidistro!")
+  else
+    echo "Commit matched with ~/aidistro"
+  endif
+  exe printf("G log %s -n 10", commitish)
+  silent only
+endfunction
+
+command -nargs=0 Artifact call s:DetermineImage()
+command -nargs=0 Mender call s:DetermineImage()
 
 function s:DetermineRsyncDir()
   let cmd = "df -h --output=source,avail,target | tail +2 | sort -r -h -k2"
@@ -1879,6 +1904,95 @@ function work#OnCheckUpdate(code)
     call init#Warn("Uncommited changes with mender!")
   endif
 endfunction
+"}}}
+
+""""""""""""""""""""""""""""Gitlab"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+let s:gitlab_token_file = stdpath('state') .. "/token.txt"
+if filereadable(s:gitlab_token_file)
+  let s:gitlab_token = readfile(s:gitlab_token_file)[0]
+else
+  call init#Warn("No gitlab token set up!")
+  let s:gitlab_token = ""
+endif
+
+function! work#OnGitlabResponse(req, cb)
+  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. s:gitlab_token, a:req]
+  return init#OnJobOutput(cmd, function("s:DecodeGitlabResponse", [a:cb]))
+endfunction
+
+function! s:DecodeGitlabResponse(cb, output)
+  call assert_true(len(a:output) <= 1)
+  if len(a:output) >= 1
+    let dict = json_decode(a:output[0])
+    call function(a:cb)(dict)
+  endif
+endfunction
+
+function! work#GitlabRequest(req)
+  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. s:gitlab_token, a:req]
+  return init#SystemOrThrow(cmd)
+endfunction
+
+function! work#OnGitlabUser(cb)
+  if !exists('s:gitlab_user')
+    call work#OnGitlabResponse("https://gitlab.com/api/v4/user", function("s:OnGitlabUser", [a:cb]))
+  else
+    call function(a:cb)()
+  endif
+endfunction
+
+function! s:OnGitlabUser(cb, user)
+  let s:gitlab_user = a:user["id"]
+  call function(a:cb)()
+endfunction
+
+function! work#ShowAssignedMR()
+  call work#OnGitlabUser(function("s:ShowAssignedMR"))
+endfunction
+
+function! s:ShowAssignedMR()
+  let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=opened", s:gitlab_user)
+  call work#OnGitlabResponse(req, function("s:OnAssignedMR"))
+endfunction
+
+function! s:OnAssignedMR(dict)
+  let list = []
+  for entry in a:dict
+    let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
+    let item = #{
+          \ title: entry["title"],
+          \ timestamp: entry["created_at"],
+          \ repo: repo,
+          \ url: entry["web_url"],
+          \ branch: entry["source_branch"]}
+    call add(list, item)
+  endfor
+  call sort(list, function("s:CompareMR"))
+  let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
+  let nr = qutil#CreateCustomQuickfix(lines, "MR", function("s:OpenAssignedMR"))
+  let b:mr_list = list
+endfunction
+
+function s:CompareMR(lhs, rhs)
+  if a:lhs.timestamp < a:rhs.timestamp
+    return -1
+  elseif a:lhs.timestamp > a:rhs.timestamp
+    return 1
+  else
+    return 0
+  endif
+endfunction
+
+function! s:OpenAssignedMR()
+  let idx = line('.') - 1
+  let entry = b:mr_list[idx]
+  call init#ToClipboard(entry["url"])
+endfunction
+
+command! -nargs=0 Assigned call work#ShowAssignedMR()
+"}}}
 
 function! s:OnVimEnter()
   " Install commands for the first time
