@@ -83,17 +83,13 @@ function! work#GetMakeCommandFor(repo)
 
   if repo == 'libalcatraz'
     let cmake .= " -DBUILD_TESTS=0"
-    if stridx(g:DEVICE, "onyx") >= 0
-      let cmake .= " -DPLATFORM=onyx"
-    elseif stridx(g:DEVICE, "rockx") >= 0
-      let cmake .= " -DPLATFORM=obsidian-dm"
-    endif
     let cmake .= " -DPRELOAD_OPENCV_MAT_SUPPORT=1"
-  elseif repo == 'alcatraz-ml-library' || repo == 'badge-and-face' || repo == 'device-health'
+  endif
+  if repo == 'alcatraz-ml-library' || repo == 'badge-and-face' || repo == 'device-health' || repo == 'libalcatraz'
     if stridx(g:DEVICE, "onyx") >= 0
-      let cmake .= " -DDEVICE=onyx"
+      let cmake .= " -DDEVICE=onyx -DPLATFORM=obsidian"
     elseif stridx(g:DEVICE, "rockx") >= 0
-      let cmake .= " -DDEVICE=obsidian"
+      let cmake .= " -DDEVICE=obsidian -DPLATFORM=obsidian"
     endif
   endif
 
@@ -1328,15 +1324,15 @@ function! work#OpenJira(issue)
   endif
 endfunction
 
-function! s:ChooseRepo(arg)
+function! work#OpenMergeRequest(arg)
   if empty(a:arg)
-    call work#OpenMR(FugitiveWorkTree())
+    call work#GenerateMergeRequestURL(FugitiveWorkTree())
   else
-    call qutil#GetRepos()->qutil#CommandPass(a:arg)->qutil#CreateOneShotQuickfix("Repos", 'work#OpenMR')
+    call qutil#GetRepos()->qutil#CommandPass(a:arg)->qutil#CreateOneShotQuickfix("Repos", 'work#GenerateMergeRequestURL')
   endif
 endfunction
 
-function! work#OpenMR(repo)
+function! work#GenerateMergeRequestURL(repo)
   let git_dir = a:repo .. "/.git"
   let url = git#ExecuteOrThrow([git_dir, 'remote', 'get-url', 'origin'])[0]
   let url = substitute(url, '^git@gitlab.com:', 'https://gitlab.com/', '')
@@ -1344,9 +1340,6 @@ function! work#OpenMR(repo)
   let url ..= '/-/merge_requests'
   call init#ToClipboard(url)
 endfunction
-
-command! -nargs=? -complete=customlist,qutil#ReposCompl MR call s:ChooseRepo(<q-args>)
-cabbr Mr MR
 
 function! s:ShowActivity()
   let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
@@ -1698,8 +1691,8 @@ endfunction
 command! -bang -nargs=? Rtsp call work#CheckRtspConnection("<bang>", <q-args>)
 "}}}
 
-""""""""""""""""""""""""""""Clean repo"""""""""""""""""""""""""" {{{
-""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""Check"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function s:GetRepoStatus(repo, ...)
   let repo = FugitiveExtractGitDir(a:repo)
   if !git#IsClean(repo)
@@ -1765,8 +1758,13 @@ function s:ForceUpdateRepo(repo, ...)
     endif
   endif
 
-  call git#ExecuteOrThrow([repo, "fetch", "origin", branch])
-  call git#ExecuteOrThrow([repo, "reset", "--hard", "origin/" .. branch])
+  let dict = FugitiveExecute([repo, "fetch", "origin", branch])
+  if dict['exit_status'] == 0
+    call git#ExecuteOrThrow([repo, "reset", "--hard", "origin/" .. branch])
+  else
+    call git#ExecuteOrThrow([repo, "reset", "--hard", branch])
+  endif
+
   call git#UpdateSubmodule(repo)
 
   if !git#IsClean(repo)
@@ -1909,16 +1907,20 @@ endfunction
 """"""""""""""""""""""""""""Gitlab"""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-let s:gitlab_token_file = stdpath('state') .. "/token.txt"
-if filereadable(s:gitlab_token_file)
-  let s:gitlab_token = readfile(s:gitlab_token_file)[0]
+let g:gitlab_token_file = stdpath('state') .. "/token.txt"
+if filereadable(g:gitlab_token_file)
+  let g:gitlab_token = readfile(g:gitlab_token_file)[0]
+  let today = strftime('%Y-%m-%d')
+  if today ># '2027-04-20'
+    call init#Warn("Your gitlab token as expired!")
+  endif
 else
   call init#Warn("No gitlab token set up!")
-  let s:gitlab_token = ""
+  let g:gitlab_token = ""
 endif
 
 function! work#OnGitlabResponse(req, cb)
-  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. s:gitlab_token, a:req]
+  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. g:gitlab_token, a:req]
   return init#OnJobOutput(cmd, function("s:DecodeGitlabResponse", [a:cb]))
 endfunction
 
@@ -1931,12 +1933,12 @@ function! s:DecodeGitlabResponse(cb, output)
 endfunction
 
 function! work#GitlabRequest(req)
-  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. s:gitlab_token, a:req]
+  let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. g:gitlab_token, a:req]
   return init#SystemOrThrow(cmd)
 endfunction
 
 function! work#OnGitlabUser(cb)
-  if !exists('s:gitlab_user')
+  if !exists('g:gitlab_user')
     call work#OnGitlabResponse("https://gitlab.com/api/v4/user", function("s:OnGitlabUser", [a:cb]))
   else
     call function(a:cb)()
@@ -1944,38 +1946,21 @@ function! work#OnGitlabUser(cb)
 endfunction
 
 function! s:OnGitlabUser(cb, user)
-  let s:gitlab_user = a:user["id"]
+  let g:gitlab_user = a:user["id"]
   call function(a:cb)()
 endfunction
 
-function! work#ShowAssignedMR()
-  call work#OnGitlabUser(function("s:ShowAssignedMR"))
+function! work#OpenMergeRequstQuickfix(bang)
+  call work#OnGitlabUser(function("s:OnMyMergeRequests", [a:bang]))
 endfunction
 
-function! s:ShowAssignedMR()
-  let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=opened", s:gitlab_user)
-  call work#OnGitlabResponse(req, function("s:OnAssignedMR"))
+function! s:OnMyMergeRequests(bang)
+  let field = empty(a:bang) ? "author_id" : "assignee_id"
+  let req = printf("https://gitlab.com/api/v4/merge_requests?scope=all&%s=%s&state=opened&per_page=100", field, g:gitlab_user)
+  call work#OnGitlabResponse(req, function("s:OnMergeRequestDict", [req]))
 endfunction
 
-function! s:OnAssignedMR(dict)
-  let list = []
-  for entry in a:dict
-    let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
-    let item = #{
-          \ title: entry["title"],
-          \ timestamp: entry["created_at"],
-          \ repo: repo,
-          \ url: entry["web_url"],
-          \ branch: entry["source_branch"]}
-    call add(list, item)
-  endfor
-  call sort(list, function("s:CompareMR"))
-  let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
-  let nr = qutil#CreateCustomQuickfix(lines, "MR", function("s:OpenAssignedMR"))
-  let b:mr_list = list
-endfunction
-
-function s:CompareMR(lhs, rhs)
+function s:CompareTimestamps(lhs, rhs)
   if a:lhs.timestamp < a:rhs.timestamp
     return -1
   elseif a:lhs.timestamp > a:rhs.timestamp
@@ -1985,13 +1970,176 @@ function s:CompareMR(lhs, rhs)
   endif
 endfunction
 
-function! s:OpenAssignedMR()
+function! s:OnMergeRequestDict(req, dict)
+  const only_other_reviews = stridx(a:req, "author_id") < 0
+  let list = []
+  for entry in a:dict
+    if only_other_reviews && entry["author"]["id"] == g:gitlab_user
+      continue
+    endif
+    let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
+    let targets = filter(s:GetTargets(), "stridx(v:val[0], repo) >= 0")
+    let item = #{
+          \ title: entry["title"],
+          \ repo_id: entry["project_id"],
+          \ mr_id: entry["iid"],
+          \ timestamp: entry["created_at"],
+          \ repo: repo,
+          \ url: entry["web_url"],
+          \ branch: entry["source_branch"]}
+    if len(targets) >= 1
+      let item["repo_full"] = targets[0][0]
+    endif
+    call add(list, item)
+  endfor
+
+  call sort(list, function("s:CompareTimestamps"))
+  let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
+  let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
+  call setbufvar(nr, 'mr_list', list)
+  nnoremap <silent> <buffer> B :call work#CheckMergeRequest()<CR>
+  nnoremap <silent> <buffer> b :call work#CopyBranchMergeRequest()<CR>
+  nnoremap <silent> <buffer> w :call work#CopyMergeRequestURL()<CR>
+  nnoremap <silent> <buffer> n :call work#ShowNotesMergeRequest()<CR>
+endfunction
+
+function s:ShowMergeRequestHelp()
+  echo "(B) Reset repo to branch locally (b) Copy branch (w) Open URL (n) Show notes"
+endfunction
+
+function! work#CopyMergeRequestURL()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   call init#ToClipboard(entry["url"])
+  " quit
 endfunction
 
-command! -nargs=0 Assigned call work#ShowAssignedMR()
+function! work#CheckMergeRequest()
+  let idx = line('.') - 1
+  let entry = b:mr_list[idx]
+  let repo = entry["repo_full"]
+  call s:ForceUpdateRepo(repo, entry["branch"])
+  quit
+  exe "e " .. repo
+endfunction
+
+function! work#CopyBranchMergeRequest()
+  let idx = line('.') - 1
+  let entry = b:mr_list[idx]
+  call init#ToClipboard(entry["branch"])
+endfunction
+
+function! work#ShowNotesMergeRequest()
+  let idx = line('.') - 1
+  let entry = b:mr_list[idx]
+  let req = printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s/notes?per_page=100",
+        \ entry["repo_id"], entry["mr_id"])
+
+  let repo = entry["repo_full"]
+  call work#OnGitlabResponse(req, function("s:ShowGitlabNotes", [repo]))
+endfunction
+
+function! s:ShowGitlabNotes(repo, resp)
+  let head = git#HashOrThrow("HEAD", a:repo)
+  let list = []
+  for note in a:resp
+    let resolvable = get(note, "resolvable", v:false)
+    let resolved = get(note, "resolved", v:true)
+    let text = note["body"]
+    let pos = get(note, "position", #{})
+    if resolvable && !resolved && !empty(pos)
+      let start = pos["line_range"]["start"]
+      let line = pos["new_line"]
+      let file = printf("%s/%s", a:repo, pos["new_path"])
+      let sha = pos["head_sha"]
+      if sha != head
+        let url = FugitiveFind(printf("%s:%s", sha, file))
+      else
+        let url = file
+      endif
+      let timestamp = note["created_at"]
+      let author = note["author"]["username"]
+      let text = printf("%s: %s", author, text)
+      call add(list, #{filename: url, lnum: line, text: text, timestamp: timestamp})
+    endif
+  endfor
+  call sort(list, function("s:CompareTimestamps"))
+  call qutil#SetQuickfix(list, "Notes")
+endfunction
+
+function! s:MrCommand(bang, arg)
+  if !empty(a:arg)
+    if empty(a:bang)
+      call work#OpenMergeRequest(a:arg)
+    else
+      call work#OpenMergeRequest("")
+    endif
+  else
+    call work#OpenMergeRequstQuickfix(a:bang)
+  endif
+endfunction
+
+command! -nargs=? -bang -complete=customlist,qutil#ReposCompl Mr call s:MrCommand("<bang>", <q-args>)
+cabbr MR Mr
+
+function work#OpenUnmergedBranches()
+  call work#OnGitlabUser(function("s:CollectEveryMr"))
+endfunction
+
+function! s:CollectEveryMr()
+  let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=all&&per_page=100", g:gitlab_user)
+  call work#OnGitlabResponse(req, function("s:OnEveryMr"))
+endfunction
+
+function! s:OnEveryMr(dict)
+  let repo_to_branch = #{}
+  for entry in a:dict
+    let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
+    let targets = filter(s:GetTargets(), "stridx(v:val[0], repo) >= 0")
+    if len(targets) >= 1
+      let repo = targets[0][0]
+      let branch = entry["source_branch"]
+      if branch == "obsidian-master"
+        throw string(entry)
+      endif
+      if !has_key(repo_to_branch, repo)
+        let repo_to_branch[repo] = #{}
+      endif
+      let repo_to_branch[repo][branch] = 1
+    endif
+  endfor
+  let list = []
+  let current_author = git#ExecuteOrThrow(["config", "user.name"])[0]
+  for repo in keys(repo_to_branch)
+    let git_dir = FugitiveExtractGitDir(repo)
+    let cmd = [git_dir, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
+    let local_branches = git#ExecuteOrThrow(cmd)
+    let remote_branches = repo_to_branch[repo]
+    for branch in local_branches
+      let targets = filter(s:GetTargets(), "stridx(v:val[0], repo) >= 0")
+      let master_branch = len(targets) >= 1 ? targets[0][1] : ""
+      if !has_key(remote_branches, branch) && branch != master_branch
+        let author = git#ExecuteOrThrow([git_dir, "log", branch, "-1", "--pretty=%an"])[0]
+        if author == current_author
+          call add(list, printf("%s: %s", repo, branch))
+        endif
+      endif
+    endfor
+  endfor
+  call qutil#CreateCustomQuickfix(list, "Unmerged", function("s:OnUnmergedBranch"))
+endfunction
+
+function! s:OnUnmergedBranch()
+  let line = getline('.')
+  let [repo, branch] = split(line, ": ")
+  call s:ForceUpdateRepo(repo, branch)
+  quit
+  exe "e " .. repo
+endfunction
+
+command! -nargs=0 Unmerged call work#OpenUnmergedBranches()
+
+
 "}}}
 
 function! s:OnVimEnter()
