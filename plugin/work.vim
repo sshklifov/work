@@ -543,11 +543,7 @@ function! work#ControlFileExists()
 endfunction
 
 function! work#GetHostStatus()
-  if init#IsMainWorkspace()
-    return work#IsMasterRunning()
-  else
-    return get(s:, 'control_file_exists', v:false)
-  endif
+  return get(s:, 'control_file_exists', v:false)
 endfunction
 
 function! s:MonitorControlFile()
@@ -558,48 +554,52 @@ endfunction
 function! s:OnControlFileEvent(...)
   let s:control_file_exists = work#ControlFileExists()
   if !s:control_file_exists
-    echom "SSH connection died..."
+    echom "SSH master died..."
   endif
-endfunction
-
-function! work#IsMasterRunning()
-  return get(s:, 'master_job_id', 0) > 0
+  redrawstatus
 endfunction
 
 function! s:StartMaster()
-  if exists('s:master_job_id')
-    let s:master_stop_request = 1
-    call timer_stop(s:master_timer_id)
-    if jobstop(s:master_job_id)
-      call jobwait([s:master_job_id])
-    endif
-    unlet s:master_stop_request
-  endif
-
-  let cmd = "ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=accept-new -M -N " .. g:HOST
-  let s:master_job_id = init#OnJobExit(cmd, expand("<SID>") .. 'OnMasterExit')
-  let s:master_timer_id = timer_start(1100, 's:CheckMasterConnection')
-  call assert_true(s:master_job_id > 0)
-endfunction
-
-function! s:OnMasterExit(code)
-  unlet s:master_job_id
-  redrawstatus!
-
-  if !exists('s:master_stop_request')
-    echom "SSH master died!"
+  if work#ControlFileExists()
+    call init#OnJobExit(["ssh", "-O", "check", "-S", g:HOST_CONTROL, g:HOST], function("s:OnMasterCheck"))
+  else
+    call s:OnRestartMaster()
   endif
 endfunction
 
-function! s:CheckMasterConnection(...)
-  if work#IsMasterRunning()
-    redrawstatus!
-    call s:OnConnectedMaster()
+function! s:OnMasterCheck(code)
+  if a:code == 0
+    call s:OnMasterRunning(a:code)
+  else
+    call delete(g:HOST_CONTROL)
+    call init#OnJobExit(["ssh", "-O", "exit", "-o", "ControlPath=" .. g:HOST_CONTROL, g:HOST], function("s:OnRestartMaster"))
   endif
 endfunction
 
-function s:OnConnectedMaster()
+function! s:OnRestartMaster(...)
+  let cmd = ["ssh", "-o", "ConnectTimeout=1", "-o", "ControlPath=" .. g:HOST_CONTROL,
+        \ "-o", "ControlPersist=yes", "-o", "StrictHostKeyChecking=accept-new", "-M", "-N",
+        \ g:HOST]
+  call init#OnJobExit(cmd, function("s:OnMasterRunning"))
+endfunction
+
+function! s:OnMasterRunning(code)
+  if a:code != 0
+    call init#Warn("Failed to start SSH master!")
+    return
+  endif
+
+  call s:MonitorControlFile()
+  " Patch in order to avoid 'Connection reset by peer' errors.
+  let fix_ssh_cmd =  'test -d /run/sshd || (mkdir -p /run/sshd && chmod 0755 /run/sshd)'
+  call init#OnJobSuccess(["ssh", g:HOST, fix_ssh_cmd], function("s:OnPatchedConnection"))
+endfunction
+
+function! s:OnPatchedConnection()
   call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
+  call s:DetermineRsyncDir()
+  call s:DetermineSdk()
+  call s:CheckMenderCommit()
   let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
   call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
 endfunction
@@ -671,14 +671,7 @@ endfunction
 
 function s:OnHostChange()
   call s:InstallHostCommands()
-  call s:DetermineSdk()
-  call s:DetermineRsyncDir()
-  call s:CheckMenderCommit()
-  if init#IsMainWorkspace()
-    call s:StartMaster()
-  else
-    call s:MonitorControlFile()
-  endif
+  call s:StartMaster()
 endfunction
 
 function! HostCompl(ArgLead, CmdLine, CursorPos)
@@ -699,6 +692,7 @@ function! s:ChangeHost(host)
   endif
 endfunction
 
+" TODO dead code
 function! s:TryReconnect(code)
   if a:code == 0
     call s:OnHostChange()
@@ -1473,16 +1467,9 @@ command! -nargs=? Orientation call s:Orientation(<q-args>)
 """"""""""""""""""""""""""""Services"""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:OpenServices()
-  let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
-  let activity = systemlist(["ssh", g:HOST, cmd])
-  call s:StartServiceMonitor(activity)
-
   let services = s:GetServices()
   let nr = qutil#CreateCustomQuickfix(services, 'Services', expand("<SID>") .. 'OnSelectedService')
   call s:UpdateServicesHl(nr)
-  if !init#IsMainWorkspace()
-    call init#OnBufDelete(nr, expand("<SID>") .. "StopServiceMonitor")
-  endif
 endfunction
 
 function s:OnSelectedService()
@@ -1881,8 +1868,8 @@ function work#OnDiskFree(fs)
     if index(whitelist, target) >= 0
       return work#OnFilesystem(fs[0])
     endif
+    call qutil#CreateOneShotQuickfix(fs, "Choose RSYNC directory", "work#OnFilesystem")
   endif
-  call qutil#CreateOneShotQuickfix(fs, "Choose RSYNC directory", "work#OnFilesystem")
 endfunction
 
 function work#OnFilesystem(entry)
@@ -2146,9 +2133,9 @@ function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
   " Run RSI plugin
-  if init#IsMainWorkspace()
-    call RsiEnable()
-  endif
+
+  " TODO -- RSI is DISABLED!
+  " call RsiEnable()
 endfunction
 
 augroup Work
