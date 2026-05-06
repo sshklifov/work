@@ -35,31 +35,31 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
-  let repo = split(FugitiveWorkTree(), "/")[-1]
-  if repo == "worktree"
-    let orig = git#ExecuteOrThrow(["rev-parse", "--git-common-dir"])[0]
-    let repo = split(orig, "/")[-2]
+  let repo = FugitiveWorkTree()
+  let parts = split(repo, "/")
+  if len(parts) > 0
+    let repo = parts[-1]
+    if repo == "worktree"
+      let orig = git#ExecuteOrThrow(["rev-parse", "--git-common-dir"])[0]
+      let repo = split(orig, "/")[-2]
+    endif
   endif
   return work#GetMakeCommandFor(repo)
 endfunction
 
 function! work#GetMakeCommandFor(repo)
   if empty(a:repo)
-    echo "Not inside repo"
-    return
+    call init#Warn("Not inside a git tracked repo!")
   endif
-  const repo = split(a:repo, "/")[-1]
-  let whitelist_repos = ["obsidian-video", "libalcatraz", "mpp",
-        \ "camera_engine_rkaiq", "badge-and-face", "rock-video",
-        \ "alcatraz-ml-library", "mcu_manager", "sip-intercom-app",
-        \ "device-health", "hiredis", "alcatraz_audio", "mcu_manager", "mcu" ]
-  if index(whitelist_repos, repo) < 0
-    echo "Unsupported repo: " . repo
-    return []
+  let repo = a:repo
+
+  let dir = FugitiveWorkTree()
+  if empty(dir)
+    let dir = getcwd()
   endif
 
   let cmds = []
-  call add(cmds, printf("cd %s", FugitiveWorkTree()))
+  call add(cmds, printf("cd %s", dir))
   call add(cmds, printf("source %s/environment-setup-armv8a-aisys-linux", g:SDK_DIR))
   if repo == 'alcatraz-ml-library'
     call add(cmds, "export ParavisionSDKType=ROCKCHIP")
@@ -237,6 +237,71 @@ command! -nargs=1 -bang -complete=customlist,JournalCompl Journal call s:Journal
 command! -nargs=1 -bang -complete=customlist,JournalCompl JP call s:JournalPriority("<bang>", <q-args>)
 
 cabbr J Journal
+
+" TODO: Refactor health logic with selecting services (mostly for the highlight) and put into qutil#
+" Then make the command open a quickfix so you select which services you want to display (good defaults)
+" and when you close the window -> open the journal!
+
+function s:ShowBootLogs()
+  let cmd = ["journalctl", "-b", "--no-pager"]
+  for service in s:GetServices()
+    if stridx(service, "badge-and-face") < 0
+      call add(cmd, "_SYSTEMD_UNIT=" .. service)
+    endif
+  endfor
+  call add(cmd, "+")
+  for prio in range(0, 4)
+    call add(cmd, "PRIORITY=" .. prio)
+  endfor
+  call init#OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "work#OnBootLogs")
+endfunction
+
+function! work#OnBootLogs(output)
+  enew
+  call setline(1, a:output)
+  set nomodified
+  set nomodifiable
+  " Color warnings / errors in a separate job
+  let nr = bufnr()
+  let b:logs = a:output
+  let b:cb_count = len(range(0, 4))
+  for prio in range(0, 4)
+    let cmd = ["journalctl", "-q", "-b", "--no-pager", "PRIORITY=" .. prio]
+    let hl = prio < 4 ? "ErrorMsg" : "WarningMsg"
+    call init#OnJobOutput(["ssh", g:HOST, join(cmd)], "work#OnBootColoredLog", nr, hl)
+  endfor
+endfunction
+
+function! work#OnBootColoredLog(bufnr, hl, output)
+  let ns = nvim_create_namespace('boot')
+  let idx = 0
+  let haystack = getbufvar(a:bufnr, "logs")
+  for needle in a:output
+    if !empty(needle)
+      let pos = index(haystack, needle, idx)
+      if pos >= 0
+        call nvim_buf_set_extmark(a:bufnr, ns, pos, 0, #{line_hl_group: a:hl})
+        let idx = pos + 1
+      else
+        call setbufvar(a:bufnr, "show_warning", v:true)
+      endif
+    endif
+  endfor
+
+  let count = getbufvar(a:bufnr, "cb_count") - 1
+  call setbufvar(a:bufnr, "cb_count", count)
+  if count == 0
+    if getbufvar(a:bufnr, "show_warning")
+      call init#Warn("Partial highlight.")
+    endif
+    call setbufvar(a:bufnr, "logs", [])
+    let uptime = init#SystemOrThrow(["ssh", g:HOST, "uptime -p"])
+    echo uptime[0]
+  endif
+endfunction
+
+command! -nargs=0 Boot call s:ShowBootLogs()
+command! -nargs=0 Uptime call s:ShowBootLogs()
 
 function! s:SshTerminal()
   below sp
