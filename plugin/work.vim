@@ -1988,10 +1988,11 @@ function! s:OnMergeRequestDict(req, dict)
   nnoremap <silent> <buffer> b :call work#CopyBranchMergeRequest()<CR>
   nnoremap <silent> <buffer> w :call work#CopyMergeRequestURL()<CR>
   nnoremap <silent> <buffer> n :call work#ShowNotesMergeRequest()<CR>
+  nnoremap <silent> <buffer> T :call work#WorktreeMergeRequest()<CR>
 endfunction
 
 function s:ShowMergeRequestHelp()
-  echo "(B) Reset repo to branch locally (b) Copy branch (w) Open URL (n) Show notes"
+  echo "(B) Reset repo to branch locally (T) Edit in worktree (b) Copy branch (w) Open URL (n) Show notes"
 endfunction
 
 function! work#CopyMergeRequestURL()
@@ -2024,6 +2025,18 @@ function! work#ShowNotesMergeRequest()
 
   let repo = entry["repo_full"]
   call work#OnGitlabResponse(req, function("s:ShowGitlabNotes", [repo]))
+endfunction
+
+function! work#WorktreeMergeRequest()
+  let idx = line('.') - 1
+  let entry = b:mr_list[idx]
+  let repo = entry["repo_full"]
+  let branch = entry["branch"]
+  let git_dir = FugitiveExtractGitDir(repo)
+  call git#ExecuteOrThrow([git_dir, "fetch", "origin", branch])
+  call git#TrackBranch("!", branch, git_dir)
+  call git#OpenWorktree("!", branch, repo)
+  " TODO MakeSuccessful -> exe "Review " .. branch
 endfunction
 
 function! s:ShowGitlabNotes(repo, resp)
