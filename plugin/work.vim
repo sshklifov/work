@@ -117,7 +117,7 @@ function! work#GetMakeCommandFor(repo)
   return command
 endfunction
 
-command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), "<bang>")
+command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), #{preview: <bang>0})
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
@@ -238,15 +238,28 @@ command! -nargs=1 -bang -complete=customlist,JournalCompl JP call s:JournalPrior
 
 cabbr J Journal
 
-" TODO: Refactor health logic with selecting services (mostly for the highlight) and put into qutil#
-" Then make the command open a quickfix so you select which services you want to display (good defaults)
-" and when you close the window -> open the journal!
+" TODO: Refactor health logic to use CreateMultiQuickfix? It's different thoough...
 
-function s:ShowBootLogs()
+function s:ChooseBootLogs(bang)
+  let services = s:GetServices()
+  let enabled = []
+  for service in services
+    let e = stridx(service, "badge-and-face") < 0
+    call add(enabled, e)
+  endfor
+  if empty(a:bang)
+    call s:ShowBootLogs(enabled)
+  else
+    call qutil#CreateMultiQuickfix(services, enabled, 'Boot', function("s:ShowBootLogs"))
+  endif
+endfunction
+
+function s:ShowBootLogs(enabled)
   let cmd = ["journalctl", "-b", "--no-pager"]
-  for service in s:GetServices()
-    if stridx(service, "badge-and-face") < 0
-      call add(cmd, "_SYSTEMD_UNIT=" .. service)
+  let services = s:GetServices()
+  for idx in range(len(services))
+    if a:enabled[idx]
+      call add(cmd, "_SYSTEMD_UNIT=" .. services[idx])
     endif
   endfor
   call add(cmd, "+")
@@ -300,8 +313,8 @@ function! work#OnBootColoredLog(bufnr, hl, output)
   endif
 endfunction
 
-command! -nargs=0 Boot call s:ShowBootLogs()
-command! -nargs=0 Uptime call s:ShowBootLogs()
+command! -nargs=0 -bang Boot call s:ChooseBootLogs("<bang>")
+command! -nargs=0 -bang Uptime call s:ChooseBootLogs("<bang>")
 
 function! s:SshTerminal()
   below sp
@@ -492,8 +505,7 @@ endfunction
 
 function! s:Resync()
   let dir = FugitiveFind(g:BUILD_TYPE)
-  exe printf("autocmd! User MakeSuccessful ++once call s:RemoteSyncAll('%s')", dir)
-  call qutil#Make(work#GetMakeCommand())
+  call qutil#Make(work#GetMakeCommand(), #{on_success: { -> s:RemoteSyncAll(dir)}})
 endfunction
 
 function! work#Debug(arg, opts)
@@ -2038,7 +2050,9 @@ function! s:OnMergeRequestDict(req, dict)
           \ timestamp: entry["created_at"],
           \ repo: repo,
           \ url: entry["web_url"],
-          \ branch: entry["source_branch"]}
+          \ branch: entry["source_branch"],
+          \ target_branch: entry["target_branch"]
+          \ }
     if len(targets) >= 1
       let item["repo_full"] = targets[0][0]
     endif
@@ -2097,11 +2111,19 @@ function! work#WorktreeMergeRequest()
   let entry = b:mr_list[idx]
   let repo = entry["repo_full"]
   let branch = entry["branch"]
+  let target_branch = entry["target_branch"]
+
   let git_dir = FugitiveExtractGitDir(repo)
+  " TODO test if it works when I get an MR
+  call git#CloseWorktree()
   call git#ExecuteOrThrow([git_dir, "fetch", "origin", branch])
   call git#TrackBranch("!", branch, git_dir)
-  call git#OpenWorktree("!", branch, repo)
-  " TODO MakeSuccessful -> exe "Review " .. branch
+  call git#OpenWorktree(branch, repo, #{preview: 1, on_success: function("s:OnMergeRequestWorktree", [target_branch])})
+endfunction
+
+function! s:OnMergeRequestWorktree(target_branch)
+  " TODO switch somehow to the thing?
+  exe "R " .. a:target_branch
 endfunction
 
 function! s:ShowGitlabNotes(repo, resp)
