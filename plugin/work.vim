@@ -1298,17 +1298,6 @@ command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
 
 """"""""""""""""""""""""""""AI"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#FetchAI()
-  call git#CleanOrThrow("~/aidistro")
-  e ~/aidistro
-
-  echo "Fetching from origin..."
-  call git#ExecuteOrThrow(["checkout", "master"], "Failed to checkout aidistro master")
-  call git#ExecuteOrThrow(["pull", "origin", "master"], "Failed to pull aidistro")
-  call git#ExecuteOrThrow(["submodule", "update", "--init", "--recursive"])
-  echo "Fetching completed!"
-endfunction
-
 function! work#CommitAI()
   e ~/aidistro
   let cmd = ["diff", "--name-only", "--cached"]
@@ -1379,7 +1368,7 @@ function! AiCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let items = ["Fetch", "Commit", "Test", "Push", "CleanUp", "Reset"]
+  let items = ["Commit", "Test", "Push", "CleanUp", "Reset"]
   return filter(items, 'v:val =~ a:ArgLead')
 endfunction
 
@@ -2063,25 +2052,25 @@ function! s:OnMergeRequestDict(req, dict)
   let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
   let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
   call setbufvar(nr, 'mr_list', list)
-  nnoremap <silent> <buffer> B :call work#CheckMergeRequest()<CR>
-  nnoremap <silent> <buffer> b :call work#CopyBranchMergeRequest()<CR>
-  nnoremap <silent> <buffer> w :call work#CopyMergeRequestURL()<CR>
-  nnoremap <silent> <buffer> n :call work#ShowNotesMergeRequest()<CR>
-  nnoremap <silent> <buffer> T :call work#WorktreeMergeRequest()<CR>
+  nnoremap <silent> <buffer> B :call s:CheckMergeRequest()<CR>
+  nnoremap <silent> <buffer> b :call s:CopyBranchMergeRequest()<CR>
+  nnoremap <silent> <buffer> w :call s:CopyMergeRequestURL()<CR>
+  nnoremap <silent> <buffer> n :call s:ShowNotesMergeRequest()<CR>
+  nnoremap <silent> <buffer> T :call s:WorktreeMergeRequest()<CR>
 endfunction
 
 function s:ShowMergeRequestHelp()
   echo "(B) Reset repo to branch locally (T) Edit in worktree (b) Copy branch (w) Open URL (n) Show notes"
 endfunction
 
-function! work#CopyMergeRequestURL()
+function! s:CopyMergeRequestURL()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   call init#ToClipboard(entry["url"])
   " quit
 endfunction
 
-function! work#CheckMergeRequest()
+function! s:CheckMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   let repo = entry["repo_full"]
@@ -2090,13 +2079,13 @@ function! work#CheckMergeRequest()
   exe "e " .. repo
 endfunction
 
-function! work#CopyBranchMergeRequest()
+function! s:CopyBranchMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   call init#ToClipboard(entry["branch"])
 endfunction
 
-function! work#ShowNotesMergeRequest()
+function! s:ShowNotesMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   let req = printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s/notes?per_page=100",
@@ -2106,7 +2095,7 @@ function! work#ShowNotesMergeRequest()
   call work#OnGitlabResponse(req, function("s:ShowGitlabNotes", [repo]))
 endfunction
 
-function! work#WorktreeMergeRequest()
+function! s:WorktreeMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   let repo = entry["repo_full"]
@@ -2122,7 +2111,9 @@ function! work#WorktreeMergeRequest()
 endfunction
 
 function! s:OnMergeRequestWorktree(target_branch)
-  " TODO switch somehow to the thing?
+  const path = git#WorktreePath()
+  exe "e " .. path
+  only
   exe "R " .. a:target_branch
 endfunction
 
@@ -2159,7 +2150,7 @@ function! s:MrCommand(bang, arg)
     if empty(a:bang)
       call work#OpenMergeRequest(a:arg)
     else
-      call work#OpenMergeRequest("")
+      return init#Warn("Bang is not allowed in this context!")
     endif
   else
     call work#OpenMergeRequstQuickfix(a:bang)
@@ -2169,16 +2160,12 @@ endfunction
 command! -nargs=? -bang -complete=customlist,qutil#ReposCompl Mr call s:MrCommand("<bang>", <q-args>)
 cabbr MR Mr
 
-function work#OpenUnmergedBranches()
-  call work#OnGitlabUser(function("s:CollectEveryMr"))
-endfunction
-
-function! s:CollectEveryMr()
+function! s:CollectEveryUnmergedMr()
   let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=all&&per_page=100", g:gitlab_user)
-  call work#OnGitlabResponse(req, function("s:OnEveryMr"))
+  call work#OnGitlabResponse(req, function("s:OnEveryUnmergedMr"))
 endfunction
 
-function! s:OnEveryMr(dict)
+function! s:OnEveryUnmergedMr(dict)
   let repo_to_branch = #{}
   for entry in a:dict
     let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
@@ -2224,8 +2211,45 @@ function! s:OnUnmergedBranch()
   exe "e " .. repo
 endfunction
 
-command! -nargs=0 Unmerged call work#OpenUnmergedBranches()
+command! -nargs=0 Unmerged call work#OnGitlabUser(function("s:CollectEveryUnmergedMr"))
 
+function! s:CollectEveryMergedMr()
+  let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=merged&&per_page=100", g:gitlab_user)
+  call work#OnGitlabResponse(req, function("s:OnEveryMergedMr"))
+endfunction
+
+function! s:OnEveryMergedMr(dict)
+  let items = []
+  for entry in a:dict
+    let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
+    let title = entry["title"]
+    let branch = entry["source_branch"]
+    let timestamp = entry["merged_at"]
+    let issue = work#BranchIssueNumber(branch)
+    if empty(issue)
+      let issue = work#BranchIssueNumber(title)
+    endif
+    call add(items, #{repo: repo, title: title, issue: issue, timestamp: timestamp})
+  endfor
+  call sort(items, function("s:CompareTimestamps"))
+  call reverse(items)
+  let issues = map(copy(items), "v:val.issue")
+  let items = map(items, "printf('%s: %s', v:val.repo, v:val.title)")
+  let nr = qutil#CreateCustomQuickfix(items, "Merged", function("s:OnMergedBranch"))
+  call setbufvar(nr, "issues", issues)
+endfunction
+
+function! s:OnMergedBranch()
+  let idx = line('.') - 1
+  let issue = b:issues[idx]
+  if !empty(issue)
+    call work#OpenJira(issue)
+  else
+    echo "Unknown issue!"
+  endif
+endfunction
+
+command! -nargs=0 Merged call work#OnGitlabUser(function("s:CollectEveryMergedMr"))
 
 "}}}
 
