@@ -636,11 +636,11 @@ function! s:OnControlFileEvent(...)
   redrawstatus
 endfunction
 
-function! s:StartMaster()
+function! s:EnsureMaster()
   if work#ControlFileExists()
     call init#OnJobExit(["ssh", "-O", "check", "-S", g:HOST_CONTROL, g:HOST], function("s:OnMasterCheck"))
   else
-    call s:OnRestartMaster()
+    call s:StartMaster()
   endif
 endfunction
 
@@ -649,11 +649,11 @@ function! s:OnMasterCheck(code)
     call s:OnMasterRunning(a:code)
   else
     call delete(g:HOST_CONTROL)
-    call init#OnJobExit(["ssh", "-O", "exit", "-o", "ControlPath=" .. g:HOST_CONTROL, g:HOST], function("s:OnRestartMaster"))
+    call init#OnJobExit(["ssh", "-O", "exit", "-o", "ControlPath=" .. g:HOST_CONTROL, g:HOST], function("s:StartMaster"))
   endif
 endfunction
 
-function! s:OnRestartMaster(...)
+function! s:StartMaster(...)
   let cmd = ["ssh", "-o", "ConnectTimeout=1", "-o", "ControlPath=" .. g:HOST_CONTROL,
         \ "-o", "ControlPersist=yes", "-o", "StrictHostKeyChecking=accept-new", "-M", "-N",
         \ g:HOST]
@@ -748,7 +748,7 @@ endfunction
 
 function s:OnHostChange()
   call s:InstallHostCommands()
-  call s:StartMaster()
+  call s:EnsureMaster()
 endfunction
 
 function! HostCompl(ArgLead, CmdLine, CursorPos)
@@ -1960,12 +1960,12 @@ endfunction
 """"""""""""""""""""""""""""Gitlab"""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-let g:gitlab_token_file = stdpath('state') .. "/token.txt"
+let g:gitlab_token_file = stdpath('state') .. "/gitlab_token.txt"
 if filereadable(g:gitlab_token_file)
   let g:gitlab_token = readfile(g:gitlab_token_file)[0]
   let today = strftime('%Y-%m-%d')
   if today ># '2027-04-20'
-    call init#Warn("Your gitlab token as expired!")
+    call init#Warn("Your gitlab token has expired!")
   endif
 else
   call init#Warn("No gitlab token set up!")
@@ -1974,10 +1974,10 @@ endif
 
 function! work#OnGitlabResponse(req, cb)
   let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. g:gitlab_token, a:req]
-  return init#OnJobOutput(cmd, function("s:DecodeGitlabResponse", [a:cb]))
+  return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
 endfunction
 
-function! s:DecodeGitlabResponse(cb, output)
+function! s:DecodeJsonResponse(cb, output)
   call assert_true(len(a:output) <= 1)
   if len(a:output) >= 1
     let dict = json_decode(a:output[0])
