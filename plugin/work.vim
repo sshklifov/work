@@ -2253,6 +2253,115 @@ command! -nargs=0 Merged call work#OnGitlabUser(function("s:CollectEveryMergedMr
 
 "}}}
 
+""""""""""""""""""""""""""""Jenkins"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+let g:jenkins_user = "stefan@alcatraz.ai"
+let g:jenkins_token_file = stdpath('state') .. "/jenkins_token.txt"
+if filereadable(g:jenkins_token_file)
+  let g:jenkins_token = readfile(g:jenkins_token_file)[0]
+else
+  call init#Warn("No jenkins token set up!")
+  let g:jenkins_token = ""
+endif
+
+function! work#OnJenkinsResponse(req, cb)
+  let credentials = printf("%s:%s", g:jenkins_user, g:jenkins_token)
+  let cmd = ["curl", "--silent", "--globoff", "-u", credentials, a:req]
+  return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
+endfunction
+
+function s:ShowBuilds()
+  let jobs = ["aidistro_p1", "aidistro_obsidian", "aidistro_obsidian_release"]
+  let ns = "jenkins_builds"
+  for job in jobs
+    let req = printf(
+          \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,actions[causes[userId]]]{,100}",
+          \ job)
+    let Cb = init#JoinCallbacks(ns, job, function("s:OnBuildsResponse"), len(jobs))
+    call work#OnJenkinsResponse(req, Cb)
+  endfor
+endfunction
+
+function! s:FindUserId(json)
+  if type(a:json) == v:t_list
+    for item in a:json
+      let user_id = s:FindUserId(item)
+      if !empty(user_id)
+        return user_id
+      endif
+    endfor
+  elseif type(a:json) == v:t_dict
+    if has_key(a:json, "userId")
+      return a:json["userId"]
+    endif
+    for v in values(a:json)
+      let t = type(v)
+      if t == v:t_list || t == v:t_dict
+        let user_id = s:FindUserId(v)
+        if !empty(user_id)
+          return user_id
+        endif
+      endif
+    endfor
+  endif
+  return ""
+endfunction
+
+function! s:OnBuildsResponse(response_list)
+  let items = []
+  for [job, json] in a:response_list
+    for build in json["builds"]
+      let user = s:FindUserId(build)
+      if user != g:jenkins_user
+        continue
+      endif
+      let timestamp = build["timestamp"] / 1000
+      let today = strftime("%Y-%m-%d", timestamp) == strftime("%Y-%m-%d")
+      let seconds = localtime() - timestamp
+      if today
+        if seconds < 60
+          let pretty_time = seconds .. "s ago"
+        elseif seconds < 60 * 60
+          let pretty_time = (seconds / 60) .. "m ago"
+        elseif seconds < 24 * 60 * 60
+          let pretty_time = (seconds / 60 / 60) .. "h ago"
+        endif
+      else
+        let pretty_time = strftime("%Y-%m-%d %H:%M:%S", timestamp)
+      endif
+      let name = printf("%s %s [%s]: %s", job, build["number"], build["result"], pretty_time)
+      if build["building"]
+        let hl = "DiagnosticUnnecessary"
+      elseif build["result"] == "FAILURE"
+        let hl = "DiagnosticError"
+      elseif build["result"] == "SUCCESS"
+        let hl = "DiagnosticOk"
+      else
+        let hl = "Normal"
+      endif
+      call add(items, #{name: name, timestamp: timestamp, url: build["url"], hl: hl})
+    endfor
+  endfor
+  call sort(items, function("s:CompareTimestamps"))
+  call reverse(items)
+  let names = map(copy(items), "v:val.name")
+  let nr = qutil#CreateCustomQuickfix(names, "Builds", function("s:OnSelectedBuild"))
+  call setbufvar(nr, "urls", map(copy(items), "v:val.url"))
+  let ns = nvim_create_namespace("builds")
+  for idx in range(len(items))
+    call nvim_buf_set_extmark(nr, ns, idx, 0, #{line_hl_group: items[idx]["hl"]})
+  endfor
+endfunction
+
+function! s:OnSelectedBuild()
+  let idx = line('.') - 1
+  let url = b:urls[idx]
+  call init#ToClipboard(url)
+endfunction
+
+command! -nargs=0 Builds call s:ShowBuilds()
+
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
