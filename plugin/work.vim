@@ -65,10 +65,9 @@ function! work#GetMakeCommandFor(repo)
     call add(cmds, "export ParavisionSDKType=ROCKCHIP")
   endif
 
-  let libstdcpp = "11.5.0"
   let sdk_flags = [
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/", g:SDK_DIR, libstdcpp),
-        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/aarch64-aisys-linux", g:SDK_DIR, libstdcpp),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/", g:SDK_DIR, g:LIBSTD_CPP),
+        \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/aarch64-aisys-linux", g:SDK_DIR, g:LIBSTD_CPP),
         \ ]
   call add(cmds, "export CXXFLAGS=" . string(join(sdk_flags)))
 
@@ -240,6 +239,42 @@ cabbr J Journal
 
 " TODO: Refactor health logic to use CreateMultiQuickfix? It's different thoough...
 
+function! s:OnJobMaxOutput(cmds, max_output, cb, ...)
+  if exists("s:job_collected_data")
+    echo "Cannot start job, busy!"
+    return
+  endif
+
+  call assert_true(!exists("s:job_max_data"))
+  call assert_true(type(a:cb) == v:t_string)
+  let s:job_collected_data = []
+  let s:job_max_data = a:max_output
+
+  let Cb = function(a:cb, a:000)
+  let WrapCb = {_0, _1, _2 -> Cb(s:ForwardMaxOutput()) }
+  return init#Jobstart(a:cmds, #{on_stdout: function("s:CollectMaxOutput"), on_exit: WrapCb})
+endfunction
+
+function! s:CollectMaxOutput(job, data, _1)
+  if len(s:job_collected_data) < s:job_max_data
+    if len(s:job_collected_data) > 0 && len(a:data) > 0 && strptime('%b %d %H:%M:%S', a:data[0]) == 0
+      let s:job_collected_data[-1] ..= a:data[0]
+      call extend(s:job_collected_data, a:data[1:])
+    else
+      call extend(s:job_collected_data, a:data)
+    endif
+  else
+    call jobstop(a:job)
+  endif
+endfunction
+
+function! s:ForwardMaxOutput()
+  let ret = s:job_collected_data
+  unlet s:job_collected_data
+  unlet s:job_max_data
+  return ret
+endfunction
+
 function s:ChooseBootLogs(bang)
   let services = s:GetServices()
   let enabled = []
@@ -266,10 +301,10 @@ function s:ShowBootLogs(enabled)
   for prio in range(0, 4)
     call add(cmd, "PRIORITY=" .. prio)
   endfor
-  call init#OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "work#OnBootLogs")
+  call s:OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "s:OnBootLogs")
 endfunction
 
-function! work#OnBootLogs(output)
+function! s:OnBootLogs(output)
   enew
   call setline(1, a:output)
   set nomodified
@@ -693,25 +728,56 @@ function! s:OnDeviceMounts(mnt)
 endfunction
 
 function s:DetermineSdk()
-  let cmd = ["ssh", g:HOST, "cat /var/lib/mender/device_type"]
+  let cmd = ["ssh", g:HOST, "cat /var/lib/mender/device_type || ls /usr/lib/librsid.so"]
   call init#OnJobOutput(cmd, expand("<SID>") .. 'OnSdkOutput')
 endfunction
 
 function! s:OnSdkOutput(output)
-  if stridx(a:output[0], "rockx-dm-p15") >= 0
+  if stridx(a:output[0], "librsid.so") >= 0
+    let g:DEVICE = "imx95-var-dart"
+    let g:SDK_DIR = "/opt/aisys/imx95_var_dart"
+    let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
+  elseif stridx(a:output[0], "rockx-dm-p15") >= 0
     let g:DEVICE = "rockx-dm-p15"
     let g:SDK_DIR = "/opt/aisys/obsidian_p15"
+    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "rockx-dm-r10") >= 0
     let g:DEVICE = "rockx-dm-r10"
     let g:SDK_DIR = "/opt/aisys/obsidian_r10"
+    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "onyx-p1") >= 0
     let g:DEVICE = "onyx-p1"
     let g:SDK_DIR = "/opt/aisys/onyx_p1"
+    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "onyx-cr") >= 0
     let g:DEVICE = "onyx-cr"
     let g:SDK_DIR = "/opt/aisys/onyx_cr"
+    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   endif
   let g:objdump_exe = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
+  let full_docker_compose = printf("/home/%s/aidocker/%s", $USER, g:DOCKER_COMPOSE)
+  call init#OnJobOutput(["docker-compose", "-f", full_docker_compose, "config", "--format", "json"], function("s:OnDockerCompose"))
+  let libstd_cpp_dir = g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/include/c++"
+  call init#OnJobOutput(["ls", "-1", libstd_cpp_dir], function("s:OnLibstdVersions"))
+endfunction
+
+function! s:OnLibstdVersions(output)
+  " Close enough...
+  let versions = sort(a:output)
+  let g:LIBSTD_CPP = versions[-1]
+endfunction
+
+function! s:OnDockerCompose(output)
+  let json = json_decode(a:output)
+  let volumes = init#Get(json, "services", "ubuntu22", "volumes", [])
+  let dest_path = printf("/home/%s/aicache", $USER)
+  " Use as a default
+  let g:DOCKER_CACHE = dest_path
+  for volume in volumes
+    if volume["target"] == dest_path
+      let g:DOCKER_CACHE = volume["source"]
+    endif
+  endfor
 endfunction
 
 function! s:InstallHostCommands()
@@ -739,8 +805,6 @@ function! s:InstallHostCommands()
     nnoremap <silent> <leader>rf <cmd>Sync focus-tool<CR>
     nnoremap <silent> <leader>rq <cmd>Sync qrcode-scanner<CR>
     nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("application/obsidian-video")<CR>
-  else
-    call init#Warn("Not installing host specific maps!")
   endif
   nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
@@ -849,8 +913,8 @@ function! s:UpdateDocker()
   sp
   enew
   lcd ~/aidocker
-  let cmds = ["sudo docker-compose build ubuntu22"]
-  call termopen(join(cmds, ";"))
+  let cmd = printf("sudo docker-compose -f %s build ubuntu22", g:DOCKER_COMPOSE)
+  call termopen(cmd)
   startinsert
 endfunction
 
@@ -858,11 +922,11 @@ function! s:RunDocker(...)
   sp
   enew
   lcd ~/aidocker
-  let cmds = ["sudo", "docker-compose", "run", "--rm", "ubuntu22"]
+  let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", g:DEVICE),
-        \ "source /home/stef/aidistro/setup-environment /home/stef/aicache"]
+        \ "source /home/stef/aidistro/setup-environment " .. g:DOCKER_CACHE]
   if a:0 > 0
     call add(bash_cmd, join(a:000))
   else
@@ -889,7 +953,7 @@ function! s:BuildMfg()
 endfunction
 
 function! s:InstallSdk()
-  let sdks = systemlist(["find", "/home/" .. $USER .. "/aicache/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
+  let sdks = systemlist(["find", g:DOCKER_CACHE .. "/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
   if empty(sdks)
     echo "No sdk found"
     return
@@ -916,7 +980,7 @@ function! s:InstallSdk()
 endfunction
 
 function! s:FindImage()
-  let images = systemlist(["find", "/home/" .. $USER .. "/aicache/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:DEVICE)])
+  let images = systemlist(["find", g:DOCKER_CACHE .. "/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:DEVICE)])
   if empty(images)
     throw "No image found"
   endif
@@ -958,8 +1022,9 @@ function! s:InstallImage()
   call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
   call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
   call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
+  call add(cmds, "echo 'Waiting for device to reboot...'")
   call add(cmds, "ssh_wait_silent " .. g:HOST)
-  call termopen(join(cmds, " && "))
+  call termopen(join(cmds, " ; "))
   startinsert
 endfunction
 
@@ -1733,9 +1798,9 @@ function work#SelectStream(ip)
   let line = getline(pos)
   let [type, name] = split(line, ": ")
   if type == "H264"
-    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink"
+    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! fpsdisplaysink video-sink=autovideosink"
   elseif type == "MJPEG"
-    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! videoconvert ! autovideosink"
+    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! fpsdisplaysink video-sink=autovideosink"
   endif
   let msg = printf(fmt, a:ip, name)
   call init#ToClipboard(msg)
