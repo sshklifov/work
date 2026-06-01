@@ -2,7 +2,7 @@
 
 """"""""""""""""""""""""""""Commit tag"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#BranchIssueNumber(...)
+function! work#ExtractIssue(...)
   let branch = get(a:000, 0, git#GetBranch())
   return matchstr(branch, 'SW-[0-9]\{4\}')
 endfunction
@@ -22,7 +22,7 @@ function! s:OnNewCommit()
     return init#Warn('Current branch is %s!', branch)
   endif
 
-  let issue = work#BranchIssueNumber()
+  let issue = work#ExtractIssue()
   if empty(getline(1)) && !empty(issue)
     call setline(1, issue .. ': ')
     startinsert!
@@ -52,7 +52,7 @@ function! work#GetMakeCommandFor(repo)
     call init#Warn("Not inside a git tracked repo!")
   endif
   let repo = a:repo
-
+  
   let dir = FugitiveWorkTree()
   if empty(dir)
     let dir = getcwd()
@@ -82,7 +82,9 @@ function! work#GetMakeCommandFor(repo)
 
   if repo == 'libalcatraz'
     let cmake .= " -DBUILD_TESTS=0"
-    let cmake .= " -DPRELOAD_OPENCV_MAT_SUPPORT=1"
+    if stridx(g:DEVICE, "rockx") >= 0
+      let cmake .= " -DPRELOAD_OPENCV_MAT_SUPPORT=1"
+    endif
   endif
   if repo == 'alcatraz-ml-library' || repo == 'badge-and-face' || repo == 'device-health' || repo == 'libalcatraz'
     if stridx(g:DEVICE, "onyx") >= 0
@@ -614,10 +616,10 @@ function! s:RunAsService(exe)
   endif
   let cmds = []
   call add(cmds, printf("echo Stopping %s...", systemd_name))
-  call add(cmds, "sudo systemctl stop " .. systemd_name)
-  call add(cmds, printf("sudo rsync -a --xattrs %s /usr/bin/", remote_path))
+  call add(cmds, "systemctl stop " .. systemd_name)
+  call add(cmds, printf("rsync -a --xattrs %s /usr/bin/", remote_path))
   call add(cmds, printf("echo Starting %s...", systemd_name))
-  call add(cmds, "sudo systemctl start " .. systemd_name)
+  call add(cmds, "systemctl start " .. systemd_name)
 
   sp
   enew
@@ -651,7 +653,7 @@ function! s:OnConfig(host, Cb, output)
 endfunction
 
 function! work#ControlFileExists()
-  return !empty(g:HOST_CONTROL) && filereadable(g:HOST_CONTROL)
+  return has_key(g:, "HOST_CONTROL") && !empty(g:HOST_CONTROL) && filereadable(g:HOST_CONTROL)
 endfunction
 
 function! work#GetHostStatus()
@@ -702,6 +704,41 @@ function! s:OnMasterRunning(code)
   endif
 
   call s:MonitorControlFile()
+  let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
+  call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+endfunction
+
+function! s:AddBackdoor()
+  let cmds = []
+
+  " Enable authorized_keys again
+  call add(cmds,
+        \ "sed -i 's|^AuthorizedKeysFile[[:space:]].*|AuthorizedKeysFile .ssh/authorized_keys|' /etc/ssh/sshd_config")
+
+  " Create root ssh dir with proper perms
+  call add(cmds, "mkdir -p /root/.ssh")
+  call add(cmds, "chmod 700 /root/.ssh")
+
+  " Copy the currently working user's authorized keys
+  call add(cmds, "cat > /root/.ssh/authorized_keys")
+  call add(cmds, "chown root:root /root/.ssh/authorized_keys")
+  call add(cmds, "chmod 600 /root/.ssh/authorized_keys")
+
+  " Validate + restart ssh
+  call add(cmds, "sshd -t")
+  call add(cmds, "systemctl restart sshd.socket")
+
+  let once_guard = 'test -f /root/.ssh/authorized_keys'
+  let backdoor_cmd = printf('sudo sh -c "%s || (%s)"', once_guard, join(cmds, " && "))
+
+  const host = "alcatraz@" .. g:HOST
+  let id = init#OnJobSuccess(["ssh", host, backdoor_cmd], function("s:OnBackdoor"))
+  let auth_file = readfile(expand("~/.ssh/id_ed25519.pub"))
+  call chansend(id, auth_file)
+  call chanclose(id, 'stdin')
+endfunction
+
+function! s:OnBackdoor()
   " Patch in order to avoid 'Connection reset by peer' errors.
   let fix_ssh_cmd =  'test -d /run/sshd || (mkdir -p /run/sshd && chmod 0755 /run/sshd)'
   call init#OnJobSuccess(["ssh", g:HOST, fix_ssh_cmd], function("s:OnPatchedConnection"))
@@ -713,7 +750,7 @@ function! s:OnPatchedConnection()
   call s:DetermineSdk()
   call s:CheckMenderCommit()
   let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
-  call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+  call s:EnsureMaster()
 endfunction
 
 function! s:OnDeviceMounts(mnt)
@@ -733,30 +770,27 @@ function s:DetermineSdk()
 endfunction
 
 function! s:OnSdkOutput(output)
+  let g:DOCKER_COMPOSE = "docker-compose.yaml"
+  let g:DOCKER_CACHE = printf("/home/%s/aicache", $USER)
   if stridx(a:output[0], "librsid.so") >= 0
     let g:DEVICE = "imx95-var-dart"
     let g:SDK_DIR = "/opt/aisys/imx95_var_dart"
     let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
+    let g:DOCKER_CACHE = printf("/home/%s/aicache-bd", $USER)
   elseif stridx(a:output[0], "rockx-dm-p15") >= 0
     let g:DEVICE = "rockx-dm-p15"
     let g:SDK_DIR = "/opt/aisys/obsidian_p15"
-    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "rockx-dm-r10") >= 0
     let g:DEVICE = "rockx-dm-r10"
     let g:SDK_DIR = "/opt/aisys/obsidian_r10"
-    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "onyx-p1") >= 0
     let g:DEVICE = "onyx-p1"
     let g:SDK_DIR = "/opt/aisys/onyx_p1"
-    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   elseif stridx(a:output[0], "onyx-cr") >= 0
     let g:DEVICE = "onyx-cr"
     let g:SDK_DIR = "/opt/aisys/onyx_cr"
-    let g:DOCKER_COMPOSE = "docker-compose.yaml"
   endif
   let g:objdump_exe = g:SDK_DIR .. "/sysroots/x86_64-aisdk-linux/usr/bin/aarch64-aisys-linux/aarch64-aisys-linux-objdump"
-  let full_docker_compose = printf("/home/%s/aidocker/%s", $USER, g:DOCKER_COMPOSE)
-  call init#OnJobOutput(["docker-compose", "-f", full_docker_compose, "config", "--format", "json"], function("s:OnDockerCompose"))
   let libstd_cpp_dir = g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/include/c++"
   call init#OnJobOutput(["ls", "-1", libstd_cpp_dir], function("s:OnLibstdVersions"))
 endfunction
@@ -765,19 +799,6 @@ function! s:OnLibstdVersions(output)
   " Close enough...
   let versions = sort(a:output)
   let g:LIBSTD_CPP = versions[-1]
-endfunction
-
-function! s:OnDockerCompose(output)
-  let json = json_decode(a:output)
-  let volumes = init#Get(json, "services", "ubuntu22", "volumes", [])
-  let dest_path = printf("/home/%s/aicache", $USER)
-  " Use as a default
-  let g:DOCKER_CACHE = dest_path
-  for volume in volumes
-    if volume["target"] == dest_path
-      let g:DOCKER_CACHE = volume["source"]
-    endif
-  endfor
 endfunction
 
 function! s:InstallHostCommands()
@@ -805,6 +826,7 @@ function! s:InstallHostCommands()
     nnoremap <silent> <leader>rf <cmd>Sync focus-tool<CR>
     nnoremap <silent> <leader>rq <cmd>Sync qrcode-scanner<CR>
     nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("application/obsidian-video")<CR>
+    nnoremap <silent> <leader>ss <cmd>call <SID>RunAsService("application/rtsp-server")<CR>
   endif
   nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
@@ -812,7 +834,7 @@ endfunction
 
 function s:OnHostChange()
   call s:InstallHostCommands()
-  call s:EnsureMaster()
+  call s:AddBackdoor()
 endfunction
 
 function! HostCompl(ArgLead, CmdLine, CursorPos)
@@ -830,15 +852,6 @@ function! s:ChangeHost(host)
     echo "Current host is: " .. g:HOST
   else
     call s:DetermineConfig(a:host, function('s:OnHostResolvedIP'))
-  endif
-endfunction
-
-" TODO dead code
-function! s:TryReconnect(code)
-  if a:code == 0
-    call s:OnHostChange()
-  else
-    call init#Warn("Connection to '%s': Timed out.", g:HOST)
   endif
 endfunction
 
@@ -874,8 +887,8 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
-        \ "BuildSdk", "BuildImage", "BuildMfg", "InstallSdk", "ShowImage",
-        \ "SaveImage", "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
+        \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
+        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
         \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
@@ -940,20 +953,36 @@ function! s:RunDocker(...)
   return id
 endfunction
 
+function s:BitbakeCommand(...)
+  let opts = get(a:000, 0, #{})
+  if g:DEVICE == "imx95-var-dart"
+    let img_cmd = "bitbake ai-base-image"
+  else
+    let img_cmd = "bitbake rock-image"
+  endif
+  let sdk_cmd = img_cmd .. " -c populate_sdk"
+
+  let multi = has_key(opts, "multi") && opts["multi"]
+  let sdk_only = has_key(opts, "sdk") && opts["sdk"]
+  if multi
+    return printf("%s && %s", img_cmd, sdk_cmd)
+  elseif sdk_only
+    return sdk_cmd
+  else
+    return img_cmd
+  endif
+endfunction
+
 function! s:BuildSdk()
-  return s:RunDocker("bitbake rock-image -c populate_sdk")
+  return s:RunDocker(s:BitbakeCommand(#{sdk: v:true}))
 endfunction
 
 function! s:BuildImage()
-  return s:RunDocker("bitbake rock-image")
-endfunction
-
-function! s:BuildMfg()
-  return s:RunDocker("bitbake ota-mfg-image")
+  return s:RunDocker(s:BitbakeCommand())
 endfunction
 
 function! s:InstallSdk()
-  let sdks = systemlist(["find", g:DOCKER_CACHE .. "/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
+  let sdks = init#SystemOrThrow(["find", g:DOCKER_CACHE .. "/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
   if empty(sdks)
     echo "No sdk found"
     return
@@ -979,8 +1008,14 @@ function! s:InstallSdk()
   startinsert
 endfunction
 
-function! s:FindImage()
-  let images = systemlist(["find", g:DOCKER_CACHE .. "/tmp/deploy/images/", "-regex", printf(".*%s.*mender", g:DEVICE)])
+function! s:FindImage(...)
+  let ext = (g:DEVICE == "imx95-var-dart" ? "wic.zst" : "mender") 
+  let regex = printf(".*%s.*%s", g:DEVICE, ext)
+  let dir = get(a:000, 0, "")
+  if empty(dir)
+    let dir = g:DOCKER_CACHE .. "/tmp/deploy/images/"
+  endif
+  let images = systemlist(["find", dir, "-regex", regex])
   if empty(images)
     throw "No image found"
   endif
@@ -1012,23 +1047,58 @@ function! s:SaveImage(name)
   echo "Copied to " .. dest .. "."
 endfunction
 
-function! s:InstallImage()
-  let most_recent_image = s:FindImage()
+function! s:InstallImage(...)
+  if a:0 > 0
+    let most_recent_image = a:1
+  else
+    let most_recent_image = s:FindImage()
+  endif
+
   let most_recent_timestamp = getftime(most_recent_image)
   let mins = (localtime() - most_recent_timestamp) / 60
   split
   enew
   let cmds = []
   call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
-  call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
-  call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
-  call add(cmds, "echo 'Waiting for device to reboot...'")
-  call add(cmds, "ssh_wait_silent " .. g:HOST)
-  call termopen(join(cmds, " ; "))
+  if g:DEVICE == "imx95-var-dart"
+    let dev = s:FindSdCard()
+    if empty(dev)
+      return init#Warn("Please mount the flash drive!")
+    endif
+
+    let mounts = init#SystemOrThrow("findmnt -n -o SOURCE")
+    call filter(mounts, "stridx(v:val, dev) >= 0")
+    if !empty(mounts)
+      call add(cmds, "umount " .. join(mounts))
+    endif
+
+    call add(cmds, printf("sudo bmaptool copy %s %s", most_recent_image, dev))
+    call add(cmds, "sync")
+    call add(cmds, "udisksctl power-off -b /dev/sdc")
+    call add(cmds, "echo 'Please insert SD card back into device...'")
+  else
+    call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
+    call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
+    call add(cmds, "echo 'Waiting for device to reboot...'")
+    call add(cmds, "ssh_wait_silent " .. g:HOST)
+  endif
+  call termopen(join(cmds, " && "))
   startinsert
 endfunction
 
+function! s:FindSdCard()
+  const by_id = "/dev/disk/by-id/usb-Generic_MassStorageClass_000000002962-0:1"
+  if !empty(getftype(by_id))
+    return resolve(by_id)
+  else
+    return ""
+  endif
+endfunction
+
 function! s:RefreshImage()
+  if g:DEVICE == "imx95-var-dart" && empty(s:FindSdCard())
+    return init#Warn("Please mount the flash drive!")
+  endif
   let id = s:BuildImage()
   call init#OnTermSuccess(id, function("s:InstallImage"))
 endfunction
@@ -1039,7 +1109,7 @@ function! s:RefreshSdk()
 endfunction
 
 function! s:Refresh()
-  let id = s:RunDocker("bitbake rock-image && bitbake rock-image -c populate_sdk")
+  let id = s:RunDocker(s:BitbakeCommand(#{multi: v:true}))
   call init#OnTermSuccess(id, function("s:InstallBoth"))
 endfunction
 
@@ -1466,82 +1536,59 @@ function! work#GenerateMergeRequestURL(repo)
   call init#ToClipboard(url)
 endfunction
 
-function! s:ShowActivity()
-  let cmd = ["for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
-  let branches = git#ExecuteOrThrow(cmd, "Failed to fetch recent commits!")
-  call filter(branches, '!empty(v:val)')
-  call qutil#CreateOneShotQuickfix(branches, 'Branches', 'work#OnIssueSelected')
-endfunction
+" TODO remove? not used... but look STONK!
 
-function! work#OnIssueSelected(branch)
-  let issue = work#BranchIssueNumber(a:branch)
-  if !empty(issue)
-    call work#OpenJira(issue)
-  else
-    echo "Nothing to show!"
-  endif
-endfunction
+" function! s:MyDashboard()
+"   call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
+" endfunction
 
-function! s:MyDashboard()
-  call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
-endfunction
+" function! s:CopyBranch()
+"   call init#ToClipboard(git#GetBranch())
+" endfunction
 
-function! s:OpenCurrent()
-  let issue = work#BranchIssueNumber()
-  if empty(issue)
-    echo "Nothing to show!"
-  else
-    call work#OpenJira(issue)
-  endif
-endfunction
+" function! s:CopyHash()
+"   let hash = git#ExecuteOrThrow(['rev-parse', 'HEAD'], "Failed to parse HEAD")
+"   call init#ToClipboard(hash[0])
+" endfunction
 
-function! s:CopyBranch()
-  call init#ToClipboard(git#GetBranch())
-endfunction
+" function! s:MessageSearch(...)
+"   let args = join(a:000)
+"   if empty(args)
+"     echo "Expecting string!"
+"   else
+"     exe "G log --grep=" .. join(a:000)
+"   endif
+" endfunction
 
-function! s:CopyHash()
-  let hash = git#ExecuteOrThrow(['rev-parse', 'HEAD'], "Failed to parse HEAD")
-  call init#ToClipboard(hash[0])
-endfunction
+" function! s:CodeSearch(...)
+"   let args = join(a:000)
+"   if empty(args)
+"     echo "Expecting string!"
+"   else
+"     exe "G log --all -S " .. args
+"   endif
+" endfunction
 
-function! s:MessageSearch(...)
-  let args = join(a:000)
-  if empty(args)
-    echo "Expecting string!"
-  else
-    exe "G log --grep=" .. join(a:000)
-  endif
-endfunction
+" function! s:AuthorSearch(...)
+"   let args = join(a:000)
+"   if empty(args)
+"     let args = "Shklifov"
+"   endif
+"   exe "G log --author " .. args
+" endfunction
 
-function! s:CodeSearch(...)
-  let args = join(a:000)
-  if empty(args)
-    echo "Expecting string!"
-  else
-    exe "G log --all -S " .. args
-  endif
-endfunction
+" function! IssueCompl(ArgLead, CmdLine, CursorPos)
+"   let nargs = len(split(a:CmdLine))
+"   if a:CursorPos < len(a:CmdLine) || nargs > 2
+"     return []
+"   endif
+"   let cmds = ["MyDashboard", "OpenCurrent",
+"         \ "CopyBranch", "CopyHash", "MessageSearch",
+"         \ "CodeSearch", "AuthorSearch", "OpenMR"]
+"   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
+" endfunction
 
-function! s:AuthorSearch(...)
-  let args = join(a:000)
-  if empty(args)
-    let args = "Shklifov"
-  endif
-  exe "G log --author " .. args
-endfunction
-
-function! IssueCompl(ArgLead, CmdLine, CursorPos)
-  let nargs = len(split(a:CmdLine))
-  if a:CursorPos < len(a:CmdLine) || nargs > 2
-    return []
-  endif
-  let cmds = ["ShowActivity", "MyDashboard", "OpenCurrent",
-        \ "CopyBranch", "CopyHash", "MessageSearch",
-        \ "CodeSearch", "AuthorSearch", "OpenMR"]
-  return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
-endfunction
-
-command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
+" command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
 " }}}
 
 """"""""""""""""""""""""""""Orientation"""""""""""""""""""""""""" {{{
@@ -1742,8 +1789,9 @@ function work#CheckRtspConnection(bang, ip)
   call system(["nc", "-w", "1", "-z", ip, 8554])
 
   let cmd = "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"
-  let output = systemlist(printf("timeout -p 0.1 nc %s 8554", ip), cmd)
+  let output = systemlist(printf("timeout 0.1 nc %s 8554", ip), cmd)
   if stridx(join(output), "DESCRIBE") < 0
+    call init#ShowErrors(output)
     return init#Warn("No DESCRIBE command!")
   endif
 
@@ -1763,7 +1811,7 @@ function work#CheckRtspConnection(bang, ip)
     let seq += 1
   endfor
 
-  let output = system(printf("timeout -p 4 nc %s 8554", ip), cmd)
+  let output = system(printf("timeout 4 nc %s 8554", ip), cmd)
   let output = split(output, "\r\n")
 
   let ok = filter(copy(output), 'v:val =~# "RTSP/[0-9.]* 200 OK"')
@@ -1862,7 +1910,7 @@ function s:CheckRepo(repo, ...)
   endif
 endfunction
 
-function s:ForceUpdateRepo(repo, ...)
+function! s:ForceUpdateRepo(repo, ...)
   let repo = FugitiveExtractGitDir(a:repo)
   if a:0 > 0
     let branch = a:1
@@ -1896,7 +1944,7 @@ function s:ForceUpdateRepo(repo, ...)
   endif
 endfunction
 
-function s:CheckAidistro(bang, branch)
+function! s:CheckAidistro(bang, branch)
   let repo = expand("~/aidistro")
   if empty(a:bang)
     call s:CheckRepo(repo, a:branch)
@@ -2117,11 +2165,11 @@ function! s:OnMergeRequestDict(req, dict)
   let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
   let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
   call setbufvar(nr, 'mr_list', list)
-  nnoremap <silent> <buffer> B :call s:CheckMergeRequest()<CR>
-  nnoremap <silent> <buffer> b :call s:CopyBranchMergeRequest()<CR>
-  nnoremap <silent> <buffer> w :call s:CopyMergeRequestURL()<CR>
-  nnoremap <silent> <buffer> n :call s:ShowNotesMergeRequest()<CR>
-  nnoremap <silent> <buffer> T :call s:WorktreeMergeRequest()<CR>
+  nnoremap <silent> <buffer> B :call <SID>CheckoutMergeRequest()<CR>
+  nnoremap <silent> <buffer> b :call <SID>CopyBranchMergeRequest()<CR>
+  nnoremap <silent> <buffer> w :call <SID>CopyMergeRequestURL()<CR>
+  nnoremap <silent> <buffer> n :call <SID>ShowNotesMergeRequest()<CR>
+  nnoremap <silent> <buffer> T :call <SID>WorktreeMergeRequest()<CR>
 endfunction
 
 function s:ShowMergeRequestHelp()
@@ -2135,7 +2183,7 @@ function! s:CopyMergeRequestURL()
   " quit
 endfunction
 
-function! s:CheckMergeRequest()
+function! s:CheckoutMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   let repo = entry["repo_full"]
@@ -2290,9 +2338,9 @@ function! s:OnEveryMergedMr(dict)
     let title = entry["title"]
     let branch = entry["source_branch"]
     let timestamp = entry["merged_at"]
-    let issue = work#BranchIssueNumber(branch)
+    let issue = work#ExtractIssue(branch)
     if empty(issue)
-      let issue = work#BranchIssueNumber(title)
+      let issue = work#ExtractIssue(title)
     endif
     call add(items, #{repo: repo, title: title, issue: issue, timestamp: timestamp})
   endfor
@@ -2321,7 +2369,7 @@ command! -nargs=0 Merged call work#OnGitlabUser(function("s:CollectEveryMergedMr
 """"""""""""""""""""""""""""Jenkins"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-let g:jenkins_user = "stefan@alcatraz.ai"
+let g:alcatraz_ai_user = "stefan@alcatraz.ai"
 let g:jenkins_token_file = stdpath('state') .. "/jenkins_token.txt"
 if filereadable(g:jenkins_token_file)
   let g:jenkins_token = readfile(g:jenkins_token_file)[0]
@@ -2331,7 +2379,7 @@ else
 endif
 
 function! work#OnJenkinsResponse(req, cb)
-  let credentials = printf("%s:%s", g:jenkins_user, g:jenkins_token)
+  let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
   let cmd = ["curl", "--silent", "--globoff", "-u", credentials, a:req]
   return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
 endfunction
@@ -2378,7 +2426,7 @@ function! s:OnBuildsResponse(response_list)
   for [job, json] in a:response_list
     for build in json["builds"]
       let user = s:FindUserId(build)
-      if user != g:jenkins_user
+      if user != g:alcatraz_ai_user
         continue
       endif
       let timestamp = build["timestamp"] / 1000
@@ -2427,6 +2475,146 @@ endfunction
 
 command! -nargs=0 Builds call s:ShowBuilds()
 
+function! work#OnJenkinsPost(req, data, cb)
+  let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
+  let cmd = [ "curl", "--silent", "-i", "--globoff", "-X", "POST", "-u", credentials]
+  for d in a:data
+    let cmd += ["--data-urlencode", d]
+  endfor
+  call add(cmd, a:req)
+  return init#OnJobOutput(cmd, a:cb)
+endfunction
+
+function! s:ReleaseBuild(branch)
+  let url = "https://jenkins.alcatraz.ai/job/aidistro_obsidian_release/buildWithParameters"
+  call work#OnJenkinsPost(url, ["branch=" .. a:branch], function("s:OnBuildTriggered"))
+endfunction
+
+function! s:OnBuildTriggered(resp)
+  let prefix = "location: "
+  let resp = filter(a:resp, 'stridx(v:val, prefix) >= 0')
+  if empty(resp)
+    return init#Warn("Build information is missing in response!")
+  endif
+  let location = trim(resp[0][len(prefix):])
+  call init#Warn(location)
+  let g:jenkins_tracked_build = location
+  call s:PingBuildQueue()
+endfunction
+
+function! s:PingBuildQueue(...)
+  if !exists("g:jenkins_tracked_build")
+    return
+  endif
+  let req = g:jenkins_tracked_build .. "api/json"
+  call work#OnJenkinsResponse(req, function("s:OnQueueItem"))
+endfunction
+
+function! s:OnQueueItem(dict)
+  if has_key(a:dict, "executable")
+    let g:jenkins_tracked_build = a:dict.executable.url
+    call s:PingQueuedBuild()
+  else
+    let g:statusline_dict['jenkins'] = a:dict["why"]
+    call timer_start(3000, function("s:PingBuildQueue"))
+  endif
+endfunction
+
+function! s:PingQueuedBuild(...)
+  if !exists("g:jenkins_tracked_build")
+    return
+  endif
+  let req = g:jenkins_tracked_build .. "api/json"
+  call work#OnJenkinsResponse(req, function("s:OnBuildStatus"))
+endfunction
+
+function! s:OnBuildStatus(dict)
+  let building = get(a:dict, "building", v:true)
+  let result = get(a:dict, "result", "")
+  if !building && result == "SUCCESS"
+    call init#ToClipboard(a:dict.url)
+    let g:statusline_dict['jenkins'] = ''
+  else
+    " let g:statusline_dict['jenkins'] = a:dict["why"]
+    call timer_start(3000, function("s:PingQueuedBuild"))
+  endif
+endfunction
+
+command! -nargs=1 -complete=customlist,AidistroCompl Jenkins call s:ReleaseBuild(<q-args>)
+" }}}
+
+""""""""""""""""""""""""""""Jira"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+let g:jira_token_file = stdpath('state') .. "/jira_token.txt"
+if filereadable(g:jira_token_file)
+  let g:jira_token = readfile(g:jira_token_file)[0]
+  let today = strftime('%Y-%m-%d')
+  if today >=# '2027-05-22'
+    call init#Warn("Your jira token has expired!")
+  endif
+else
+  call init#Warn("No jira token set up!")
+  let g:jira_token = ""
+endif
+
+function! work#OnJiraResponse(query, data, cb)
+  let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jira_token)
+  let cmd = ["curl", "--silent", "--globoff", "-u", credentials, "--get", "--data-urlencode", a:query]
+
+  let data = ["maxResults=100"] + a:data
+  for d in data
+    let cmd += ["--data", d]
+  endfor
+
+  let url = "https://alcatrazai.atlassian.net/rest/api/3/search/jql"
+  call add(cmd, url)
+  return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
+endfunction
+
+function! s:OnAssignedIssues(cb)
+  let q = "jql=assignee=currentUser() ORDER BY updated DESC"
+  call work#OnJiraResponse(q, ['fields=status,summary'], function("s:OnIssuesResponse", [a:cb]))
+endfunction
+
+function! s:OnIssuesResponse(cb, dict)
+  let issues = a:dict["issues"]
+  let items = map(issues, '#{id: v:val.key, title: v:val.fields.summary, status: v:val.fields.status.name}')
+  call function(a:cb)(items)
+endfunction
+
+function! s:ShowUnresolved(items)
+  let done = ["Won't fix", "Released", "Duplicate", "Tech limitation", "Can't Reproduce"]
+  let items = filter(a:items, 'index(done, v:val.status) < 0')
+  let names = map(items, 'printf("%s [%s]: %s", v:val.id, v:val.status, v:val.title)')
+  call qutil#CreateCustomQuickfix(names, "Issues", function("s:OpenUnresolved"))
+endfunction
+
+function! s:OpenUnresolved()
+  let issue = work#ExtractIssue(getline('.'))
+  call work#OpenJira(issue)
+endfunction
+
+command! -nargs=0 Issues call s:OnAssignedIssues(function("s:ShowUnresolved"))
+
+" TODO BUILD NUMBER! it is hard coded in the url
+" function! s:DownloadArtifact()
+"   let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
+"   let req = "https://jenkins.alcatraz.ai/job/aidistro_obsidian_release/256/s3/download/rock-prod-image-rockx-dm-r10.mender"
+"   let path = expand("~/Downloads/rock-prod-image-rockx-dm-r10.mender")
+"   let cmd = ["curl", "--silent", "-L", "-o", path, "-u", credentials, req]
+"   call init#OnJobExit(cmd, function("s:InstallImage", [path]))
+" endfunction
+
+" function! s:OnDownloadArtifact(path, code)
+"   if a:code != 0 || !filereadable(path)
+"     return init#Warn("Downloading artifact failed!")
+"   endif
+"   call s:InstallImage(a:path)
+" endfunction
+
+" command! -nargs=0 Test call s:DownloadArtifact()
+" }}}
+
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
@@ -2439,4 +2627,3 @@ endfunction
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
 augroup END
-" }}}
