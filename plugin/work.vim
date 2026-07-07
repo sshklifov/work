@@ -35,14 +35,17 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
-  let repo = FugitiveWorkTree()
-  let parts = split(repo, "/")
-  if len(parts) > 0
-    let repo = parts[-1]
-    if repo == "worktree"
-      let orig = git#ExecuteOrThrow(["rev-parse", "--git-common-dir"])[0]
-      let repo = split(orig, "/")[-2]
-    endif
+  let worktree = FugitiveWorkTree()
+  let repo = fnamemodify(worktree, ":t")
+  if repo == "worktree"
+    " Map the worktree back to the actual repo. Resolve the git dir from the
+    " worktree path itself -- FugitiveExecute with no dir uses the current
+    " buffer's git dir, which while opening the worktree is still the repo we
+    " launched from (-> 'fatal: not a git repository').
+    let git_dir = FugitiveExtractGitDir(worktree)
+    " throw string(git_dir)
+    let orig = git#ExecuteOrThrow([git_dir, "rev-parse", "--git-common-dir"])[0]
+    let repo = split(orig, "/")[-2]
   endif
   return work#GetMakeCommandFor(repo)
 endfunction
@@ -61,9 +64,6 @@ function! work#GetMakeCommandFor(repo)
   let cmds = []
   call add(cmds, printf("cd %s", dir))
   call add(cmds, printf("source %s/environment-setup-armv8a-aisys-linux", g:SDK_DIR))
-  if repo == 'alcatraz-ml-library'
-    call add(cmds, "export ParavisionSDKType=ROCKCHIP")
-  endif
 
   let sdk_flags = [
         \ printf("-isystem %s/sysroots/armv8a-aisys-linux/usr/include/c++/%s/", g:SDK_DIR, g:LIBSTD_CPP),
@@ -91,6 +91,8 @@ function! work#GetMakeCommandFor(repo)
       let cmake .= " -DDEVICE=onyx -DPLATFORM=obsidian"
     elseif stridx(g:DEVICE, "rockx") >= 0
       let cmake .= " -DDEVICE=obsidian -DPLATFORM=obsidian"
+    elseif stridx(g:DEVICE, "imx95-var-dart") >= 0
+      let cmake .= " -DDEVICE=bd -DPLATFORM=bd"
     endif
   endif
 
@@ -119,6 +121,7 @@ function! work#GetMakeCommandFor(repo)
 endfunction
 
 command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), #{preview: <bang>0})
+" command! -nargs=0 -bang Make echo string(work#GetMakeCommand())
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
@@ -135,7 +138,10 @@ command! -nargs=0 RelWithDeb call s:ChangeBuildType("RelWithDeb")
 function! s:ResolveEnvFile()
   let fname = expand("%:f")
   let resolved = ""
-  if stridx(fname, "include/alcatraz") >= 0
+  if stridx(fname, "include/RealSenseID") >= 0
+    let idx = stridx(fname, "include/RealSenseID")
+    let resolved = "/home/stef/bd-sdk/" . fname[idx:]
+  elseif stridx(fname, "include/alcatraz") >= 0
     let idx = stridx(fname, "include/alcatraz")
     let resolved = "/home/stef/libalcatraz/" . fname[idx:]
   elseif stridx(fname, "include/rockchip") >= 0
@@ -163,13 +169,48 @@ function! s:ResolveEnvFile()
     exe "edit " . resolved
     call winrestview(view)
   else
-    echo "Sorry, I'm buggy, Update me! Resolved to: " . resolved
+    let Cb = function('s:OnEnvRepo', [fname])
+    call qutil#CreateOneShotQuickfix(qutil#GetRepos(), 'Choose repo', Cb)
+    echo "Not found in database, please choose where to search!"
   endif
+endfunction
+
+function! s:OnEnvRepo(fname, repo)
+  let basename = fnamemodify(a:fname, ':t')
+  let files = qsearch#GetFiles(a:repo, "-name", basename)
+  let parts = split(a:fname, '/', 1)
+  for pos in range(1, 3)
+    let str = join(parts[-pos:-1], '/')
+    let new_files = filter(copy(files), 'stridx(v:val, str) >= 0')
+    if empty(new_files)
+      break
+    endif
+    let files = new_files
+  endfor
+  call qutil#CreateOneShotQuickfix(files, 'Matches', function('s:DropEnvFile'))
+endfunction
+
+function! s:DropEnvFile(file)
+  let view = winsaveview()
+  exe "edit " . a:file
+  call winrestview(view)
 endfunction
 
 command! -nargs=0 Clean call system("rm -rf " . FugitiveFind(g:BUILD_TYPE))
 command! -nargs=0 -bang Remake exe "Clean" | exe "Make<bang>"
 nnoremap <silent> <leader>env :call <SID>ResolveEnvFile()<CR>
+
+function! s:ListPackages(args)
+  let paths = []
+  call add(paths, g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/lib/pkgconfig")
+  call add(paths, g:SDK_DIR .. "/sysroots/armv8a-aisys-linux/usr/share/pkgconfig")
+  let cmd = printf("PKG_CONFIG_PATH=%s pkg-config --list-all", join(paths, ":"))
+  let output = init#SystemOrThrow(cmd)
+  call filter(output, "stridx(tolower(v:val), tolower(a:args)) >= 0")
+  call init#CustomBottomBuffer('Packages', output)
+endfunction
+
+command! -nargs=* Packages call s:ListPackages(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
@@ -202,7 +243,7 @@ function! s:Journal(bang, service_name)
   let cmd = s:GetJournalCmd(a:service_name)
   if !empty(a:bang)
     sp enew
-    call termopen(["ssh", g:HOST, cmd .. " -f"])
+    call init#Termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
     call init#CustomBottomBuffer('Journal ' .. a:service_name, lines)
@@ -219,7 +260,7 @@ function! s:OnPriority(bang, args, prio)
   let cmd = printf("%s -p %s", cmd, a:prio)
   if !empty(a:bang)
     sp enew
-    call termopen(["ssh", g:HOST, cmd .. " -f"])
+    call init#Termopen(["ssh", g:HOST, cmd .. " -f"])
   else
     let lines = systemlist(["ssh", g:HOST, cmd])
     call init#CustomBottomBuffer('Journal ' .. a:args, lines)
@@ -353,13 +394,99 @@ endfunction
 command! -nargs=0 -bang Boot call s:ChooseBootLogs("<bang>")
 command! -nargs=0 -bang Uptime call s:ChooseBootLogs("<bang>")
 
-function! s:SshTerminal()
-  below sp
-  enew
-  call termopen(["ssh", g:HOST])
+function! s:RemoteHistoryFile()
+  let dir = stdpath('state') .. "/history"
+  if !isdirectory(dir)
+    call mkdir(dir, "p")
+  endif
+  return printf("%s/%s.bash_history", dir, get(g:, "DEVICE", "unknown"))
 endfunction
 
-command! -nargs=0 T call s:SshTerminal()
+function! s:SyncRemoteHistory()
+  if empty(get(g:, "DEVICE", ""))
+    return
+  endif
+  let file = s:RemoteHistoryFile()
+  let remote_history = init#SystemOrThrow(["ssh", g:HOST, "cat ~/.bash_history"])
+  let local_history = filereadable(file) ? readfile(file) : []
+
+  let seen = {}
+  let merged = []
+  for line in reverse(local_history + remote_history)
+    if !empty(line) && !has_key(seen, line)
+      let seen[line] = 1
+      call add(merged, line)
+    endif
+  endfor
+  call writefile(reverse(merged), file)
+endfunction
+
+function! s:OpenTerminal(bang, arg)
+  if empty(a:arg)
+    if empty(a:bang)
+      call init#SshTerminal()
+    else
+      below sp
+      enew
+      terminal
+      startinsert
+    endif
+    return
+  endif
+
+  if empty(a:bang)
+    call s:SyncRemoteHistory()
+    let cmds = readfile(s:RemoteHistoryFile())
+  else
+    call assert_true($SHELL == "/usr/bin/fish")
+    let cmds = readfile(expand("~/.local/share/fish/fish_history"))
+    call filter(cmds, "stridx(v:val, '- cmd:') == 0")
+    call map(cmds, "v:val[7:]")
+  endif
+
+  call reverse(cmds)
+  call filter(cmds, "stridx(v:val, a:arg) >= 0")
+  let label = empty(a:bang) ? 'Remote command' : 'Local command'
+  call qutil#CreateCustomQuickfix(cmds, label, function("s:ExecuteCommand", [a:bang]))
+endfunction
+
+function! s:ExecuteCommand(bang)
+  let lnum = line('.')
+  let buf = bufnr()
+  let job_result = getbufvar(buf, 'job_result', #{})
+  if has_key(job_result, lnum)
+    let [code, lines] = job_result[lnum]
+    if empty(lines) || (len(lines) == 1 && empty(lines[0]))
+      echo "Nothing to show."
+      return
+    endif
+    let description = (code == 0) ? 'Output' : 'Error'
+    return init#CustomBottomBuffer(description, lines)
+  endif
+  let cmd = getline(lnum)
+  if empty(a:bang)
+    let cmd = ["ssh", g:HOST, cmd]
+  endif
+  call init#OnJobResult(cmd, #{stdout: 1, stderr: 1, exit_code: 1}, function('s:OnExecutedCommand', [buf, lnum]))
+  let ns = nvim_create_namespace('command_result')
+  call nvim_buf_set_extmark(buf, ns, lnum - 1, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
+endfunction
+
+function! s:OnExecutedCommand(buf, lnum, result)
+  let job_result = getbufvar(a:buf, 'job_result', #{})
+  let exit_code = a:result.exit_code
+  let ns = nvim_create_namespace('command_result')
+  if exit_code == 0
+    let job_result[a:lnum] = [exit_code, a:result.stdout]
+    call nvim_buf_set_extmark(a:buf, ns, a:lnum - 1, 0, #{line_hl_group: 'DiagnosticOk'})
+  else
+    let job_result[a:lnum] = [exit_code, a:result.stderr]
+    call nvim_buf_set_extmark(a:buf, ns, a:lnum - 1, 0, #{line_hl_group: 'DiagnosticError'})
+  endif
+  call setbufvar(a:buf, 'job_result', job_result)
+endfunction
+
+command! -bang -nargs=* T call s:OpenTerminal("<bang>", <q-args>)
 
 function! s:RemoteFileCommand(what, cb)
   if empty(a:what)
@@ -508,11 +635,11 @@ function! s:RemoteSyncAll(dir)
   call s:RemoteSyncExes(a:dir, exes, "s:ShowSyncMessage")
 endfunction
 
-function work#SyncOne(dir, exe)
+function work#SyncOne(bang, dir, exe)
   if exists('s:services_status')
     let systemd_name = s:GetServiceName(a:exe)
     let status = get(s:services_status, systemd_name, "inactive")
-    if status != "inactive" && status != "failed"
+    if a:bang != "!" && status != "inactive" && status != "failed"
       return init#Warn("Service %s is %s!", systemd_name, status)
     endif
   endif
@@ -530,8 +657,8 @@ function work#SyncOne(dir, exe)
   call s:RemoteSyncExes(a:dir, [a:exe], function("init#ToClipboard", [cmd]))
 endfunction
 
-command! -nargs=? -complete=customlist,SyncCompl Sync
-      \ call s:GetSyncTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Sync', 'work#SyncOne', FugitiveFind(g:BUILD_TYPE))
+command! -bang -nargs=? -complete=customlist,SyncCompl Sync
+      \ call s:GetSyncTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Sync', 'work#SyncOne', "<bang>", FugitiveFind(g:BUILD_TYPE))
 
 function! SyncCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
@@ -579,7 +706,9 @@ function! s:GetApps()
         \ qrcode-scanner: #{user: "rock-bootstrap", service:"qrcode-scanner.service"},
         \ device-health: #{user: "device-health", service: "device-health.service"},
         \ }
-  if stridx(g:DEVICE, "rockx") >= 0
+  if stridx(g:DEVICE, "imx95-var-dart") >= 0
+    let apps["bd-video"] = #{user: "rock-video", service: "bd-video.service"}
+  elseif stridx(g:DEVICE, "rockx") >= 0
     let apps["obsidian-video"] = #{user: "rock-video", service: "obsidian-video.service"}
   elseif stridx(g:DEVICE, "onyx") >= 0
     let apps["rock-video"] = #{user: "rock-video", service: "rock-video.service"}
@@ -623,7 +752,7 @@ function! s:RunAsService(exe)
 
   sp
   enew
-  let id = termopen(["ssh", g:HOST, join(cmds, ' && ')])
+  let id = init#Termopen(["ssh", g:HOST, join(cmds, ' && ')])
   call init#OnTermSuccess(id, function('s:Journal', ['!', systemd_name]))
 endfunction
 
@@ -658,6 +787,11 @@ endfunction
 
 function! work#GetHostStatus()
   return get(s:, 'control_file_exists', v:false)
+endfunction
+
+function! work#IsHostSimulated()
+  const is_invalid = stridx(g:HOST, ".invalid") >= 0
+  return is_invalid
 endfunction
 
 function! s:MonitorControlFile()
@@ -713,7 +847,7 @@ function! s:AddBackdoor()
 
   " Enable authorized_keys again
   call add(cmds,
-        \ "sed -i 's|^AuthorizedKeysFile[[:space:]].*|AuthorizedKeysFile .ssh/authorized_keys|' /etc/ssh/sshd_config")
+        \ "sed -i 's|^AuthorizedKeysFile[[:space:]].*|AuthorizedKeysFile /root/.ssh/authorized_keys|' /etc/ssh/sshd_config")
 
   " Create root ssh dir with proper perms
   call add(cmds, "mkdir -p /root/.ssh")
@@ -732,19 +866,15 @@ function! s:AddBackdoor()
   let backdoor_cmd = printf('sudo sh -c "%s || (%s)"', once_guard, join(cmds, " && "))
 
   const host = "alcatraz@" .. g:HOST
-  let id = init#OnJobSuccess(["ssh", host, backdoor_cmd], function("s:OnBackdoor"))
+  let id = init#OnJobSuccess(["ssh", host, backdoor_cmd], function("s:OnFixedHost"))
   let auth_file = readfile(expand("~/.ssh/id_ed25519.pub"))
   call chansend(id, auth_file)
   call chanclose(id, 'stdin')
 endfunction
 
-function! s:OnBackdoor()
-  " Patch in order to avoid 'Connection reset by peer' errors.
-  let fix_ssh_cmd =  'test -d /run/sshd || (mkdir -p /run/sshd && chmod 0755 /run/sshd)'
-  call init#OnJobSuccess(["ssh", g:HOST, fix_ssh_cmd], function("s:OnPatchedConnection"))
-endfunction
+command! -nargs=0 Backdoor call s:AddBackdoor()
 
-function! s:OnPatchedConnection()
+function! s:OnFixedHost()
   call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
   call s:DetermineRsyncDir()
   call s:DetermineSdk()
@@ -771,12 +901,14 @@ endfunction
 
 function! s:OnSdkOutput(output)
   let g:DOCKER_COMPOSE = "docker-compose.yaml"
-  let g:DOCKER_CACHE = printf("/home/%s/aicache", $USER)
+  let g:DOCKER_CACHE = expand("~/aicache")
+  let g:AIDISTRO = expand("~/aidistro")
   if stridx(a:output[0], "librsid.so") >= 0
     let g:DEVICE = "imx95-var-dart"
     let g:SDK_DIR = "/opt/aisys/imx95_var_dart"
     let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
     let g:DOCKER_CACHE = printf("/home/%s/aicache-bd", $USER)
+    let g:AIDISTRO = expand("~/aidistro-bd")
   elseif stridx(a:output[0], "rockx-dm-p15") >= 0
     let g:DEVICE = "rockx-dm-p15"
     let g:SDK_DIR = "/opt/aisys/obsidian_p15"
@@ -795,10 +927,46 @@ function! s:OnSdkOutput(output)
   call init#OnJobOutput(["ls", "-1", libstd_cpp_dir], function("s:OnLibstdVersions"))
 endfunction
 
+function! s:CompareVersions(a, b)
+  let [a_maj, a_min; _] = split(a:a, '\.')
+  let [b_maj, b_min; _] = split(a:b, '\.')
+  if a_maj != b_maj
+    return a_maj - b_maj
+  else
+    return a_min - b_min
+  endif
+endfunction
+
 function! s:OnLibstdVersions(output)
-  " Close enough...
-  let versions = sort(a:output)
-  let g:LIBSTD_CPP = versions[-1]
+  let versions = sort(filter(a:output, "!empty(v:val)"), function("s:CompareVersions"))
+  if empty(versions)
+    call init#Warn("Missing SDK: " .. g:DEVICE)
+  else
+    let g:LIBSTD_CPP = versions[-1]
+  endif
+endfunction
+
+" TODO: Kind of hacky and might need updating, but I think it's going to be worth it!
+function! s:SimulateHost(simulated_sdk)
+  if !work#IsHostSimulated()
+    let g:HOST .= ".invalid"
+    let g:HOST_IP = g:HOST
+    let g:HOST_CONTROL .= ".invalid"
+    let g:RSYNC_DIR = "/dev/null"
+    call s:OnControlFileEvent()
+  endif
+  call s:OnSdkOutput([a:simulated_sdk])
+endfunction
+
+command! -nargs=1 -complete=customlist,SimulateCompl Simulate call s:SimulateHost(<q-args>)
+cabbr Sim Simulate
+
+function! SimulateCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  let options = ["librsid.so", "rockx-dm-p15", "rockx-dm-r10", "onyx-p1", "onyx-cr"]
+  return filter(options, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
 function! s:InstallHostCommands()
@@ -833,8 +1001,20 @@ function! s:InstallHostCommands()
 endfunction
 
 function s:OnHostChange()
-  call s:InstallHostCommands()
-  call s:AddBackdoor()
+  if !work#IsHostSimulated()
+    call s:InstallHostCommands()
+    " Patch in order to avoid 'Connection reset by peer' errors.
+    let fix_ssh_cmd = 'test -d /run/sshd || (mkdir -p /run/sshd && chmod 0755 /run/sshd)'
+    call init#OnJobExit(["ssh", "-o", "ConnectTimeout=1", g:HOST, fix_ssh_cmd], function("s:OnAttemptSSH"))
+  endif
+endfunction
+
+function s:OnAttemptSSH(code)
+  if a:code == 0
+    call s:OnFixedHost()
+  else
+    echo "SSH job failed! You can try :Backdoor!"
+  endif
 endfunction
 
 function! HostCompl(ArgLead, CmdLine, CursorPos)
@@ -863,7 +1043,7 @@ function! s:OnHostResolvedIP()
 
   botr split
   enew
-  let id = termopen(join(cmds, ";"))
+  let id = init#Termopen(join(cmds, ";"))
   call init#OnTermSuccess(id, expand("<SID>") .. "OnHostChange")
   startinsert
 endfunction
@@ -872,26 +1052,17 @@ command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
-function s:Do(cmd, ...)
-  let Partial = function("s:" .. a:cmd, a:000)
-  try
-    call Partial()
-  catch
-    echo v:exception
-  endtry
-endfunction
-
 function! DoCompl(ArgLead, CmdLine, CursorPos)
   let nargs = len(split(a:CmdLine))
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
-        \ "BuildSdk", "BuildImage", "InstallSdk", "ShowImage", "SaveImage",
-        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
+        \ "BuildImage", "ProdImage", "BuildSdk", "InstallSdk", "ShowImage", "SaveImage",
+        \ "InstallImage", "RefreshImage", "RefreshSdk", "RefreshBoth",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
         \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
-  return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
+  return filter(cmds, 'v:val =~? a:ArgLead')
 endfunction
 
 function s:GetServices()
@@ -927,7 +1098,7 @@ function! s:UpdateDocker()
   enew
   lcd ~/aidocker
   let cmd = printf("sudo docker-compose -f %s build ubuntu22", g:DOCKER_COMPOSE)
-  call termopen(cmd)
+  call init#Termopen(cmd)
   startinsert
 endfunction
 
@@ -939,7 +1110,7 @@ function! s:RunDocker(...)
 
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", g:DEVICE),
-        \ "source /home/stef/aidistro/setup-environment " .. g:DOCKER_CACHE]
+        \ printf("source %s/setup-environment %s", g:AIDISTRO, g:DOCKER_CACHE)]
   if a:0 > 0
     call add(bash_cmd, join(a:000))
   else
@@ -948,7 +1119,7 @@ function! s:RunDocker(...)
 
   let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
   call add(cmds, docker_cmd)
-  let id = termopen(join(cmds))
+  let id = init#Termopen(join(cmds))
   startinsert
   return id
 endfunction
@@ -1004,7 +1175,7 @@ function! s:InstallSdk()
   call add(cmds, "echo 'Found sdk from " .. mins .. "m ago'")
   call add(cmds, "rm -rf " .. g:SDK_DIR .. "/*")
   call add(cmds, printf("%s -d %s -y", most_recent_file, g:SDK_DIR))
-  call termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"))
   startinsert
 endfunction
 
@@ -1056,8 +1227,6 @@ function! s:InstallImage(...)
 
   let most_recent_timestamp = getftime(most_recent_image)
   let mins = (localtime() - most_recent_timestamp) / 60
-  split
-  enew
   let cmds = []
   call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
   if g:DEVICE == "imx95-var-dart"
@@ -1082,7 +1251,11 @@ function! s:InstallImage(...)
     call add(cmds, "echo 'Waiting for device to reboot...'")
     call add(cmds, "ssh_wait_silent " .. g:HOST)
   endif
-  call termopen(join(cmds, " && "))
+  split
+  enew
+  " Last chance to save .bash_history before the reflash wipes it.
+  call s:SyncRemoteHistory()
+  call init#Termopen(join(cmds, " && "))
   startinsert
 endfunction
 
@@ -1108,7 +1281,7 @@ function! s:RefreshSdk()
   call init#OnTermSuccess(id, function("s:InstallSdk"))
 endfunction
 
-function! s:Refresh()
+function! s:RefreshBoth()
   let id = s:RunDocker(s:BitbakeCommand(#{multi: v:true}))
   call init#OnTermSuccess(id, function("s:InstallBoth"))
 endfunction
@@ -1157,7 +1330,7 @@ function! s:FakeSdk()
 
   split
   enew
-  call termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"))
   startinsert
 endfunction
 
@@ -1184,6 +1357,7 @@ function! s:HostDebugSyms(...)
 
     let remote_dir = g:HOST . ":/usr/lib/.debug"
     call init#SystemOrThrow(printf("rsync -lt %s %s", join(files), remote_dir))
+    echo printf("Synced %d symbols!", len(files))
   endif
   call init#CustomBottomBuffer("Debug symbols", files)
 endfunction
@@ -1232,7 +1406,7 @@ function! s:PlotTrace(name)
   lcd ~/libalcatraz/tracing/scripts
   enew
   throw string(cmds)
-  " call termopen(join(cmds, " && "), #{})
+  " call init#Termopen(join(cmds, " && "))
 endfunction
 
 function! s:BarfPlotTrace(name)
@@ -1273,7 +1447,7 @@ function! s:BarfPlotTrace(name)
   botr split
   lcd ~/libalcatraz/tracing/scripts
   enew
-  call termopen(join(cmds, " && "), #{})
+  call init#Termopen(join(cmds, " && "))
 endfunction
 
 function! s:OpenCV()
@@ -1291,7 +1465,7 @@ function! s:OpenCV()
   call add(cmds, printf("ssh %s chmod +s /usr/lib/libalcatraz_opencv_mat.so*", g:HOST))
   bot sp
   enew
-  call termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"))
 endfunction
 
 function! s:MemoryMonitor(...)
@@ -1341,6 +1515,7 @@ function s:GetTargets()
           \ ["/home/stef/device-health", "main", "device-health_git.bb"]]
   call add(targets, ["/home/stef/rock-video", "master", "rock-video_git.bb"])
   call add(targets, ["/home/stef/obsidian-video", "main", "obsidian-video_git.bb"])
+  call add(targets, ["/home/stef/bd-video", "main", "bd-video_git.bb"])
   call add(targets, ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face_git.bb"])
   return targets
 endfunction
@@ -1358,7 +1533,7 @@ function! s:OpenBitbake(repo)
 
   let bitbake = targets[0][2]
   " Find old hash
-  let files = qsearch#GetFiles("/home/stef/aidistro", "-regex", ".*" .. bitbake)
+  let files = qsearch#GetFiles(g:AIDISTRO, "-regex", ".*" .. bitbake)
   if empty(files)
     throw "Could not find: " .. bitbake
   endif
@@ -1382,7 +1557,11 @@ function! s:AddRepo(repo)
   if empty(new_src_branch)
     throw "Failed to determine branch!"
   endif
+  let remote_rev = git#HashOrThrow("origin/" .. new_src_branch)
   let new_src_rev = git#HashOrThrow(new_src_branch)
+  if remote_rev != new_src_rev
+    throw "Unpushed changes!"
+  endif
 
   call s:OpenBitbake(a:repo)
 
@@ -1397,7 +1576,7 @@ endfunction
 function! s:FactoryReset()
   botr split
   enew
-  call termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
+  call init#Termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
 endfunction
 
 function! s:Enroll()
@@ -1413,9 +1592,6 @@ function! s:Enroll()
   endif
 endfunction
 
-command! -nargs=? -complete=customlist,HostCompl Ip call init#ToClipboard(g:HOST_IP)
-cabbr IP Ip
-
 function! s:Reboot()
   let cmds = []
   call add(cmds, printf("ssh %s reboot", g:HOST))
@@ -1423,32 +1599,32 @@ function! s:Reboot()
   call add(cmds, "ssh_wait_silent " .. g:HOST)
   bot sp
   enew
-  call termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"))
 endfunction
 
 command! -nargs=0 Reboot call s:Reboot()
 
-command -nargs=+ -complete=customlist,DoCompl Do call s:Do(<f-args>)
+command -nargs=* -complete=customlist,DoCompl Do call init#Dispatch("Do", expand("<SID>"), <f-args>)
 "}}}
 
 """"""""""""""""""""""""""""AI"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#CommitAI()
-  e ~/aidistro
+  exe "e " .. g:AIDISTRO
   let cmd = ["diff", "--name-only", "--cached"]
-  let staged = git#ExecuteOrThrow(cmd, "Cannot determine what changed in aidistro.")
+  let staged = git#ExecuteOrThrow(cmd, "Cannot determine what changed in " .. g:AIDISTRO)
   for [repo, branch, bitbake] in reverse(s:GetTargets())
     let staged_bitbake = filter(copy(staged), 'stridx(v:val, bitbake) >= 0')
     if empty(staged_bitbake)
       continue
     endif
     " Get commit message. This is needed to create the branch and the commit
-    exe "e " .. repo
+    exe "e " .. g:AIDISTRO
     let cmd = ["log", "-1", "--format=%B", "origin/" .. branch]
     let msg = git#ExecuteOrThrow(cmd, "Cannot determine commit message for " .. repo)[0]
     let issue = matchstr(msg, 'SW-[0-9]\{4\}')
     " Create branch
-    e ~/aidistro
+    exe "e " .. g:AIDISTRO
     if empty(issue)
       let ai_branch = "stef/ai"
     else
@@ -1470,13 +1646,13 @@ function! work#TestAI()
 endfunction
 
 function! work#PushAI()
-  e ~/aidistro
+  exe "e " .. g:AIDISTRO
   call git#ExecuteOrThrow(["push", "origin", "HEAD"], "Failed to push branch to origin")
   call init#ToClipboard("https://gitlab.com/Rainbe/Firmware/aidistro/-/merge_requests")
 endfunction
 
 function! work#CleanUpAI()
-  e ~/aidistro
+  exe "e " .. g:AIDISTRO
   let branch = git#GetBranchOrThrow()
   call git#ExecuteOrThrow(["checkout", "master"], "Failed to checkout master")
   " Not the end of the world if this fails.
@@ -1490,7 +1666,7 @@ function! work#CleanUpAI()
 endfunction
 
 function! work#ResetAI()
-  e ~/aidistro
+  exe "e " .. g:AIDISTRO
   call git#ExecuteOrThrow(["reset", "--hard"])
   call git#ExecuteOrThrow(["submodule", "update", "--init", "--recursive"])
   if !git#IsClean()
@@ -1511,7 +1687,7 @@ command! -nargs=1 -complete=customlist,AiCompl AI call init#TryCall("work#" .. <
 cabbr Ai AI
 " }}}
 
-""""""""""""""""""""""""""""Issue"""""""""""""""""""""""""" {{{
+""""""""""""""""""""""""""""Copy"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#OpenJira(issue)
   if !empty(a:issue)
@@ -1536,59 +1712,53 @@ function! work#GenerateMergeRequestURL(repo)
   call init#ToClipboard(url)
 endfunction
 
-" TODO remove? not used... but look STONK!
+function! s:CopyJira()
+  call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
+endfunction
 
-" function! s:MyDashboard()
-"   call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
-" endfunction
+function! s:CopyJenkins()
+  call init#ToClipboard("https://jenkins.alcatraz.ai/")
+endfunction
 
-" function! s:CopyBranch()
-"   call init#ToClipboard(git#GetBranch())
-" endfunction
+function! s:CopySlack()
+  call init#ToClipboard("https://app.slack.com/client/T10SACYGL/dms")
+endfunction
 
-" function! s:CopyHash()
-"   let hash = git#ExecuteOrThrow(['rev-parse', 'HEAD'], "Failed to parse HEAD")
-"   call init#ToClipboard(hash[0])
-" endfunction
+function! s:CopyBranch()
+  call init#ToClipboard(git#GetBranch())
+endfunction
 
-" function! s:MessageSearch(...)
-"   let args = join(a:000)
-"   if empty(args)
-"     echo "Expecting string!"
-"   else
-"     exe "G log --grep=" .. join(a:000)
-"   endif
-" endfunction
+function! s:CopyHash()
+  let hash = git#ExecuteOrThrow(['rev-parse', 'HEAD'], "Failed to parse HEAD")
+  call init#ToClipboard(hash[0])
+endfunction
 
-" function! s:CodeSearch(...)
-"   let args = join(a:000)
-"   if empty(args)
-"     echo "Expecting string!"
-"   else
-"     exe "G log --all -S " .. args
-"   endif
-" endfunction
+function! s:CopyFilename()
+  call init#ToClipboard(expand("%:p"))
+endfunction
 
-" function! s:AuthorSearch(...)
-"   let args = join(a:000)
-"   if empty(args)
-"     let args = "Shklifov"
-"   endif
-"   exe "G log --author " .. args
-" endfunction
+function! s:CopyBasename()
+  call init#ToClipboard(expand("%:t"))
+endfunction
 
-" function! IssueCompl(ArgLead, CmdLine, CursorPos)
-"   let nargs = len(split(a:CmdLine))
-"   if a:CursorPos < len(a:CmdLine) || nargs > 2
-"     return []
-"   endif
-"   let cmds = ["MyDashboard", "OpenCurrent",
-"         \ "CopyBranch", "CopyHash", "MessageSearch",
-"         \ "CodeSearch", "AuthorSearch", "OpenMR"]
-"   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
-" endfunction
+function! s:CopyDirectory()
+  call init#ToClipboard(getcwd())
+endfunction
 
-" command -nargs=+ -complete=customlist,IssueCompl Issue call s:Do(<f-args>)
+function! s:CopyIp()
+  call init#ToClipboard(g:HOST_IP)
+endfunction
+
+function CopyCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
+  endif
+  let cmds = ["Jira", "Jenkins", "Slack", "Branch", "Hash", "Filename", "Basename", "Directory", "Ip"]
+  return filter(cmds, 'v:val =~? a:ArgLead')
+endfunction
+
+command! -nargs=1 -complete=customlist,CopyCompl Copy call init#Dispatch('Copy', '<SID>Copy', <q-args>)
+
 " }}}
 
 """"""""""""""""""""""""""""Orientation"""""""""""""""""""""""""" {{{
@@ -1857,6 +2027,80 @@ endfunction
 command! -bang -nargs=? Rtsp call work#CheckRtspConnection("<bang>", <q-args>)
 "}}}
 
+""""""""""""""""""""""""""""Redis"""""""""""""""""""""""""" {{{
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! s:RedisGetUsers()
+  let redis_cmd =
+        \ "local u=redis.call([[SMEMBERS]],[[onvif.users.User]]) " .
+        \ "local o={} " .
+        \ "for _,h in ipairs(u) do " .
+        \   "o[#o+1]=(redis.call([[HGET]],h,[[userName]]) or h)" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[password]]) or [[]]) " .
+        \ "end " .
+        \ "return table.concat(o,string.char(10))"
+  let remote_cmd = printf("redis-cli -n 1 -s /run/redis/redis.sock EVAL '%s' 0", redis_cmd)
+  let output = init#SystemOrThrow(["ssh", g:HOST, remote_cmd])
+  call qutil#CreateOneShotQuickfix(output, 'Users', function("s:RedisUsersCb"))
+endfunction
+
+function! s:RedisUsersCb(credentials) 
+  let [user, pw] = split(a:credentials)
+  call init#ToClipboard(pw)
+endfunction
+
+function! s:ShowEncoderSettings(encoder)
+  const encoder = "onvif.media.VideoEncoder#adaptive_H264"
+  let remote_cmd = printf("redis-cli --raw -n 1 -s /run/redis/redis.sock HGETALL %s", a:encoder)
+  let output = filter(init#SystemOrThrow(["ssh", g:HOST, remote_cmd]), '!empty(v:val)')
+  let props = {}
+  for i in range(0, len(output) - 1, 2)
+    let props[output[i]] = output[i + 1]
+  endfor
+
+  let output = []
+
+  call add(output, printf("name: %s", get(props, "name", '<nil>')))
+  call add(output, '')
+
+  for key in ["width", "height", "framerate"]
+    call add(output, printf("%s: %s", key, get(props, key, '<nil>')))
+  endfor
+  call add(output, '')
+
+  for key in ["multicastIPAddress", "multicastPort", "multicastTTL", "multicastEnable", "multicastautostart"]
+    call add(output, printf("%s: %s", key, get(props, key, '<nil>')))
+  endfor
+  call add(output, '')
+
+  call add(output, printf("token: %s", get(props, "token", '<nil>')))
+
+  call init#CustomBottomBuffer('H264 options', output)
+endfunction
+
+function! s:RedisH264Encoder()
+  const encoder = "onvif.media.VideoEncoder#adaptive_H264"
+  call s:ShowEncoderSettings(encoder)
+endfunction
+
+function! s:RedisMJPEGEncoder()
+  const encoder = "onvif.media.VideoEncoder#adaptive_JPEG"
+  call s:ShowEncoderSettings(encoder)
+endfunction
+
+command! -nargs=* -complete=customlist,RedisCompl Redis call init#Dispatch("Redis", expand("<SID>Redis"), <f-args>)
+
+function! RedisCompl(ArgLead, CmdLine, CursorPos)
+  let nargs = len(split(a:CmdLine))
+  if a:CursorPos < len(a:CmdLine) || nargs > 2
+    return []
+  endif
+  let cmds = ["GetUsers", 'H264Encoder', 'MJPEGEncoder']
+  return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
+endfunction
+
+"}}}
+
 """"""""""""""""""""""""""""Check"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function s:GetRepoStatus(repo, ...)
@@ -1873,6 +2117,8 @@ function s:GetRepoStatus(repo, ...)
     return printf("Checked out wrong branch '%s'.", branch)
   endif
 
+  call git#ExecuteOrThrow([repo, "fetch", "origin", branch])
+
   let dict = git#ExecuteOrThrow([repo, "rev-list", "--left-right", "--count", printf("%s...origin/%s", branch, branch)])
   if dict['exit_status'] != 0
     return "Unknown remote branch!"
@@ -1880,13 +2126,16 @@ function s:GetRepoStatus(repo, ...)
 
   let output = dict['stdout']
   if type(output) == v:t_list
-    let [ahead, behind] = split(join(output))
-    if ahead != 0 || behind != 0
-      if ahead == 0
-        return printf("Branch is %d commits behind.", behind)
-      else
-        return printf("Branch is %d commits behind and % commits ahead.", ahead)
-      endif
+    let output = join(output)
+  endif
+  let [ahead, behind] = split(output)
+  if ahead != 0 || behind != 0
+    if ahead == 0
+      return printf("Branch is %d commits behind.", behind)
+    elseif behind == 0
+      return printf("Branch is %d commits ahead.", ahead)
+    else
+      return printf("Branch is %d ahead and %d behind.", ahead, behind)
     endif
   endif
   return v:null
@@ -1899,10 +2148,6 @@ function s:CheckRepo(repo, ...)
     let status = s:GetRepoStatus(a:repo)
   endif
   if !empty(status)
-    exe "split " .. a:repo
-    let w = win_getid()
-    G
-    call win_execute(w, 'close')
     call nvim_echo([[status, "Normal"]], v:false, #{})
   else
     let branch = git#GetBranch(a:repo)
@@ -1945,7 +2190,7 @@ function! s:ForceUpdateRepo(repo, ...)
 endfunction
 
 function! s:CheckAidistro(bang, branch)
-  let repo = expand("~/aidistro")
+  let repo = g:AIDISTRO
   if empty(a:bang)
     call s:CheckRepo(repo, a:branch)
   elseif empty(a:branch)
@@ -1959,14 +2204,14 @@ function! AidistroCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  return git#GetRefs('refs/heads/', a:ArgLead, "~/aidistro")
+  return git#GetRefs('refs/heads/', a:ArgLead, g:AIDISTRO)
 endfunction
 
 command! -bang -nargs=? -complete=customlist,AidistroCompl Aidistro call s:CheckAidistro("<bang>", <q-args>)
 
 function! s:ShowRepoStatus(pat)
   let list = []
-  let targets = add(s:GetTargets(), [expand("~/aidistro"), "master", ""])
+  let targets = add(s:GetTargets(), [g:AIDISTRO, "master", ""])
   let targets = filter(targets, "stridx(v:val[0], a:pat) >= 0")
   for [repo, branch, _] in targets
     let status = s:GetRepoStatus(repo, branch)
@@ -1982,7 +2227,7 @@ endfunction
 function work#FixRepoStatus()
   let line = line('.')
   let short_repo = split(getline('.'), ":")[0]
-  let targets = add(s:GetTargets(), [expand("~/aidistro"), "master", ""])
+  let targets = add(s:GetTargets(), [g:AIDISTRO, "master", ""])
   let targets = filter(targets, "stridx(v:val[0], short_repo) >= 0")
   call assert_true(len(targets) == 1)
   let [repo, branch; _] = targets[0]
@@ -2002,7 +2247,7 @@ function! CheckCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let repos = map(s:GetTargets(), "v:val[0]")
-  call add(repos, expand("~/aidistro"))
+  call add(repos, g:AIDISTRO)
   let repos = filter(repos, 'stridx(v:val, a:ArgLead) >= 0')
   return map(repos, 'fnamemodify(v:val, ":t")')
 endfunction
@@ -2017,13 +2262,13 @@ function s:DetermineImage()
     echo "Operation failed."
     return
   endif
-  Repo aidistro
+  exe "Repo " .. g:AIDISTRO
   let aidistro_commitish = git#HashOrThrow("HEAD")
   let len = min([len(aidistro_commitish), len(commitish)])
   if aidistro_commitish[:len-1] != commitish[:len-1]
-    call init#Warn("Commit differs from ~/aidistro!")
+    call init#Warn(printf("Commit differs from %s!", g:AIDISTRO))
   else
-    echo "Commit matched with ~/aidistro"
+    echo "Commit matched with " .. g:AIDISTRO
   endif
   exe printf("G log %s -n 10", commitish)
   silent only
@@ -2033,29 +2278,32 @@ command -nargs=0 Artifact call s:DetermineImage()
 command -nargs=0 Mender call s:DetermineImage()
 
 function s:DetermineRsyncDir()
-  let cmd = "df -h --output=source,avail,target | tail +2 | sort -r -h -k2"
+  let cmd = "df -h --output=fstype,avail,target | tail +2 | sort -r -h -k2"
   call init#OnJobOutput(["ssh", g:HOST, cmd], 'work#OnDiskFree')
 endfunction
 
 function work#OnDiskFree(fs)
   let fs = filter(a:fs, '!empty(v:val)')
-  " Try to auto-select the first entrry
-  if !empty(fs)
-    call filter(fs, 'split(v:val)[2] != "/tmp"')
-    let [source, avail, target] = split(fs[0])
-    const whitelist = ["/dev/shm", "/var/sync"]
-    if index(whitelist, target) >= 0
-      return work#OnFilesystem(fs[0])
-    endif
-    call qutil#CreateOneShotQuickfix(fs, "Choose RSYNC directory", "work#OnFilesystem")
+  if empty(fs)
+    return init#Warn("Will not update RSYNC directory! No mounts detected!")
   endif
+  const blacklist_fs = "nfs"
+  call filter(fs, 'stridx(split(v:val)[0], blacklist_fs) < 0')
+  " Try to auto-detecting
+  const target = "/dev/shm"
+  let res = filter(copy(fs), 'stridx(v:val, target) >= 0')
+  if len(res) > 0
+    call assert_true(len(res) == 0)
+    return work#OnFilesystem(res[0])
+  endif
+  call qutil#CreateOneShotQuickfix(fs, "Choose RSYNC directory", "work#OnFilesystem")
 endfunction
 
 function work#OnFilesystem(entry)
   let [source, avail, target] = split(a:entry)
   let g:RSYNC_DIR = target
   if stridx(avail, "G") < 0
-    call init#Warn("Have for %s RSYNC", avail)
+    call init#Warn("Have for %s g:RSYNC_DIR", avail)
   endif
 endfunction
 
@@ -2093,7 +2341,7 @@ endfunction
 function! s:DecodeJsonResponse(cb, output)
   call assert_true(len(a:output) <= 1)
   if len(a:output) >= 1
-    let dict = json_decode(a:output[0])
+    let dict = empty(a:output[0]) ? #{} : json_decode(a:output[0])
     call function(a:cb)(dict)
   endif
 endfunction
@@ -2166,8 +2414,8 @@ function! s:OnMergeRequestDict(req, dict)
   let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
   call setbufvar(nr, 'mr_list', list)
   nnoremap <silent> <buffer> B :call <SID>CheckoutMergeRequest()<CR>
-  nnoremap <silent> <buffer> b :call <SID>CopyBranchMergeRequest()<CR>
-  nnoremap <silent> <buffer> w :call <SID>CopyMergeRequestURL()<CR>
+  nnoremap <silent> <buffer> b :call <SID>GetBranchMergeRequest()<CR>
+  nnoremap <silent> <buffer> w :call <SID>GetMergeRequestURL()<CR>
   nnoremap <silent> <buffer> n :call <SID>ShowNotesMergeRequest()<CR>
   nnoremap <silent> <buffer> T :call <SID>WorktreeMergeRequest()<CR>
 endfunction
@@ -2176,7 +2424,7 @@ function s:ShowMergeRequestHelp()
   echo "(B) Reset repo to branch locally (T) Edit in worktree (b) Copy branch (w) Open URL (n) Show notes"
 endfunction
 
-function! s:CopyMergeRequestURL()
+function! s:GetMergeRequestURL()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   call init#ToClipboard(entry["url"])
@@ -2192,7 +2440,7 @@ function! s:CheckoutMergeRequest()
   exe "e " .. repo
 endfunction
 
-function! s:CopyBranchMergeRequest()
+function! s:GetBranchMergeRequest()
   let idx = line('.') - 1
   let entry = b:mr_list[idx]
   call init#ToClipboard(entry["branch"])
@@ -2215,10 +2463,11 @@ function! s:WorktreeMergeRequest()
   let branch = entry["branch"]
   let target_branch = entry["target_branch"]
 
+
   let git_dir = FugitiveExtractGitDir(repo)
-  " TODO test if it works when I get an MR
   call git#CloseWorktree()
   call git#ExecuteOrThrow([git_dir, "fetch", "origin", branch])
+
   call git#TrackBranch("!", branch, git_dir)
   call git#OpenWorktree(branch, repo, #{preview: 1, on_success: function("s:OnMergeRequestWorktree", [target_branch])})
 endfunction
@@ -2227,7 +2476,8 @@ function! s:OnMergeRequestWorktree(target_branch)
   const path = git#WorktreePath()
   exe "e " .. path
   only
-  exe "R " .. a:target_branch
+  call git#ExecuteOrThrow(["fetch", "origin", a:target_branch])
+  exe "R origin/" .. a:target_branch
 endfunction
 
 function! s:ShowGitlabNotes(repo, resp)
@@ -2486,8 +2736,18 @@ function! work#OnJenkinsPost(req, data, cb)
 endfunction
 
 function! s:ReleaseBuild(branch)
+  throw "Does not exactly work... But it's close!"
+
+  if exists('g:JENKINS_TRACKED_BUILD[0]')
+    call init#ToClipboard(g:JENKINS_TRACKED_BUILD[0])
+    return
+  endif
+
+  let git_dir = FugitiveExtractGitDir(g:AIDISTRO)
+  let branch = empty(a:branch) ? git#GetBranch(git_dir) : a:branch
+  call git#ExecuteOrThrow([git_dir, "push", "origin", branch])
   let url = "https://jenkins.alcatraz.ai/job/aidistro_obsidian_release/buildWithParameters"
-  call work#OnJenkinsPost(url, ["branch=" .. a:branch], function("s:OnBuildTriggered"))
+  call work#OnJenkinsPost(url, ["branch=" .. branch], function("s:OnBuildTriggered"))
 endfunction
 
 function! s:OnBuildTriggered(resp)
@@ -2497,50 +2757,65 @@ function! s:OnBuildTriggered(resp)
     return init#Warn("Build information is missing in response!")
   endif
   let location = trim(resp[0][len(prefix):])
-  call init#Warn(location)
-  let g:jenkins_tracked_build = location
+  let g:JENKINS_TRACKED_BUILD = [location, "s:PingBuildQueue"]
   call s:PingBuildQueue()
 endfunction
 
 function! s:PingBuildQueue(...)
-  if !exists("g:jenkins_tracked_build")
+  if !exists("g:JENKINS_TRACKED_BUILD[0]")
     return
   endif
-  let req = g:jenkins_tracked_build .. "api/json"
+  let req = g:JENKINS_TRACKED_BUILD[0] .. "api/json"
   call work#OnJenkinsResponse(req, function("s:OnQueueItem"))
 endfunction
 
 function! s:OnQueueItem(dict)
   if has_key(a:dict, "executable")
-    let g:jenkins_tracked_build = a:dict.executable.url
+    let g:JENKINS_TRACKED_BUILD = [a:dict.executable.url, "s:PingQueuedBuild"]
     call s:PingQueuedBuild()
-  else
+  elseif has_key(a:dict, "why")
     let g:statusline_dict['jenkins'] = a:dict["why"]
     call timer_start(3000, function("s:PingBuildQueue"))
+  else
+    " call init#Warn("")
+    " call assert_false()
+    " unlet g:JENKINS_TRACKED_BUILD
+    " let g:statusline_dict['jenkins'] = ''
+    " call init#Warn("Dropping build " .. g:JENKINS_TRACKED_BUILD[0])
   endif
 endfunction
 
 function! s:PingQueuedBuild(...)
-  if !exists("g:jenkins_tracked_build")
+  if !exists("g:JENKINS_TRACKED_BUILD[0]")
     return
   endif
-  let req = g:jenkins_tracked_build .. "api/json"
+  let req = g:JENKINS_TRACKED_BUILD[0] .. "api/json"
   call work#OnJenkinsResponse(req, function("s:OnBuildStatus"))
 endfunction
 
 function! s:OnBuildStatus(dict)
   let building = get(a:dict, "building", v:true)
   let result = get(a:dict, "result", "")
-  if !building && result == "SUCCESS"
-    call init#ToClipboard(a:dict.url)
+  if !building
+    call init#Warn("Build " .. result)
+    call qutil#CreateCustomQuickfix([a:dict.url], "Build", function("s:OnBuildFinished"))
+    let g:JENKINS_TRACKED_BUILD = []
     let g:statusline_dict['jenkins'] = ''
   else
+    " TODO what here?
     " let g:statusline_dict['jenkins'] = a:dict["why"]
     call timer_start(3000, function("s:PingQueuedBuild"))
   endif
 endfunction
 
-command! -nargs=1 -complete=customlist,AidistroCompl Jenkins call s:ReleaseBuild(<q-args>)
+function! s:OnBuildFinished()
+  let url = getline('.')
+  call init#ToClipboard(url)
+  quit
+endfunction
+
+command! -nargs=? -complete=customlist,AidistroCompl Jenkins call s:ReleaseBuild(<q-args>)
+
 " }}}
 
 """"""""""""""""""""""""""""Jira"""""""""""""""""""""""""" {{{
@@ -2583,7 +2858,7 @@ function! s:OnIssuesResponse(cb, dict)
 endfunction
 
 function! s:ShowUnresolved(items)
-  let done = ["Won't fix", "Released", "Duplicate", "Tech limitation", "Can't Reproduce"]
+  let done = ["Won't fix", "Released", "Duplicate", "Tech limitation", "Can't Reproduce", "DONE"]
   let items = filter(a:items, 'index(done, v:val.status) < 0')
   let names = map(items, 'printf("%s [%s]: %s", v:val.id, v:val.status, v:val.title)')
   call qutil#CreateCustomQuickfix(names, "Issues", function("s:OpenUnresolved"))
@@ -2622,8 +2897,21 @@ function! s:OnVimEnter()
 
   " TODO -- RSI is DISABLED!
   " call RsiEnable()
+
+  if exists("g:JENKINS_TRACKED_BUILD[1]")
+    let ResumedHandler = function(g:JENKINS_TRACKED_BUILD[1])
+    call ResumedHandler()
+  endif
 endfunction
 
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
 augroup END
+
+function! s:ShowShadaVars()
+  let shada_vars = filter(copy(g:), 'v:key =~# ''^[A-Z][A-Z_]*$''')
+  let text = map(items(shada_vars), 'printf("%s=%s", v:val[0], v:val[1])')
+  call init#CustomBottomBuffer('Vars', text)
+endfunction
+
+command! -nargs=0 Vars call s:ShowShadaVars()
