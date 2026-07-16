@@ -35,19 +35,11 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
-  let worktree = FugitiveWorkTree()
-  let repo = fnamemodify(worktree, ":t")
-  if repo == "worktree"
-    " Map the worktree back to the actual repo. Resolve the git dir from the
-    " worktree path itself -- FugitiveExecute with no dir uses the current
-    " buffer's git dir, which while opening the worktree is still the repo we
-    " launched from (-> 'fatal: not a git repository').
-    let git_dir = FugitiveExtractGitDir(worktree)
-    " throw string(git_dir)
-    let orig = git#ExecuteOrThrow([git_dir, "rev-parse", "--git-common-dir"])[0]
-    let repo = split(orig, "/")[-2]
+  let repo = FugitiveWorkTree()
+  if repo == git#WorktreePath()
+    let repo = git#WorktreeCommonPath()
   endif
-  return work#GetMakeCommandFor(repo)
+  return work#GetMakeCommandFor(fnamemodify(repo, ":t"))
 endfunction
 
 function! work#GetMakeCommandFor(repo)
@@ -121,7 +113,6 @@ function! work#GetMakeCommandFor(repo)
 endfunction
 
 command! -nargs=0 -bang Make call qutil#Make(work#GetMakeCommand(), #{preview: <bang>0})
-" command! -nargs=0 -bang Make echo string(work#GetMakeCommand())
 
 function! s:ChangeBuildType(new_type)
   " Avoids a lot of user errors
@@ -350,8 +341,7 @@ endfunction
 function! s:OnBootLogs(output)
   enew
   call setline(1, a:output)
-  set nomodified
-  set nomodifiable
+  setlocal nomodified nomodifiable
   " Color warnings / errors in a separate job
   let nr = bufnr()
   let b:logs = a:output
@@ -399,15 +389,12 @@ function! s:RemoteHistoryFile()
   if !isdirectory(dir)
     call mkdir(dir, "p")
   endif
-  return printf("%s/%s.bash_history", dir, get(g:, "DEVICE", "unknown"))
+  return printf("%s/%s.bash_history", dir, g:DEVICE)
 endfunction
 
 function! s:SyncRemoteHistory()
-  if empty(get(g:, "DEVICE", ""))
-    return
-  endif
   let file = s:RemoteHistoryFile()
-  let remote_history = init#SystemOrThrow(["ssh", g:HOST, "cat ~/.bash_history"])
+  let remote_history = init#SystemOrThrow(["ssh", g:HOST, "cat ~/.bash_history 2>/dev/null || true"])
   let local_history = filereadable(file) ? readfile(file) : []
 
   let seen = {}
@@ -421,36 +408,22 @@ function! s:SyncRemoteHistory()
   call writefile(reverse(merged), file)
 endfunction
 
-function! s:OpenTerminal(bang, arg)
+function! s:OpenTerminal(arg)
   if empty(a:arg)
-    if empty(a:bang)
-      call init#SshTerminal()
-    else
-      below sp
-      enew
-      terminal
-      startinsert
-    endif
+    call init#SshTerminal()
     return
   endif
 
-  if empty(a:bang)
-    call s:SyncRemoteHistory()
-    let cmds = readfile(s:RemoteHistoryFile())
-  else
-    call assert_true($SHELL == "/usr/bin/fish")
-    let cmds = readfile(expand("~/.local/share/fish/fish_history"))
-    call filter(cmds, "stridx(v:val, '- cmd:') == 0")
-    call map(cmds, "v:val[7:]")
-  endif
+  call s:SyncRemoteHistory()
+  let cmds = readfile(s:RemoteHistoryFile())
 
   call reverse(cmds)
   call filter(cmds, "stridx(v:val, a:arg) >= 0")
-  let label = empty(a:bang) ? 'Remote command' : 'Local command'
-  call qutil#CreateCustomQuickfix(cmds, label, function("s:ExecuteCommand", [a:bang]))
+  let label = 'Remote command'
+  call qutil#CreateCustomQuickfix(cmds, label, function("s:ExecuteCommand"))
 endfunction
 
-function! s:ExecuteCommand(bang)
+function! s:ExecuteCommand()
   let lnum = line('.')
   let buf = bufnr()
   let job_result = getbufvar(buf, 'job_result', #{})
@@ -463,10 +436,7 @@ function! s:ExecuteCommand(bang)
     let description = (code == 0) ? 'Output' : 'Error'
     return init#CustomBottomBuffer(description, lines)
   endif
-  let cmd = getline(lnum)
-  if empty(a:bang)
-    let cmd = ["ssh", g:HOST, cmd]
-  endif
+  let cmd = ["ssh", g:HOST, getline(lnum)]
   call init#OnJobResult(cmd, #{stdout: 1, stderr: 1, exit_code: 1}, function('s:OnExecutedCommand', [buf, lnum]))
   let ns = nvim_create_namespace('command_result')
   call nvim_buf_set_extmark(buf, ns, lnum - 1, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
@@ -486,7 +456,7 @@ function! s:OnExecutedCommand(buf, lnum, result)
   call setbufvar(a:buf, 'job_result', job_result)
 endfunction
 
-command! -bang -nargs=* T call s:OpenTerminal("<bang>", <q-args>)
+command! -nargs=* T call s:OpenTerminal(<q-args>)
 
 function! s:RemoteFileCommand(what, cb)
   if empty(a:what)
@@ -503,16 +473,6 @@ function! s:RemoteFileCommand(what, cb)
     echo "Nothing to show."
   else
     call qutil#CreateOneShotQuickfix(files, 'Remote files', a:cb)
-  endif
-endfunction
-
-function! work#Scp(pat)
-  if !empty(a:pat)
-    let files = init#RemoteFindFiles(g:HOST, a:pat)
-    call qutil#CreateOneShotQuickfix(files, 'Scp', function('init#Scp', [g:HOST]))
-  else
-    let name = expand("%:t")
-    call init#Scp(g:HOST, printf("%s/%s", g:RSYNC_DIR, name))
   endif
 endfunction
 
@@ -537,6 +497,14 @@ function! work#DownloadRemoteFile(file)
   endif
 endfunction
 
+function! work#Upload(path)
+  if !filereadable(expand("%:p"))
+    return init#Warn("No file to upload!")
+  endif
+  let dest = empty(a:path) ? printf("%s/%s", g:RSYNC_DIR, expand("%:t")) : a:path
+  call init#Upload(g:HOST, dest)
+endfunction
+
 function! SshfsCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
@@ -544,11 +512,11 @@ function! SshfsCompl(ArgLead, CmdLine, CursorPos)
   return init#RemoteFindFiles(g:HOST, a:ArgLead)
 endfunction
 
-function! ScpCompl(ArgLead, CmdLine, CursorPos)
+function! UploadCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  return init#RemoteFindBasenames(g:HOST, a:ArgLead)
+  return init#RemoteFindDirs(g:HOST, a:ArgLead)
 endfunction
 
 function! RemoteExeCompl(ArgLead, CmdLine, CursorPos)
@@ -610,6 +578,8 @@ function! s:RemoteSyncExes(dir, exes, cb)
       call add(post_cmds, "setcap cap_sys_nice+ep " .. remote_exe)
     elseif exe =~ 'mock_video$'
       call add(post_cmds, "setcap cap_kill+ep " .. remote_exe)
+    elseif exe =~ 'librsid_debug.so$'
+      call add(post_cmds, "cp " .. remote_exe .. " /usr/lib")
     endif
   endfor
   " Exclude rest. XXX: ORDER OF FLAGS MATTERS!
@@ -978,7 +948,7 @@ function! s:InstallHostCommands()
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
   exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
 
-  command! -nargs=? -bang -complete=customlist,ScpCompl Scp call work#Scp(<q-args>)
+  command! -nargs=? -complete=customlist,UploadCompl Upload call work#Upload(<q-args>)
   command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
   command! -nargs=? -complete=customlist,SshfsCompl Download call s:RemoteFileCommand(<q-args>, 'work#DownloadRemoteFile')
   cabbr SSfs Ssfs
@@ -1005,15 +975,24 @@ function s:OnHostChange()
     call s:InstallHostCommands()
     " Patch in order to avoid 'Connection reset by peer' errors.
     let fix_ssh_cmd = 'test -d /run/sshd || (mkdir -p /run/sshd && chmod 0755 /run/sshd)'
-    call init#OnJobExit(["ssh", "-o", "ConnectTimeout=1", g:HOST, fix_ssh_cmd], function("s:OnAttemptSSH"))
+    let opts = #{stderr: 1, exit_code: 1}
+    call init#OnJobResult(["ssh", "-o", "ConnectTimeout=1", g:HOST, fix_ssh_cmd], opts, function("s:OnAttemptSSH"))
   endif
 endfunction
 
-function s:OnAttemptSSH(code)
-  if a:code == 0
+function s:OnAttemptSSH(res)
+  let code = a:res.exit_code
+  if code == 0
     call s:OnFixedHost()
+  elseif join(a:res.stderr) =~? 'permission denied'
+    echo "SSH job failed due to permissions! Possible fix :Backdoor"
+  elseif join(a:res.stderr) =~? 'timed out'
+    echo "SSH job timed out! Wait for connection via :Host"
+  elseif join(a:res.stderr) =~? 'key verification failed'
+    echo "SSH key has changed! Trust again via :Host"
   else
-    echo "SSH job failed! You can try :Backdoor!"
+    echo "SSH job failed!"
+    call init#ShowErrors(a:res.stderr)
   endif
 endfunction
 
@@ -1039,13 +1018,13 @@ function! s:OnHostResolvedIP()
   let cmds = []
   call add(cmds, "ssh-keygen -R " .. g:HOST_IP)
   call add(cmds, "echo 'Waiting for connection...'")
-  call add(cmds, "ssh_wait_silent " .. g:HOST)
+  call add(cmds, "ssh_wait " .. g:HOST)
 
   botr split
   enew
   let id = init#Termopen(join(cmds, ";"))
+  call init#TermHide(id)
   call init#OnTermSuccess(id, expand("<SID>") .. "OnHostChange")
-  startinsert
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
@@ -1058,7 +1037,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
     return []
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
-        \ "BuildImage", "ProdImage", "BuildSdk", "InstallSdk", "ShowImage", "SaveImage",
+        \ "BuildImage", "ShowSdk", "BuildSdk", "InstallSdk", "ShowImage", "SaveImage",
         \ "InstallImage", "RefreshImage", "RefreshSdk", "RefreshBoth",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
         \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
@@ -1108,8 +1087,13 @@ function! s:RunDocker(...)
   lcd ~/aidocker
   let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
+  let machine = g:DEVICE
+  if filereadable(printf("%s/layers/meta-ai/conf/machine/%s-dev.conf", g:AIDISTRO, g:DEVICE))
+    let machine = g:DEVICE .. '-dev'
+  endif
+
   let bash_cmd = ["export USE_S3_BUCKET=1",
-        \ printf("export MACHINE=%s", g:DEVICE),
+        \ printf("export MACHINE=%s", machine),
         \ printf("source %s/setup-environment %s", g:AIDISTRO, g:DOCKER_CACHE)]
   if a:0 > 0
     call add(bash_cmd, join(a:000))
@@ -1149,14 +1133,15 @@ function! s:BuildSdk()
 endfunction
 
 function! s:BuildImage()
+  " Last chance to save .bash_history before the reflash wipes it.
+  call s:SyncRemoteHistory()
   return s:RunDocker(s:BitbakeCommand())
 endfunction
 
-function! s:InstallSdk()
+function! s:FindSdk()
   let sdks = init#SystemOrThrow(["find", g:DOCKER_CACHE .. "/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
   if empty(sdks)
-    echo "No sdk found"
-    return
+    throw "No sdk found"
   endif
   let most_recent_file = sdks[0]
   let most_recent_timestamp = getftime(sdks[0])
@@ -1167,12 +1152,18 @@ function! s:InstallSdk()
       let most_recent_timestamp = curr_timestamp
     endif
   endfor
-  let mins = (localtime() - most_recent_timestamp) / 60
+  return most_recent_file
+endfunction
+
+function! s:InstallSdk()
+  let most_recent_file = s:FindSdk()
+  let most_recent_timestamp = getftime(most_recent_file)
+  let ago = init#PrettyTime(localtime() - most_recent_timestamp)
 
   split
   enew
   let cmds = []
-  call add(cmds, "echo 'Found sdk from " .. mins .. "m ago'")
+  call add(cmds, printf("echo 'Found sdk from %s ago'", ago))
   call add(cmds, "rm -rf " .. g:SDK_DIR .. "/*")
   call add(cmds, printf("%s -d %s -y", most_recent_file, g:SDK_DIR))
   call init#Termopen(join(cmds, ";"))
@@ -1203,8 +1194,7 @@ function! s:FindImage(...)
 endfunction
 
 function! s:ShowImage()
-  let img = s:FindImage()
-  echo img
+  call init#ToClipboard(s:FindImage())
 endfunction
 
 function! s:SaveImage(name)
@@ -1226,9 +1216,9 @@ function! s:InstallImage(...)
   endif
 
   let most_recent_timestamp = getftime(most_recent_image)
-  let mins = (localtime() - most_recent_timestamp) / 60
+  let ago = init#PrettyTime(localtime() - most_recent_timestamp)
   let cmds = []
-  call add(cmds, "echo 'Found image from " .. mins .. "m ago'")
+  call add(cmds, printf("echo 'Found image from %s ago'", ago))
   if g:DEVICE == "imx95-var-dart"
     let dev = s:FindSdCard()
     if empty(dev)
@@ -1253,8 +1243,6 @@ function! s:InstallImage(...)
   endif
   split
   enew
-  " Last chance to save .bash_history before the reflash wipes it.
-  call s:SyncRemoteHistory()
   call init#Termopen(join(cmds, " && "))
   startinsert
 endfunction
@@ -1274,6 +1262,10 @@ function! s:RefreshImage()
   endif
   let id = s:BuildImage()
   call init#OnTermSuccess(id, function("s:InstallImage"))
+endfunction
+
+function! s:ShowSdk()
+  call init#ToClipboard(s:FindSdk())
 endfunction
 
 function! s:RefreshSdk()
@@ -1457,9 +1449,9 @@ function! s:OpenCV()
     echo "Preload library not found!"
     return
   endif
-  let ts = localtime() - getftime(file)
+  let ago = init#PrettyTime(localtime() - getftime(file))
   let cmds = []
-  call add(cmds, printf("echo Copying over library from %dm ago", ts / 60))
+  call add(cmds, printf("echo Copying over library from %s ago", ago))
   call add(cmds, printf("cp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s/sysroots/armv8a-aisys-linux/usr/lib", g:BUILD_TYPE, g:SDK_DIR))
   call add(cmds, printf("scp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s:/usr/lib", g:BUILD_TYPE, g:HOST))
   call add(cmds, printf("ssh %s chmod +s /usr/lib/libalcatraz_opencv_mat.so*", g:HOST))
@@ -1620,7 +1612,7 @@ function! work#CommitAI()
     endif
     " Get commit message. This is needed to create the branch and the commit
     exe "e " .. g:AIDISTRO
-    let cmd = ["log", "-1", "--format=%B", "origin/" .. branch]
+    let cmd = [FugitiveExtractGitDir(repo), "log", "-1", "--format=%B", "origin/" .. branch]
     let msg = git#ExecuteOrThrow(cmd, "Cannot determine commit message for " .. repo)[0]
     let issue = matchstr(msg, 'SW-[0-9]\{4\}')
     " Create branch
@@ -1892,10 +1884,6 @@ function s:OnServicesChanged(_0, d, _1)
     elseif stridx(line, 'string "ActiveState"') >= 0
       let next_line = get(a:d, idx + 1, '')
       let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
-      " TODO DEBUG THIS BAD BOY
-      if empty(activity)
-        call init#Warn(next_line)
-      endif
       if exists('s:services_last') && has_key(s:services_status, s:services_last)
         let changed = s:services_status[s:services_last] != activity
         if changed
@@ -2476,7 +2464,7 @@ function! s:OnMergeRequestWorktree(target_branch)
   const path = git#WorktreePath()
   exe "e " .. path
   only
-  call git#ExecuteOrThrow(["fetch", "origin", a:target_branch])
+  call init#SystemOrThrow(["git", "fetch", "origin", a:target_branch])
   exe "R origin/" .. a:target_branch
 endfunction
 
@@ -2683,13 +2671,7 @@ function! s:OnBuildsResponse(response_list)
       let today = strftime("%Y-%m-%d", timestamp) == strftime("%Y-%m-%d")
       let seconds = localtime() - timestamp
       if today
-        if seconds < 60
-          let pretty_time = seconds .. "s ago"
-        elseif seconds < 60 * 60
-          let pretty_time = (seconds / 60) .. "m ago"
-        elseif seconds < 24 * 60 * 60
-          let pretty_time = (seconds / 60 / 60) .. "h ago"
-        endif
+        let pretty_time = init#PrettyTime(seconds) .. " ago"
       else
         let pretty_time = strftime("%Y-%m-%d %H:%M:%S", timestamp)
       endif
@@ -2893,10 +2875,6 @@ command! -nargs=0 Issues call s:OnAssignedIssues(function("s:ShowUnresolved"))
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
-  " Run RSI plugin
-
-  " TODO -- RSI is DISABLED!
-  " call RsiEnable()
 
   if exists("g:JENKINS_TRACKED_BUILD[1]")
     let ResumedHandler = function(g:JENKINS_TRACKED_BUILD[1])
