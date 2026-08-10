@@ -131,7 +131,7 @@ function! s:ResolveEnvFile()
   let resolved = ""
   if stridx(fname, "include/RealSenseID") >= 0
     let idx = stridx(fname, "include/RealSenseID")
-    let resolved = "/home/stef/bd-sdk/" . fname[idx:]
+    let resolved = "/home/stef/RealSenseID/" . fname[idx:]
   elseif stridx(fname, "include/alcatraz") >= 0
     let idx = stridx(fname, "include/alcatraz")
     let resolved = "/home/stef/libalcatraz/" . fname[idx:]
@@ -198,7 +198,19 @@ function! s:ListPackages(args)
   let cmd = printf("PKG_CONFIG_PATH=%s pkg-config --list-all", join(paths, ":"))
   let output = init#SystemOrThrow(cmd)
   call filter(output, "stridx(tolower(v:val), tolower(a:args)) >= 0")
-  call init#CustomBottomBuffer('Packages', output)
+  call qutil#CreateOneShotQuickfix(output, 'Packages', function('s:OpenPackage', [paths]))
+endfunction
+
+function! s:OpenPackage(paths, entry)
+  let name = split(a:entry)[0]
+  for path in a:paths
+    let file = path .. "/" .. name .. ".pc"
+    if filereadable(file)
+      exe "edit " .. fnameescape(file)
+      return
+    endif
+  endfor
+  echo printf("No .pc file for %s!", name)
 endfunction
 
 command! -nargs=* Packages call s:ListPackages(<q-args>)
@@ -309,46 +321,47 @@ function! s:ForwardMaxOutput()
   return ret
 endfunction
 
-function s:ChooseBootLogs(bang)
+function s:ChooseBootLogs(bang, arg)
   let services = s:GetServices()
   let enabled = []
   for service in services
-    let e = stridx(service, "badge-and-face") < 0
-    call add(enabled, e)
-  endfor
-  if empty(a:bang)
-    call s:ShowBootLogs(enabled)
-  else
-    call qutil#CreateMultiQuickfix(services, enabled, 'Boot', function("s:ShowBootLogs"))
-  endif
-endfunction
-
-function s:ShowBootLogs(enabled)
-  let cmd = ["journalctl", "-b", "--no-pager"]
-  let services = s:GetServices()
-  for idx in range(len(services))
-    if a:enabled[idx]
-      call add(cmd, "_SYSTEMD_UNIT=" .. services[idx])
+    if stridx(service, a:arg) >= 0
+      call add(enabled, service)
     endif
   endfor
-  call add(cmd, "+")
-  for prio in range(0, 4)
-    call add(cmd, "PRIORITY=" .. prio)
-  endfor
-  call s:OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "s:OnBootLogs")
+  call s:ShowBootLogs(a:bang, enabled)
 endfunction
 
-function! s:OnBootLogs(output)
+function s:ShowBootLogs(bang, services)
+  let cmd = ["journalctl", "-b", "--no-pager"]
+  for service in a:services
+    call add(cmd, "_SYSTEMD_UNIT=" .. service)
+  endfor
+  if !empty(a:bang)
+    " OR in warnings / errors from every other unit on the host
+    call add(cmd, "+")
+    for prio in range(0, 4)
+      call add(cmd, "PRIORITY=" .. prio)
+    endfor
+  endif
+  " Empty means no unit filter, i.e. everything the bang pulled in
+  let error_services = empty(a:bang) ? a:services : []
+  call s:OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "s:OnBootLogs", error_services)
+endfunction
+
+function! s:OnBootLogs(error_services, output)
   enew
   call setline(1, a:output)
   setlocal nomodified nomodifiable
   " Color warnings / errors in a separate job
   let nr = bufnr()
   let b:logs = a:output
-  let b:cb_count = len(range(0, 4))
-  for prio in range(0, 4)
-    let cmd = ["journalctl", "-q", "-b", "--no-pager", "PRIORITY=" .. prio]
-    let hl = prio < 4 ? "ErrorMsg" : "WarningMsg"
+  let b:cb_count = 2
+  for [prio, hl] in [["3", "ErrorMsg"], ["4..4", "WarningMsg"]]
+    let cmd = ["journalctl", "-q", "-b", "--no-pager", "-p", prio]
+    for service in a:error_services
+      call add(cmd, "_SYSTEMD_UNIT=" .. service)
+    endfor
     call init#OnJobOutput(["ssh", g:HOST, join(cmd)], "work#OnBootColoredLog", nr, hl)
   endfor
 endfunction
@@ -381,8 +394,8 @@ function! work#OnBootColoredLog(bufnr, hl, output)
   endif
 endfunction
 
-command! -nargs=0 -bang Boot call s:ChooseBootLogs("<bang>")
-command! -nargs=0 -bang Uptime call s:ChooseBootLogs("<bang>")
+command! -nargs=? -bang Boot call s:ChooseBootLogs("<bang>", <q-args>)
+command! -nargs=? -bang Uptime call s:ChooseBootLogs("<bang>", <q-args>)
 
 function! s:RemoteHistoryFile()
   let dir = stdpath('state') .. "/history"
@@ -393,6 +406,10 @@ function! s:RemoteHistoryFile()
 endfunction
 
 function! s:SyncRemoteHistory()
+  if work#IsHostSimulated() || !work#GetHostStatus()
+    return
+  endif
+
   let file = s:RemoteHistoryFile()
   let remote_history = init#SystemOrThrow(["ssh", g:HOST, "cat ~/.bash_history 2>/dev/null || true"])
   let local_history = filereadable(file) ? readfile(file) : []
@@ -476,16 +493,53 @@ function! s:RemoteFileCommand(what, cb)
   endif
 endfunction
 
+" rsync pulls files and directories alike, so a single traversal looks for both.
+" Directories get a trailing slash to say what is about to come down.
+function! s:RemoteFindPaths(pattern)
+  let cmd = 'find / \( -path /proc -o -path /sys -o -path /run \) -prune -o'
+        \ .. printf(' -regex ".*%s.*"', a:pattern)
+        \ .. ' \( -type d -exec printf "%s/\n" {} + -o -type f -print \)'
+  let paths = systemlist(["ssh", g:HOST, cmd])
+  " -exec flushes in batches, so the directories come out last unsorted.
+  return v:shell_error ? [] : sort(paths)
+endfunction
+
+function! s:DownloadCommand(what)
+  if empty(a:what)
+    let paths = init#RemoteRecentFiles(g:HOST)
+  else
+    " An argument that already names something skips the filesystem walk.
+    let path = shellescape(a:what)
+    call system(["ssh", g:HOST, printf("[ -e %s ]", path)])
+    if v:shell_error
+      let paths = s:RemoteFindPaths(a:what)
+    else
+      call system(["ssh", g:HOST, printf("[ -d %s ]", path)])
+      let paths = [v:shell_error ? a:what : a:what .. "/"]
+    endif
+  endif
+  if empty(paths)
+    echo "Nothing to show."
+  else
+    call qutil#CreateOneShotQuickfix(paths, 'Remote paths', 'work#DownloadRemote')
+  endif
+endfunction
+
 function! work#SelectRemoteFile(file)
   call init#Sshfs(g:HOST, a:file)
 endfunction
 
-function! work#DownloadRemoteFile(file)
-  let url = printf("%s:%s", g:HOST, a:file)
-  call init#SystemOrThrow(["rsync", url, expand("~/Downloads")])
-  let result = expand("~/Downloads/" .. fnamemodify(a:file, ":t"))
-  if filereadable(result)
-    call init#ToClipboard(result)
+function! work#DownloadRemote(path)
+  " Strip trailing slashes, otherwise rsync copies just the contents of a
+  " directory and fnamemodify() can no longer tell us its name.
+  let path = substitute(a:path, '/\+$', '', '')
+  let url = printf("%s:%s", g:HOST, path)
+  call init#SystemOrThrow(["rsync", "-rlt", url, expand("~/Downloads")])
+  let result = expand("~/Downloads/" .. fnamemodify(path, ":t"))
+  call init#ToClipboard(result)
+  if isdirectory(result)
+    exe "e " .. result
+  elseif filereadable(result)
     let bytes = readfile(result, 'b', 200)
     for l in bytes
       if l =~# '[^\x09\x0A\x0D\x20-\x7E]'
@@ -503,13 +557,6 @@ function! work#Upload(path)
   endif
   let dest = empty(a:path) ? printf("%s/%s", g:RSYNC_DIR, expand("%:t")) : a:path
   call init#Upload(g:HOST, dest)
-endfunction
-
-function! SshfsCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine)
-    return []
-  endif
-  return init#RemoteFindFiles(g:HOST, a:ArgLead)
 endfunction
 
 function! UploadCompl(ArgLead, CmdLine, CursorPos)
@@ -873,7 +920,7 @@ function! s:OnSdkOutput(output)
   let g:DOCKER_COMPOSE = "docker-compose.yaml"
   let g:DOCKER_CACHE = expand("~/aicache")
   let g:AIDISTRO = expand("~/aidistro")
-  if stridx(a:output[0], "librsid.so") >= 0
+  if stridx(a:output[0], "librsid.so") >= 0 || stridx(a:output[0], "bd-pre-evt-devkit") >=0 
     let g:DEVICE = "imx95-var-dart"
     let g:SDK_DIR = "/opt/aisys/imx95_var_dart"
     let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
@@ -930,6 +977,7 @@ endfunction
 
 command! -nargs=1 -complete=customlist,SimulateCompl Simulate call s:SimulateHost(<q-args>)
 cabbr Sim Simulate
+cabbr Sym Simulate
 
 function! SimulateCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
@@ -946,11 +994,11 @@ function! s:InstallHostCommands()
 
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Attach call init#RemoteAttach('%s', <q-args>)", g:HOST)
   exe printf("command! -nargs=1 -complete=customlist,HistoryCompl Ratch call init#RemoteAttach('%s', <q-args>, v:true)", g:HOST)
-  exe printf("command! -nargs=0 Ssh call init#SshTerm('%s')", g:HOST)
+  command! -nargs=0 Ssh call init#SshTerminal()
 
   command! -nargs=? -complete=customlist,UploadCompl Upload call work#Upload(<q-args>)
-  command! -nargs=? -complete=customlist,SshfsCompl Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
-  command! -nargs=? -complete=customlist,SshfsCompl Download call s:RemoteFileCommand(<q-args>, 'work#DownloadRemoteFile')
+  command! -nargs=? Ssfs call s:RemoteFileCommand(<q-args>, 'work#SelectRemoteFile')
+  command! -nargs=? Download call s:DownloadCommand(<q-args>)
   cabbr SSfs Ssfs
 
   nnoremap <silent> <leader>rb <cmd>Sync badge_and_face<CR>
@@ -970,7 +1018,12 @@ function! s:InstallHostCommands()
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
 endfunction
 
-function s:OnHostChange()
+function s:OnHostChange(...)
+  let shell_error = get(a:000, 0, 0)
+  if shell_error
+    return init#Warn("Connection failed!")
+  endif
+
   if !work#IsHostSimulated()
     call s:InstallHostCommands()
     " Patch in order to avoid 'Connection reset by peer' errors.
@@ -1008,7 +1061,11 @@ endfunction
 
 function! s:ChangeHost(host)
   if empty(a:host)
-    echo "Current host is: " .. g:HOST
+    if work#GetHostStatus()
+      echo "Current host is: " .. g:HOST
+    else
+      call s:DetermineConfig(g:HOST, function('s:OnHostResolvedIP'))
+    endif
   else
     call s:DetermineConfig(a:host, function('s:OnHostResolvedIP'))
   endif
@@ -1024,7 +1081,7 @@ function! s:OnHostResolvedIP()
   enew
   let id = init#Termopen(join(cmds, ";"))
   call init#TermHide(id)
-  call init#OnTermSuccess(id, expand("<SID>") .. "OnHostChange")
+  call init#OnTermExit(id, expand("<SID>") .. "OnHostChange")
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
@@ -1038,7 +1095,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
         \ "BuildImage", "ShowSdk", "BuildSdk", "InstallSdk", "ShowImage", "SaveImage",
-        \ "InstallImage", "RefreshImage", "RefreshSdk", "RefreshBoth",
+        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
         \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
   return filter(cmds, 'v:val =~? a:ArgLead')
@@ -1088,8 +1145,9 @@ function! s:RunDocker(...)
   let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
   let machine = g:DEVICE
-  if filereadable(printf("%s/layers/meta-ai/conf/machine/%s-dev.conf", g:AIDISTRO, g:DEVICE))
-    let machine = g:DEVICE .. '-dev'
+  if g:DEVICE == 'imx95-var-dart'
+    " TODO
+    " let machine = "bd-pre-evt-devkit"
   endif
 
   let bash_cmd = ["export USE_S3_BUCKET=1",
@@ -1139,6 +1197,7 @@ function! s:BuildImage()
 endfunction
 
 function! s:FindSdk()
+  " TODO whoops
   let sdks = init#SystemOrThrow(["find", g:DOCKER_CACHE .. "/tmp/deploy/sdk/", "-regex", printf(".*%s.*.sh", g:DEVICE)])
   if empty(sdks)
     throw "No sdk found"
@@ -1172,6 +1231,7 @@ endfunction
 
 function! s:FindImage(...)
   let ext = (g:DEVICE == "imx95-var-dart" ? "wic.zst" : "mender") 
+  " TODO whoops
   let regex = printf(".*%s.*%s", g:DEVICE, ext)
   let dir = get(a:000, 0, "")
   if empty(dir)
@@ -1273,7 +1333,7 @@ function! s:RefreshSdk()
   call init#OnTermSuccess(id, function("s:InstallSdk"))
 endfunction
 
-function! s:RefreshBoth()
+function! s:Refresh()
   let id = s:RunDocker(s:BitbakeCommand(#{multi: v:true}))
   call init#OnTermSuccess(id, function("s:InstallBoth"))
 endfunction
@@ -1924,100 +1984,56 @@ command! -nargs=0 Health call s:OpenServices()
 
 """"""""""""""""""""""""""""RTSP"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function work#CheckRtspConnection(bang, ip)
-  if !executable("nc")
-    echom "nc is not executable (package netcat)"
-    return
-  endif
-  if !empty(a:ip)
-    let ip = a:ip
-  else
-    let ip = g:HOST_IP
+
+function! work#CheckRtspConnection(bang)
+  let script = globpath(&runtimepath, 'plugin/rtsp.py')
+  if empty(script)
+    return init#Warn("rtsp.py not found")
   endif
 
-  call systemlist(["ping", "-c", "1", ip])
+  let cmd = ["python3", script, g:HOST_IP, "--host", g:HOST, "--device", g:DEVICE]
+  if !empty(a:bang)
+    call add(cmd, "--debug")
+  endif
+
+  let lines = systemlist(cmd)
   if v:shell_error
-    return init#Warn("No connection to " .. ip)
+    return init#Warn(join(lines, "\n"))
   endif
-  call system(["nc", "-w", "1", "-z", ip, 8554])
-  if v:shell_error
-    return init#Warn("Port 8554 is not open!")
+  if !empty(a:bang)
+    return init#CustomBottomBuffer("RTSP", lines)
   endif
-
-  call system(["nc", "-w", "1", "-z", ip, 8554])
-
-  let cmd = "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n"
-  let output = systemlist(printf("timeout 0.1 nc %s 8554", ip), cmd)
-  if stridx(join(output), "DESCRIBE") < 0
-    call init#ShowErrors(output)
-    return init#Warn("No DESCRIBE command!")
+  if empty(lines)
+    return init#Warn("No streams found")
   endif
 
-  if stridx(g:DEVICE, "onyx") >= 0
-    let streams = ["ircamera", "mircamera", "depthcamera", "mdepthcamera", "rgbcamera", "mrgbcamera"]
-  elseif stridx(g:DEVICE, "rockx") >= 0
-    let streams = ["adaptive_h264", "adaptive_mjpeg", "near-rtsp", "far-rtsp", "center-rtsp", "intercom"]
-  endif
-
-  let cmd = ""
-  let seq = 2
-  for stream in streams
-    let cmd .= printf("DESCRIBE rtsp://%s:8554/%s RTSP/1.0\r\n", ip, stream) .
-          \ printf("CSeq: %d\r\n", seq) .
-          \ "Accept: application/sdp\r\n" .
-          \ "\r\n"
-    let seq += 1
+  " Each line is "<label>\t<gst-launch command>".
+  let labels = []
+  let cmds = []
+  for line in lines
+    let [label, command] = split(line, "\t")
+    call add(labels, label)
+    call add(cmds, command)
   endfor
 
-  let output = system(printf("timeout 4 nc %s 8554", ip), cmd)
-  let output = split(output, "\r\n")
-
-  let ok = filter(copy(output), 'v:val =~# "RTSP/[0-9.]* 200 OK"')
-  if empty(ok) || !empty(a:bang)
-    echo printf("Found %d streams", len(ok))
-    return init#CustomBottomBuffer("RTSP", output)
-  endif
-
-  let content_base = filter(copy(output), 'v:val =~# "^Content-Base:"')
-  let rtpmap = filter(copy(output), 'v:val =~# "^a=rtpmap"')
-  if len(ok) != len(content_base) || len(ok) != len(rtpmap)
-    return init#Warn("Parse error")
-  endif
-
-  let found_streams = []
-  for i in range(len(ok))
-    let stream = matchstr(content_base[i], '/\zs[^/]\+\ze/\?$')
-    if stridx(rtpmap[i], "H264") >= 0
-      call add(found_streams, "H264: " . stream)
-    elseif stridx(rtpmap[i], "JPEG") >= 0
-      call add(found_streams, "MJPEG: " . stream)
-    else
-      call init#Warn("Unknown encoder: %s", rtpmap[i])
-    endif
-  endfor
-
-  call qutil#CreateCustomQuickfix(found_streams, 'Streams', 'work#SelectStream', ip)
+  let nr = qutil#CreateCustomQuickfix(labels, 'Streams', 'work#SelectStream')
+  call qutil#SetLineData(nr, cmds)
 endfunction
 
-function work#SelectStream(ip)
-  let pos = line('.')
-  let line = getline(pos)
-  let [type, name] = split(line, ": ")
-  if type == "H264"
-    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! fpsdisplaysink video-sink=autovideosink"
-  elseif type == "MJPEG"
-    let fmt = "gst-launch-1.0 rtspsrc location=rtsp://%s:8554/%s latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! fpsdisplaysink video-sink=autovideosink"
-  endif
-  let msg = printf(fmt, a:ip, name)
-  call init#ToClipboard(msg)
+function work#SelectStream()
+  call init#ToClipboard(qutil#GetLineData())
 endfunction
 
-command! -bang -nargs=? Rtsp call work#CheckRtspConnection("<bang>", <q-args>)
+command! -bang Rtsp call work#CheckRtspConnection("<bang>")
 "}}}
 
 """"""""""""""""""""""""""""Redis"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! s:RedisGetUsers()
+  call qutil#CreateOneShotQuickfix(s:RedisUsers(), 'Users', function("s:RedisUsersCb"))
+endfunction
+
+function! s:RedisUsers()
   let redis_cmd =
         \ "local u=redis.call([[SMEMBERS]],[[onvif.users.User]]) " .
         \ "local o={} " .
@@ -2028,8 +2044,7 @@ function! s:RedisGetUsers()
         \ "end " .
         \ "return table.concat(o,string.char(10))"
   let remote_cmd = printf("redis-cli -n 1 -s /run/redis/redis.sock EVAL '%s' 0", redis_cmd)
-  let output = init#SystemOrThrow(["ssh", g:HOST, remote_cmd])
-  call qutil#CreateOneShotQuickfix(output, 'Users', function("s:RedisUsersCb"))
+  return init#SystemOrThrow(["ssh", g:HOST, remote_cmd])
 endfunction
 
 function! s:RedisUsersCb(credentials) 
@@ -2076,6 +2091,92 @@ function! s:RedisMJPEGEncoder()
   call s:ShowEncoderSettings(encoder)
 endfunction
 
+function! s:RedisGetProfiles()
+  let redis_cmd =
+        \ "local p=redis.call([[SMEMBERS]],[[onvif.media.Profiles]]) " .
+        \ "table.sort(p) " .
+        \ "local o={} " .
+        \ "for _,h in ipairs(p) do " .
+        \   "o[#o+1]=h" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[token]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[name]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[videoEncoderToken]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[videoSourceToken]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[fixed]]) or [[]]) " .
+        \ "end " .
+        \ "return table.concat(o,string.char(10))"
+  let remote_cmd = printf("redis-cli -n 1 -s /run/redis/redis.sock EVAL '%s' 0", redis_cmd)
+  let profiles = filter(init#SystemOrThrow(["ssh", g:HOST, remote_cmd]), '!empty(v:val)')
+
+  let output = []
+  for profile in profiles
+    let fields = split(profile, "\t", 1)
+    call add(output, printf("[%s]", get(fields, 0, '<nil>')))
+    call add(output, printf("token: %s", get(fields, 1, '<nil>')))
+    call add(output, printf("name: %s", get(fields, 2, '<nil>')))
+    call add(output, printf("videoEncoderToken: %s", get(fields, 3, '<nil>')))
+    call add(output, printf("videoSourceToken: %s", get(fields, 4, '<nil>')))
+    call add(output, printf("fixed: %s", get(fields, 5, '<nil>')))
+    call add(output, '')
+  endfor
+
+  call init#CustomBottomBuffer('Profiles', output)
+endfunction
+
+function! s:RedisGetMetadataConfig()
+  let redis_cmd =
+        \ "local m=redis.call([[SMEMBERS]],[[onvif.media.MetadataConfiguration]]) " .
+        \ "table.sort(m) " .
+        \ "local o={} " .
+        \ "for _,h in ipairs(m) do " .
+        \   "o[#o+1]=h" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[token]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[name]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[evfilterType]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[sessionTimeout]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[multicastEnable]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[multicastautostart]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[multicastIPAddress]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[multicastPort]]) or [[]])" .
+        \   "..string.char(9).." .
+        \   "(redis.call([[HGET]],h,[[multicastTTL]]) or [[]]) " .
+        \ "end " .
+        \ "return table.concat(o,string.char(10))"
+  let remote_cmd = printf("redis-cli -n 1 -s /run/redis/redis.sock EVAL '%s' 0", redis_cmd)
+  let configs = filter(init#SystemOrThrow(["ssh", g:HOST, remote_cmd]), '!empty(v:val)')
+
+  let output = []
+  for config in configs
+    let fields = split(config, "\t", 1)
+    call add(output, printf("[%s]", get(fields, 0, '<nil>')))
+    call add(output, printf("token: %s", get(fields, 1, '<nil>')))
+    call add(output, printf("name: %s", get(fields, 2, '<nil>')))
+    call add(output, printf("evfilterType: %s", get(fields, 3, '<nil>')))
+    call add(output, printf("sessionTimeout: %s", get(fields, 4, '<nil>')))
+    call add(output, printf("multicastEnable: %s", get(fields, 5, '<nil>')))
+    call add(output, printf("multicastautostart: %s", get(fields, 6, '<nil>')))
+    call add(output, printf("multicastIPAddress: %s", get(fields, 7, '<nil>')))
+    call add(output, printf("multicastPort: %s", get(fields, 8, '<nil>')))
+    call add(output, printf("multicastTTL: %s", get(fields, 9, '<nil>')))
+    call add(output, '')
+  endfor
+
+  call init#CustomBottomBuffer('MetadataConfiguration', output)
+endfunction
+
 command! -nargs=* -complete=customlist,RedisCompl Redis call init#Dispatch("Redis", expand("<SID>Redis"), <f-args>)
 
 function! RedisCompl(ArgLead, CmdLine, CursorPos)
@@ -2083,7 +2184,7 @@ function! RedisCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine) || nargs > 2
     return []
   endif
-  let cmds = ["GetUsers", 'H264Encoder', 'MJPEGEncoder']
+  let cmds = ["GetUsers", 'H264Encoder', 'MJPEGEncoder', 'GetProfiles', 'GetMetadataConfig']
   return filter(cmds, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -2248,9 +2349,9 @@ function s:DetermineImage()
   let commitish = matchstr(artifact[0],  '-g\([0-9a-f]\+\)')[2:]
   if empty(commitish)
     echo "Operation failed."
-    return
+    return init#CustomBottomBuffer('Mender output', artifact)
   endif
-  exe "Repo " .. g:AIDISTRO
+  exe "Repo " .. fnamemodify(g:AIDISTRO, ':t')
   let aidistro_commitish = git#HashOrThrow("HEAD")
   let len = min([len(aidistro_commitish), len(commitish)])
   if aidistro_commitish[:len-1] != commitish[:len-1]
@@ -2258,7 +2359,7 @@ function s:DetermineImage()
   else
     echo "Commit matched with " .. g:AIDISTRO
   endif
-  exe printf("G log %s -n 10", commitish)
+  exe printf("G log %s -n 1", commitish)
   silent only
 endfunction
 
@@ -2313,7 +2414,7 @@ let g:gitlab_token_file = stdpath('state') .. "/gitlab_token.txt"
 if filereadable(g:gitlab_token_file)
   let g:gitlab_token = readfile(g:gitlab_token_file)[0]
   let today = strftime('%Y-%m-%d')
-  if today ># '2027-04-20'
+  if today ># '2027-08-03'
     call init#Warn("Your gitlab token has expired!")
   endif
 else
@@ -2332,6 +2433,12 @@ function! s:DecodeJsonResponse(cb, output)
     let dict = empty(a:output[0]) ? #{} : json_decode(a:output[0])
     call function(a:cb)(dict)
   endif
+endfunction
+
+function! work#GitlabModify(method, req)
+  let cmd = ["curl", "--silent", "--show-error", "--fail-with-body", "--request", a:method,
+        \ "--header", "PRIVATE-TOKEN:" .. g:gitlab_token, a:req]
+  return init#SystemOrThrow(cmd)
 endfunction
 
 function! work#GitlabRequest(req)
@@ -2400,7 +2507,7 @@ function! s:OnMergeRequestDict(req, dict)
   call sort(list, function("s:CompareTimestamps"))
   let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
   let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
-  call setbufvar(nr, 'mr_list', list)
+  call qutil#SetLineData(nr, list)
   nnoremap <silent> <buffer> B :call <SID>CheckoutMergeRequest()<CR>
   nnoremap <silent> <buffer> b :call <SID>GetBranchMergeRequest()<CR>
   nnoremap <silent> <buffer> w :call <SID>GetMergeRequestURL()<CR>
@@ -2413,15 +2520,13 @@ function s:ShowMergeRequestHelp()
 endfunction
 
 function! s:GetMergeRequestURL()
-  let idx = line('.') - 1
-  let entry = b:mr_list[idx]
+  let entry = qutil#GetLineData()
   call init#ToClipboard(entry["url"])
   " quit
 endfunction
 
 function! s:CheckoutMergeRequest()
-  let idx = line('.') - 1
-  let entry = b:mr_list[idx]
+  let entry = qutil#GetLineData()
   let repo = entry["repo_full"]
   call s:ForceUpdateRepo(repo, entry["branch"])
   quit
@@ -2429,24 +2534,25 @@ function! s:CheckoutMergeRequest()
 endfunction
 
 function! s:GetBranchMergeRequest()
-  let idx = line('.') - 1
-  let entry = b:mr_list[idx]
+  let entry = qutil#GetLineData()
   call init#ToClipboard(entry["branch"])
 endfunction
 
 function! s:ShowNotesMergeRequest()
-  let idx = line('.') - 1
-  let entry = b:mr_list[idx]
-  let req = printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s/notes?per_page=100",
-        \ entry["repo_id"], entry["mr_id"])
+  let entry = qutil#GetLineData()
+  call s:RequestGitlabNotes(#{repo: entry["repo_full"], branch: entry["branch"],
+        \ base: printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s",
+        \              entry["repo_id"], entry["mr_id"])})
+endfunction
 
-  let repo = entry["repo_full"]
-  call work#OnGitlabResponse(req, function("s:ShowGitlabNotes", [repo]))
+" Also the way the list refreshes itself after resolving a thread.
+function! s:RequestGitlabNotes(mr)
+  call work#OnGitlabResponse(a:mr.base .. "/discussions?per_page=100",
+        \ function("s:ShowGitlabNotes", [a:mr]))
 endfunction
 
 function! s:WorktreeMergeRequest()
-  let idx = line('.') - 1
-  let entry = b:mr_list[idx]
+  let entry = qutil#GetLineData()
   let repo = entry["repo_full"]
   let branch = entry["branch"]
   let target_branch = entry["target_branch"]
@@ -2468,32 +2574,227 @@ function! s:OnMergeRequestWorktree(target_branch)
   exe "R origin/" .. a:target_branch
 endfunction
 
-function! s:ShowGitlabNotes(repo, resp)
-  let head = git#HashOrThrow("HEAD", a:repo)
-  let list = []
-  for note in a:resp
-    let resolvable = get(note, "resolvable", v:false)
-    let resolved = get(note, "resolved", v:true)
-    let text = note["body"]
-    let pos = get(note, "position", #{})
-    if resolvable && !resolved && !empty(pos)
-      let start = pos["line_range"]["start"]
-      let line = pos["new_line"]
-      let file = printf("%s/%s", a:repo, pos["new_path"])
-      let sha = pos["head_sha"]
-      if sha != head
-        let url = FugitiveFind(printf("%s:%s", sha, file))
-      else
-        let url = file
-      endif
-      let timestamp = note["created_at"]
-      let author = note["author"]["username"]
-      let text = printf("%s: %s", author, text)
-      call add(list, #{filename: url, lnum: line, text: text, timestamp: timestamp})
+" A fugitive object for a commit that is not in the local clone opens as an
+" empty buffer instead of failing, so make sure the commit is there first. The
+" merge request branch is fetched at most once per invocation.
+function! s:EnsureCommit(ctx, sha)
+  if has_key(a:ctx.checked, a:sha)
+    return a:ctx.checked[a:sha]
+  endif
+
+  let args = [a:ctx.git_dir, "cat-file", "-e", a:sha .. "^{commit}"]
+  let ok = FugitiveExecute(args)["exit_status"] == 0
+  if !ok && !a:ctx.fetched
+    let a:ctx.fetched = v:true
+    call git#ExecuteOrThrow([a:ctx.git_dir, "fetch", "origin", a:ctx.branch],
+          \ printf("Failed to fetch %s!", a:ctx.branch))
+    let ok = FugitiveExecute(args)["exit_status"] == 0
+  endif
+
+  let a:ctx.checked[a:sha] = ok
+  return ok
+endfunction
+
+" Resolve a note position to a [filename, lnum] pair. Comments on deleted lines
+" have a null new_line, so fall back to the old side of the diff.
+function! s:GitlabNotePosition(ctx, pos)
+  let new_line = get(a:pos, "new_line", v:null)
+  if new_line isnot v:null
+    let path = a:pos["new_path"]
+    let sha = get(a:pos, "head_sha", a:ctx.head)
+    let line = new_line
+  else
+    let path = get(a:pos, "old_path", get(a:pos, "new_path", ""))
+    let sha = get(a:pos, "base_sha", get(a:pos, "start_sha", a:ctx.head))
+    let old_line = get(a:pos, "old_line", v:null)
+    let line = old_line is v:null ? 0 : old_line
+  endif
+
+  let file = printf("%s/%s", a:ctx.repo, path)
+  if sha == a:ctx.head
+    return [file, line]
+  endif
+  if !s:EnsureCommit(a:ctx, sha)
+    " Better a stale worktree line than a blank fugitive buffer.
+    let a:ctx.missing += 1
+    return [file, line]
+  endif
+  return [FugitiveFind(printf("%s:%s", sha, file)), line]
+endfunction
+
+" Order threads by their location in the diff, oldest first within a file.
+function s:CompareThreads(lhs, rhs)
+  if a:lhs.path != a:rhs.path
+    return a:lhs.path < a:rhs.path ? -1 : 1
+  endif
+  if a:lhs.lnum != a:rhs.lnum
+    return a:lhs.lnum < a:rhs.lnum ? -1 : 1
+  endif
+  return s:CompareTimestamps(a:lhs, a:rhs)
+endfunction
+
+function! s:ShowGitlabNotes(mr, resp)
+  if type(a:resp) != v:t_list
+    return init#Warn("Unexpected gitlab response for discussions!")
+  endif
+
+  let head = git#HashOrThrow("HEAD", a:mr.repo)
+  let ctx = #{repo: a:mr.repo, branch: a:mr.branch, head: head,
+        \ git_dir: FugitiveExtractGitDir(a:mr.repo),
+        \ checked: #{}, fetched: v:false, missing: 0}
+  let threads = []
+  for discussion in a:resp
+    " A discussion *is* the thread, and it carries its own resolved state.
+    if !get(discussion, "resolvable", v:false) || get(discussion, "resolved", v:true)
+      continue
     endif
+
+    " The position lives on the note that opened the thread; replies inherit it.
+    let pos = #{}
+    for note in get(discussion, "notes", [])
+      let pos = get(note, "position", #{})
+      if !empty(pos)
+        break
+      endif
+    endfor
+    if empty(pos)
+      continue
+    endif
+
+    " Notes arrive oldest first, which is the order to read a thread in.
+    let notes = filter(copy(discussion["notes"]), '!get(v:val, "system", v:false)')
+    if empty(notes)
+      continue
+    endif
+
+    let [url, line] = s:GitlabNotePosition(ctx, pos)
+    call add(threads, #{url: url, lnum: line, notes: notes, id: discussion["id"],
+          \ path: get(pos, "new_path", get(pos, "old_path", "")),
+          \ timestamp: notes[0]["created_at"]})
   endfor
-  call sort(list, function("s:CompareTimestamps"))
-  call qutil#SetQuickfix(list, "Notes")
+
+  " Walk the diff top to bottom, one whole thread at a time.
+  call sort(threads, function("s:CompareThreads"))
+
+  " One line per thread: <CR> opens the conversation without leaving the list.
+  let width = 0
+  for thread in threads
+    let thread.where = printf("%s:%d", thread.path, thread.lnum)
+    let width = max([width, len(thread.where)])
+  endfor
+
+  let lines = []
+  for thread in threads
+    let opener = thread.notes[0]
+    let count = len(thread.notes) > 1 ? printf(" +%d", len(thread.notes) - 1) : "   "
+    call add(lines, [
+          \ [printf("%-*S", width, thread.where), "Directory"],
+          \ [count, "Number"],
+          \ [printf("  %s: ", opener["author"]["username"]), "Identifier"],
+          \ [s:FlattenBody(opener["body"]), "Normal"]])
+  endfor
+
+  let nr = qutil#CreateCustomQuickfix(lines, "Notes", function("s:ShowGitlabThread"))
+  if nr <= 0
+    return
+  endif
+  call qutil#SetLineData(nr, threads)
+  call setbufvar(nr, "gitlab_mr", a:mr)
+  command! -buffer Resolve call s:ResolveGitlabThread()
+  if ctx.missing > 0
+    call init#Warn(printf("%d note(s) point at commits missing from %s!", ctx.missing, a:mr.branch))
+  endif
+endfunction
+
+function! s:ResolveGitlabThread()
+  let thread = qutil#GetLineData()
+  let mr = b:gitlab_mr
+  call work#GitlabModify("PUT", printf("%s/discussions/%s?resolved=true", mr.base, thread.id))
+  echo "Resolved " .. thread.where
+  " Refetch so the list matches gitlab again.
+  call s:RequestGitlabNotes(mr)
+endfunction
+
+" Note bodies are markdown and routinely span several lines.
+function! s:FlattenBody(body)
+  return trim(substitute(a:body, '\_s\+', ' ', 'g'))
+endfunction
+
+function! s:WrapBody(text, width)
+  let lines = []
+  let rest = a:text
+  while len(rest) > a:width
+    let cut = strridx(rest[: a:width], " ")
+    let cut = cut <= 0 ? a:width : cut
+    call add(lines, rest[: cut - 1])
+    let rest = trim(rest[cut :])
+  endwhile
+  if !empty(rest) || empty(lines)
+    call add(lines, rest)
+  endif
+  return lines
+endfunction
+
+" Jump to the commented line like a quickfix entry, then float the thread at
+" the cursor. The cursor lands on the line, not in the float.
+function! s:ShowGitlabThread()
+  let thread = qutil#GetLineData()
+
+  wincmd p
+  if qutil#IsQuickfix()
+    " Nothing to jump in: the list is the only window.
+    above new
+  endif
+  exe "edit " .. fnameescape(thread.url)
+  call cursor(thread.lnum, 1)
+  normal! zz
+  " 'relative: cursor' below resolves against the last redraw, which would
+  " still put the float where the cursor was before this jump.
+  redraw
+
+  let width = min([100, &columns - 4])
+  let lines = []
+  for note in thread.notes
+    if !empty(lines)
+      call add(lines, [["", "Normal"]])
+    endif
+    call add(lines, [[note["author"]["username"], "Title"],
+          \ ["  " .. substitute(note["created_at"], 'T\(\d\+:\d\+\).*', ' \1 UTC', ""), "Comment"]])
+    for line in s:WrapBody(s:FlattenBody(note["body"]), width - 2)
+      call add(lines, [[line, "Normal"]])
+    endfor
+  endfor
+
+  let nr = nvim_create_buf(v:false, v:true)
+  call setbufvar(nr, "&bufhidden", "wipe")
+  for chunks in lines
+    call init#AppendChunksAtEnd(nr, chunks)
+  endfor
+  call setbufvar(nr, "&modifiable", v:false)
+
+  let win = nvim_open_win(nr, v:false, #{relative: "cursor", row: 1, col: 0, anchor: "NW",
+        \ width: width, height: min([len(lines), &lines / 2]),
+        \ style: "minimal", border: "rounded", title: thread.where})
+  call setwinvar(win, "&winhighlight", "NormalFloat:Normal")
+  " Dismiss it on the next move or when leaving, like an LSP hover. Cleared on
+  " every open so only the current float is ever registered.
+  augroup GitlabThreadFloat
+    autocmd!
+    " The jump above fires its own CursorMoved once this function returns, so
+    " moves that are still on the line have to be ignored.
+    exe printf("autocmd CursorMoved <buffer> call s:CloseThreadFloat(%d, %d)", win, thread.lnum)
+    exe printf("autocmd BufLeave,WinLeave <buffer> call s:CloseThreadFloat(%d, 0)", win)
+  augroup END
+endfunction
+
+function! s:CloseThreadFloat(win, keep_lnum)
+  if line('.') == a:keep_lnum
+    return
+  endif
+  autocmd! GitlabThreadFloat
+  if nvim_win_is_valid(a:win)
+    call nvim_win_close(a:win, v:true)
+  endif
 endfunction
 
 function! s:MrCommand(bang, arg)
@@ -2587,12 +2888,11 @@ function! s:OnEveryMergedMr(dict)
   let issues = map(copy(items), "v:val.issue")
   let items = map(items, "printf('%s: %s', v:val.repo, v:val.title)")
   let nr = qutil#CreateCustomQuickfix(items, "Merged", function("s:OnMergedBranch"))
-  call setbufvar(nr, "issues", issues)
+  call qutil#SetLineData(nr, issues)
 endfunction
 
 function! s:OnMergedBranch()
-  let idx = line('.') - 1
-  let issue = b:issues[idx]
+  let issue = qutil#GetLineData()
   if !empty(issue)
     call work#OpenJira(issue)
   else
@@ -2692,7 +2992,7 @@ function! s:OnBuildsResponse(response_list)
   call reverse(items)
   let names = map(copy(items), "v:val.name")
   let nr = qutil#CreateCustomQuickfix(names, "Builds", function("s:OnSelectedBuild"))
-  call setbufvar(nr, "urls", map(copy(items), "v:val.url"))
+  call qutil#SetLineData(nr, map(copy(items), "v:val.url"))
   let ns = nvim_create_namespace("builds")
   for idx in range(len(items))
     call nvim_buf_set_extmark(nr, ns, idx, 0, #{line_hl_group: items[idx]["hl"]})
@@ -2700,104 +3000,11 @@ function! s:OnBuildsResponse(response_list)
 endfunction
 
 function! s:OnSelectedBuild()
-  let idx = line('.') - 1
-  let url = b:urls[idx]
+  let url = qutil#GetLineData()
   call init#ToClipboard(url)
 endfunction
 
 command! -nargs=0 Builds call s:ShowBuilds()
-
-function! work#OnJenkinsPost(req, data, cb)
-  let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
-  let cmd = [ "curl", "--silent", "-i", "--globoff", "-X", "POST", "-u", credentials]
-  for d in a:data
-    let cmd += ["--data-urlencode", d]
-  endfor
-  call add(cmd, a:req)
-  return init#OnJobOutput(cmd, a:cb)
-endfunction
-
-function! s:ReleaseBuild(branch)
-  throw "Does not exactly work... But it's close!"
-
-  if exists('g:JENKINS_TRACKED_BUILD[0]')
-    call init#ToClipboard(g:JENKINS_TRACKED_BUILD[0])
-    return
-  endif
-
-  let git_dir = FugitiveExtractGitDir(g:AIDISTRO)
-  let branch = empty(a:branch) ? git#GetBranch(git_dir) : a:branch
-  call git#ExecuteOrThrow([git_dir, "push", "origin", branch])
-  let url = "https://jenkins.alcatraz.ai/job/aidistro_obsidian_release/buildWithParameters"
-  call work#OnJenkinsPost(url, ["branch=" .. branch], function("s:OnBuildTriggered"))
-endfunction
-
-function! s:OnBuildTriggered(resp)
-  let prefix = "location: "
-  let resp = filter(a:resp, 'stridx(v:val, prefix) >= 0')
-  if empty(resp)
-    return init#Warn("Build information is missing in response!")
-  endif
-  let location = trim(resp[0][len(prefix):])
-  let g:JENKINS_TRACKED_BUILD = [location, "s:PingBuildQueue"]
-  call s:PingBuildQueue()
-endfunction
-
-function! s:PingBuildQueue(...)
-  if !exists("g:JENKINS_TRACKED_BUILD[0]")
-    return
-  endif
-  let req = g:JENKINS_TRACKED_BUILD[0] .. "api/json"
-  call work#OnJenkinsResponse(req, function("s:OnQueueItem"))
-endfunction
-
-function! s:OnQueueItem(dict)
-  if has_key(a:dict, "executable")
-    let g:JENKINS_TRACKED_BUILD = [a:dict.executable.url, "s:PingQueuedBuild"]
-    call s:PingQueuedBuild()
-  elseif has_key(a:dict, "why")
-    let g:statusline_dict['jenkins'] = a:dict["why"]
-    call timer_start(3000, function("s:PingBuildQueue"))
-  else
-    " call init#Warn("")
-    " call assert_false()
-    " unlet g:JENKINS_TRACKED_BUILD
-    " let g:statusline_dict['jenkins'] = ''
-    " call init#Warn("Dropping build " .. g:JENKINS_TRACKED_BUILD[0])
-  endif
-endfunction
-
-function! s:PingQueuedBuild(...)
-  if !exists("g:JENKINS_TRACKED_BUILD[0]")
-    return
-  endif
-  let req = g:JENKINS_TRACKED_BUILD[0] .. "api/json"
-  call work#OnJenkinsResponse(req, function("s:OnBuildStatus"))
-endfunction
-
-function! s:OnBuildStatus(dict)
-  let building = get(a:dict, "building", v:true)
-  let result = get(a:dict, "result", "")
-  if !building
-    call init#Warn("Build " .. result)
-    call qutil#CreateCustomQuickfix([a:dict.url], "Build", function("s:OnBuildFinished"))
-    let g:JENKINS_TRACKED_BUILD = []
-    let g:statusline_dict['jenkins'] = ''
-  else
-    " TODO what here?
-    " let g:statusline_dict['jenkins'] = a:dict["why"]
-    call timer_start(3000, function("s:PingQueuedBuild"))
-  endif
-endfunction
-
-function! s:OnBuildFinished()
-  let url = getline('.')
-  call init#ToClipboard(url)
-  quit
-endfunction
-
-command! -nargs=? -complete=customlist,AidistroCompl Jenkins call s:ReleaseBuild(<q-args>)
-
 " }}}
 
 """"""""""""""""""""""""""""Jira"""""""""""""""""""""""""" {{{
@@ -2875,11 +3082,6 @@ command! -nargs=0 Issues call s:OnAssignedIssues(function("s:ShowUnresolved"))
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
-
-  if exists("g:JENKINS_TRACKED_BUILD[1]")
-    let ResumedHandler = function(g:JENKINS_TRACKED_BUILD[1])
-    call ResumedHandler()
-  endif
 endfunction
 
 augroup Work
