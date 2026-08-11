@@ -83,7 +83,7 @@ function! work#GetMakeCommandFor(repo)
       let cmake .= " -DDEVICE=onyx -DPLATFORM=obsidian"
     elseif stridx(g:DEVICE, "rockx") >= 0
       let cmake .= " -DDEVICE=obsidian -DPLATFORM=obsidian"
-    elseif stridx(g:DEVICE, "imx95-var-dart") >= 0
+    elseif stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
       let cmake .= " -DDEVICE=bd -DPLATFORM=bd"
     endif
   endif
@@ -723,7 +723,7 @@ function! s:GetApps()
         \ qrcode-scanner: #{user: "rock-bootstrap", service:"qrcode-scanner.service"},
         \ device-health: #{user: "device-health", service: "device-health.service"},
         \ }
-  if stridx(g:DEVICE, "imx95-var-dart") >= 0
+  if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
     let apps["bd-video"] = #{user: "rock-video", service: "bd-video.service"}
   elseif stridx(g:DEVICE, "rockx") >= 0
     let apps["obsidian-video"] = #{user: "rock-video", service: "obsidian-video.service"}
@@ -912,7 +912,7 @@ function! s:OnDeviceMounts(mnt)
 endfunction
 
 function s:DetermineSdk()
-  let cmd = ["ssh", g:HOST, "cat /var/lib/mender/device_type || ls /usr/lib/librsid.so"]
+  let cmd = ["ssh", g:HOST, "cat /var/lib/mender/device_type"]
   call init#OnJobOutput(cmd, expand("<SID>") .. 'OnSdkOutput')
 endfunction
 
@@ -920,9 +920,9 @@ function! s:OnSdkOutput(output)
   let g:DOCKER_COMPOSE = "docker-compose.yaml"
   let g:DOCKER_CACHE = expand("~/aicache")
   let g:AIDISTRO = expand("~/aidistro")
-  if stridx(a:output[0], "librsid.so") >= 0 || stridx(a:output[0], "bd-pre-evt-devkit") >=0 
-    let g:DEVICE = "imx95-var-dart"
-    let g:SDK_DIR = "/opt/aisys/imx95_var_dart"
+  if stridx(a:output[0], "bd-pre-evt-devkit") >=0 
+    let g:DEVICE = "bd-pre-evt-devkit"
+    let g:SDK_DIR = "/opt/aisys/bd-pre-evt-devkit"
     let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
     let g:DOCKER_CACHE = printf("/home/%s/aicache-bd", $USER)
     let g:AIDISTRO = expand("~/aidistro-bd")
@@ -983,7 +983,7 @@ function! SimulateCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let options = ["librsid.so", "rockx-dm-p15", "rockx-dm-r10", "onyx-p1", "onyx-cr"]
+  let options = ["bd-pre-evt-devkit", "rockx-dm-p15", "rockx-dm-r10", "onyx-p1", "onyx-cr"]
   return filter(options, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1085,6 +1085,58 @@ function! s:OnHostResolvedIP()
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
+
+" Find the device again after its ip changed
+function! s:ScanDevices()
+  echo printf("Scanning for %s...", g:DEVICE)
+  let opts = #{stdout: 1, stderr: 1, exit_code: 1}
+  call init#OnJobResult(["ssh-scan", "--script", g:DEVICE], opts, expand("<SID>") .. 'OnScanResult')
+endfunction
+
+function! s:OnScanResult(res)
+  let rows = filter(copy(a:res.stdout), "!empty(v:val)")
+  if a:res.exit_code != 0 || empty(rows)
+    echo "Scan failed!"
+    return init#ShowErrors(a:res.stderr)
+  endif
+
+  call qutil#CreateOneShotQuickfix(rows, "Devices", expand("<SID>") .. 'OnScannedDevice')
+endfunction
+
+function! s:OnScannedDevice(entry)
+  " Rows are <ip>  <device_type>  <artifact>
+  let ip = split(a:entry)[0]
+  call s:UpdateHostIP(ip)
+  echo printf("%s is now %s", g:HOST, ip)
+  call s:ChangeHost(g:HOST)
+endfunction
+
+" Rewrite the address of g:HOST's .ssh/config stanza, leaving the rest of the
+" file as the user wrote it.
+function! s:UpdateHostIP(ip)
+  let file = expand("~/.ssh/config")
+  let lines = readfile(file)
+  let host_pat = printf('^\s*Host\s\+%s\s*$', g:HOST)
+  let start = indexof(lines, printf('v:val =~? %s', string(host_pat)))
+  if start < 0
+    throw printf("No 'Host %s' entry in %s", g:HOST, file)
+  endif
+
+  " The stanza ends where the next one begins.
+  let next = indexof(lines, 'v:val =~? "^\\s*\\(Host\\|Match\\)\\s"', #{startidx: start + 1})
+  let stop = next < 0 ? len(lines) : next
+  let idx = indexof(lines[start + 1 : stop - 1], 'v:val =~? "^\\s*HostName\\s"')
+  if idx < 0
+    call insert(lines, "  HostName " .. a:ip, start + 1)
+  else
+    " Keep the indent and the Hostname/HostName spelling already in the file.
+    let keyword = matchstr(lines[start + 1 + idx], '^\s*\i\+')
+    let lines[start + 1 + idx] = printf("%s %s", keyword, a:ip)
+  endif
+  call writefile(lines, file)
+endfunction
+
+command! -nargs=0 Scan call s:ScanDevices()
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -1145,11 +1197,6 @@ function! s:RunDocker(...)
   let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
   let machine = g:DEVICE
-  if g:DEVICE == 'imx95-var-dart'
-    " TODO
-    " let machine = "bd-pre-evt-devkit"
-  endif
-
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", machine),
         \ printf("source %s/setup-environment %s", g:AIDISTRO, g:DOCKER_CACHE)]
@@ -1168,11 +1215,7 @@ endfunction
 
 function s:BitbakeCommand(...)
   let opts = get(a:000, 0, #{})
-  if g:DEVICE == "imx95-var-dart"
-    let img_cmd = "bitbake ai-base-image"
-  else
-    let img_cmd = "bitbake rock-image"
-  endif
+  let img_cmd = "bitbake rock-image"
   let sdk_cmd = img_cmd .. " -c populate_sdk"
 
   let multi = has_key(opts, "multi") && opts["multi"]
@@ -1230,8 +1273,7 @@ function! s:InstallSdk()
 endfunction
 
 function! s:FindImage(...)
-  let ext = (g:DEVICE == "imx95-var-dart" ? "wic.zst" : "mender") 
-  " TODO whoops
+  let ext = "mender"
   let regex = printf(".*%s.*%s", g:DEVICE, ext)
   let dir = get(a:000, 0, "")
   if empty(dir)
@@ -1279,28 +1321,10 @@ function! s:InstallImage(...)
   let ago = init#PrettyTime(localtime() - most_recent_timestamp)
   let cmds = []
   call add(cmds, printf("echo 'Found image from %s ago'", ago))
-  if g:DEVICE == "imx95-var-dart"
-    let dev = s:FindSdCard()
-    if empty(dev)
-      return init#Warn("Please mount the flash drive!")
-    endif
-
-    let mounts = init#SystemOrThrow("findmnt -n -o SOURCE")
-    call filter(mounts, "stridx(v:val, dev) >= 0")
-    if !empty(mounts)
-      call add(cmds, "umount " .. join(mounts))
-    endif
-
-    call add(cmds, printf("sudo bmaptool copy %s %s", most_recent_image, dev))
-    call add(cmds, "sync")
-    call add(cmds, "udisksctl power-off -b /dev/sdc")
-    call add(cmds, "echo 'Please insert SD card back into device...'")
-  else
-    call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
-    call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
-    call add(cmds, "echo 'Waiting for device to reboot...'")
-    call add(cmds, "ssh_wait_silent " .. g:HOST)
-  endif
+  call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
+  call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
+  call add(cmds, "echo 'Waiting for device to reboot...'")
+  call add(cmds, "ssh_wait_silent " .. g:HOST)
   split
   enew
   call init#Termopen(join(cmds, " && "))
@@ -1317,9 +1341,6 @@ function! s:FindSdCard()
 endfunction
 
 function! s:RefreshImage()
-  if g:DEVICE == "imx95-var-dart" && empty(s:FindSdCard())
-    return init#Warn("Please mount the flash drive!")
-  endif
   let id = s:BuildImage()
   call init#OnTermSuccess(id, function("s:InstallImage"))
 endfunction
@@ -2541,6 +2562,7 @@ endfunction
 function! s:ShowNotesMergeRequest()
   let entry = qutil#GetLineData()
   call s:RequestGitlabNotes(#{repo: entry["repo_full"], branch: entry["branch"],
+        \ url: entry["url"],
         \ base: printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s",
         \              entry["repo_id"], entry["mr_id"])})
 endfunction
@@ -2700,10 +2722,18 @@ function! s:ShowGitlabNotes(mr, resp)
   endif
   call qutil#SetLineData(nr, threads)
   call setbufvar(nr, "gitlab_mr", a:mr)
-  command! -buffer Resolve call s:ResolveGitlabThread()
+  nnoremap <silent> <buffer> R :call <SID>ResolveGitlabThread()<CR>
+  nnoremap <silent> <buffer> w :call <SID>GetGitlabNoteURL()<CR>
   if ctx.missing > 0
     call init#Warn(printf("%d note(s) point at commits missing from %s!", ctx.missing, a:mr.branch))
   endif
+endfunction
+
+" The #note_<id> anchor on the merge request page opens the thread in place,
+" which is where you can reply to it.
+function! s:GetGitlabNoteURL()
+  let thread = qutil#GetLineData()
+  call init#ToClipboard(printf("%s#note_%s", b:gitlab_mr.url, thread.notes[0]["id"]))
 endfunction
 
 function! s:ResolveGitlabThread()
