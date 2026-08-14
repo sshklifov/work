@@ -35,10 +35,7 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
-  let repo = FugitiveWorkTree()
-  if repo == git#WorktreePath()
-    let repo = git#WorktreeCommonPath()
-  endif
+  let repo = git#SourceRepo(FugitiveWorkTree())
   return work#GetMakeCommandFor(fnamemodify(repo, ":t"))
 endfunction
 
@@ -283,85 +280,90 @@ command! -nargs=1 -bang -complete=customlist,JournalCompl JP call s:JournalPrior
 
 cabbr J Journal
 
-" TODO: Refactor health logic to use CreateMultiQuickfix? It's different thoough...
-
-function! s:OnJobMaxOutput(cmds, max_output, cb, ...)
-  if exists("s:job_collected_data")
-    echo "Cannot start job, busy!"
-    return
-  endif
-
-  call assert_true(!exists("s:job_max_data"))
-  call assert_true(type(a:cb) == v:t_string)
-  let s:job_collected_data = []
-  let s:job_max_data = a:max_output
-
-  let Cb = function(a:cb, a:000)
-  let WrapCb = {_0, _1, _2 -> Cb(s:ForwardMaxOutput()) }
-  return init#Jobstart(a:cmds, #{on_stdout: function("s:CollectMaxOutput"), on_exit: WrapCb})
+" -u expands into its own disjunctions, which collide with an explicit "+" and
+" silently collapse the match set to empty. Expand it by hand: same result as -u
+" (incl. PID 1's messages about the unit), but still OR-able.
+function! s:UnitMatches(services)
+  let own = map(copy(a:services), '"_SYSTEMD_UNIT=" .. v:val')
+  let pid1 = map(copy(a:services), '"UNIT=" .. v:val') + ["_PID=1"]
+  return empty(a:services) ? [] : own + ["+"] + pid1
 endfunction
 
-function! s:CollectMaxOutput(job, data, _1)
-  if len(s:job_collected_data) < s:job_max_data
-    if len(s:job_collected_data) > 0 && len(a:data) > 0 && strptime('%b %d %H:%M:%S', a:data[0]) == 0
-      let s:job_collected_data[-1] ..= a:data[0]
-      call extend(s:job_collected_data, a:data[1:])
-    else
-      call extend(s:job_collected_data, a:data)
-    endif
-  else
-    call jobstop(a:job)
-  endif
-endfunction
+let s:max_boot_lines = 100000
 
-function! s:ForwardMaxOutput()
-  let ret = s:job_collected_data
-  unlet s:job_collected_data
-  unlet s:job_max_data
-  return ret
-endfunction
+" Buffer header lines: uptime, plus a warning when -b covers less than the whole
+" boot (journald vacuums oldest-first, so "since boot" is not what it looks like).
+" The caller appends any local warnings and the separator.
+let s:header =
+      \ "b=$(awk '/^btime/{print $2}' /proc/stat); n=$(date +%s);" ..
+      \ " o=$(journalctl -q -b -o short-unix --no-pager | head -1 | cut -d. -f1);" ..
+      \ " o=${o:-$b}; d=$((o-b));" ..
+      \ " f() { if [ $1 -ge 86400 ]; then echo \"$(($1/86400))d $((($1%86400)/3600))h\";" ..
+      \ " elif [ $1 -ge 3600 ]; then echo \"$(($1/3600))h $((($1%3600)/60))m\";" ..
+      \ " else echo \"$(($1/60))m\"; fi; };" ..
+      \ " h=$(echo \"Uptime: $(f $((n-b)))\";" ..
+      \ " [ $d -gt 60 ] && echo \"Journal rotated: $(f $d) lost," ..
+      \ " showing logs from $(date -d @$o +%T)\");" ..
+      \ " echo \"$h\""
 
-function s:ChooseBootLogs(bang, arg)
-  let services = s:GetServices()
+" Each arg is a substring filter; a service is included if it matches any of them.
+" No args means no filter, i.e. every service.
+function s:ChooseBootLogs(bang, ...)
+  let filters = empty(a:000) ? [""] : a:000
   let enabled = []
-  for service in services
-    if stridx(service, a:arg) >= 0
-      call add(enabled, service)
-    endif
+  for service in s:GetServices()
+    for filter in filters
+      if stridx(service, filter) >= 0
+        call add(enabled, service)
+        break
+      endif
+    endfor
   endfor
   call s:ShowBootLogs(a:bang, enabled)
 endfunction
 
 function s:ShowBootLogs(bang, services)
-  let cmd = ["journalctl", "-b", "--no-pager"]
-  for service in a:services
-    call add(cmd, "_SYSTEMD_UNIT=" .. service)
-  endfor
+  let matches = s:UnitMatches(a:services)
+  let cmd = ["journalctl", "-b", "--no-pager"] + matches
   if !empty(a:bang)
     " OR in warnings / errors from every other unit on the host
-    call add(cmd, "+")
+    if !empty(matches)
+      " journalctl rejects a "+" that does not sit between terms
+      call add(cmd, "+")
+    endif
     for prio in range(0, 4)
       call add(cmd, "PRIORITY=" .. prio)
     endfor
   endif
   " Empty means no unit filter, i.e. everything the bang pulled in
   let error_services = empty(a:bang) ? a:services : []
-  call s:OnJobMaxOutput(["ssh", g:HOST, join(cmd)], 100000, "s:OnBootLogs", error_services)
+  call init#OnJobMaxOutput(["ssh", g:HOST, join(cmd)], s:max_boot_lines, expand("<SID>") .. 'OnBootLogs', error_services)
 endfunction
 
 function! s:OnBootLogs(error_services, output)
+  let header = systemlist(["ssh", g:HOST, s:header])
+  " One line past the limit means the job was cut short and the tail is missing
+  if len(a:output) > s:max_boot_lines
+    call add(header, printf("Output truncated at %d lines", s:max_boot_lines))
+  endif
+  call add(header, repeat("=", max(map(copy(header), 'strwidth(v:val)'))))
+
   enew
-  call setline(1, a:output)
+  call setline(1, header + a:output)
   setlocal nomodified nomodifiable
   " Color warnings / errors in a separate job
   let nr = bufnr()
   let b:logs = a:output
+  let b:log_offset = len(header)
   let b:cb_count = 2
+  let ns = nvim_create_namespace('boot')
+  for i in range(len(header))
+    if header[i] =~# '^\%(Journal rotated\|Output truncated\)'
+      call nvim_buf_set_extmark(nr, ns, i, 0, #{line_hl_group: "ErrorMsg"})
+    endif
+  endfor
   for [prio, hl] in [["3", "ErrorMsg"], ["4..4", "WarningMsg"]]
-    let cmd = ["journalctl", "-q", "-b", "--no-pager", "-p", prio]
-    for service in a:error_services
-      call add(cmd, "_SYSTEMD_UNIT=" .. service)
-    endfor
+    let cmd = ["journalctl", "-q", "-b", "--no-pager", "-p", prio] + s:UnitMatches(a:error_services)
     call init#OnJobOutput(["ssh", g:HOST, join(cmd)], "work#OnBootColoredLog", nr, hl)
   endfor
 endfunction
@@ -370,11 +372,12 @@ function! work#OnBootColoredLog(bufnr, hl, output)
   let ns = nvim_create_namespace('boot')
   let idx = 0
   let haystack = getbufvar(a:bufnr, "logs")
+  let offset = getbufvar(a:bufnr, "log_offset", 0)
   for needle in a:output
     if !empty(needle)
       let pos = index(haystack, needle, idx)
       if pos >= 0
-        call nvim_buf_set_extmark(a:bufnr, ns, pos, 0, #{line_hl_group: a:hl})
+        call nvim_buf_set_extmark(a:bufnr, ns, pos + offset, 0, #{line_hl_group: a:hl})
         let idx = pos + 1
       else
         call setbufvar(a:bufnr, "show_warning", v:true)
@@ -389,13 +392,11 @@ function! work#OnBootColoredLog(bufnr, hl, output)
       call init#Warn("Partial highlight.")
     endif
     call setbufvar(a:bufnr, "logs", [])
-    let uptime = init#SystemOrThrow(["ssh", g:HOST, "uptime -p"])
-    echo uptime[0]
   endif
 endfunction
 
-command! -nargs=? -bang Boot call s:ChooseBootLogs("<bang>", <q-args>)
-command! -nargs=? -bang Uptime call s:ChooseBootLogs("<bang>", <q-args>)
+command! -nargs=* -bang -complete=customlist,JournalCompl Boot call s:ChooseBootLogs("<bang>", <f-args>)
+command! -nargs=* -bang -complete=customlist,JournalCompl Uptime call s:ChooseBootLogs("<bang>", <f-args>)
 
 function! s:RemoteHistoryFile()
   let dir = stdpath('state') .. "/history"
@@ -769,8 +770,8 @@ function! s:RunAsService(exe)
 
   sp
   enew
-  let id = init#Termopen(["ssh", g:HOST, join(cmds, ' && ')])
-  call init#OnTermSuccess(id, function('s:Journal', ['!', systemd_name]))
+  call init#OnTermSuccess(["ssh", g:HOST, join(cmds, ' && ')],
+        \ function('s:Journal', ['!', systemd_name]))
 endfunction
 
 function! s:DetermineConfig(host, Cb)
@@ -1079,18 +1080,19 @@ function! s:OnHostResolvedIP()
 
   botr split
   enew
-  let id = init#Termopen(join(cmds, ";"))
+  let id = init#OnTermExit(join(cmds, ";"), expand("<SID>") .. "OnHostChange")
   call init#TermHide(id)
-  call init#OnTermExit(id, expand("<SID>") .. "OnHostChange")
 endfunction
 
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
 
 " Find the device again after its ip changed
-function! s:ScanDevices()
-  echo printf("Scanning for %s...", g:DEVICE)
+function! s:ScanDevices(machine)
+  let machine = empty(a:machine) ? g:DEVICE : a:machine
+  echo printf("Scanning for %s...", machine)
   let opts = #{stdout: 1, stderr: 1, exit_code: 1}
-  call init#OnJobResult(["ssh-scan", "--script", g:DEVICE], opts, expand("<SID>") .. 'OnScanResult')
+  let scan_exe = expand("~/.local/bin/ssh-scan")
+  call init#OnJobResult([scan_exe, "--script", machine], opts, expand("<SID>") .. 'OnScanResult')
 endfunction
 
 function! s:OnScanResult(res)
@@ -1100,26 +1102,28 @@ function! s:OnScanResult(res)
     return init#ShowErrors(a:res.stderr)
   endif
 
-  call qutil#CreateOneShotQuickfix(rows, "Devices", expand("<SID>") .. 'OnScannedDevice')
+  call qutil#CreateCustomQuickfix(rows, "Devices", expand("<SID>") .. 'OnScannedDevice')
 endfunction
 
-function! s:OnScannedDevice(entry)
+function! s:OnScannedDevice()
+  let entry = getline('.')
+  quit
   " Rows are <ip>  <device_type>  <artifact>
-  let ip = split(a:entry)[0]
+  let ip = split(entry)[0]
   call s:UpdateHostIP(ip)
-  echo printf("%s is now %s", g:HOST, ip)
-  call s:ChangeHost(g:HOST)
+  echo printf("alt is now %s", ip)
+  call s:ChangeHost("alt")
 endfunction
 
-" Rewrite the address of g:HOST's .ssh/config stanza, leaving the rest of the
-" file as the user wrote it.
+" Rewrite the address of the alt stanza in .ssh/config, leaving the rest of the
+" file as the user wrote it. A scanned device is never the main host: it lands
+" on alt, reused for whichever device is being worked on on the side.
 function! s:UpdateHostIP(ip)
   let file = expand("~/.ssh/config")
   let lines = readfile(file)
-  let host_pat = printf('^\s*Host\s\+%s\s*$', g:HOST)
-  let start = indexof(lines, printf('v:val =~? %s', string(host_pat)))
+  let start = indexof(lines, 'v:val =~? "^\\s*Host\\s\\+alt\\s*$"')
   if start < 0
-    throw printf("No 'Host %s' entry in %s", g:HOST, file)
+    throw printf("No 'Host alt' entry in %s", file)
   endif
 
   " The stanza ends where the next one begins.
@@ -1136,7 +1140,7 @@ function! s:UpdateHostIP(ip)
   call writefile(lines, file)
 endfunction
 
-command! -nargs=0 Scan call s:ScanDevices()
+command! -nargs=? -complete=customlist,SimulateCompl Scan call s:ScanDevices(<q-args>)
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
@@ -1190,7 +1194,12 @@ function! s:UpdateDocker()
   startinsert
 endfunction
 
+" Run the args in the container, or an interactive shell when there are none.
+" A trailing funcref runs once the container exits successfully.
 function! s:RunDocker(...)
+  let args = copy(a:000)
+  let Cb = !empty(args) && type(args[-1]) == v:t_func ? remove(args, -1) : v:null
+  let cmd = join(args)
   sp
   enew
   lcd ~/aidocker
@@ -1200,15 +1209,19 @@ function! s:RunDocker(...)
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", machine),
         \ printf("source %s/setup-environment %s", g:AIDISTRO, g:DOCKER_CACHE)]
-  if a:0 > 0
-    call add(bash_cmd, join(a:000))
+  if !empty(cmd)
+    call add(bash_cmd, cmd)
   else
     call add(bash_cmd, "/usr/bin/bash")
   endif
 
   let docker_cmd = printf("/usr/bin/bash -c '%s'", join(bash_cmd, ';'))
   call add(cmds, docker_cmd)
-  let id = init#Termopen(join(cmds))
+  if Cb is v:null
+    let id = init#Termopen(join(cmds))
+  else
+    let id = init#OnTermSuccess(join(cmds), Cb)
+  endif
   startinsert
   return id
 endfunction
@@ -1229,14 +1242,14 @@ function s:BitbakeCommand(...)
   endif
 endfunction
 
-function! s:BuildSdk()
-  return s:RunDocker(s:BitbakeCommand(#{sdk: v:true}))
+function! s:BuildSdk(...)
+  return call('s:RunDocker', [s:BitbakeCommand(#{sdk: v:true})] + a:000)
 endfunction
 
-function! s:BuildImage()
+function! s:BuildImage(...)
   " Last chance to save .bash_history before the reflash wipes it.
   call s:SyncRemoteHistory()
-  return s:RunDocker(s:BitbakeCommand())
+  return call('s:RunDocker', [s:BitbakeCommand()] + a:000)
 endfunction
 
 function! s:FindSdk()
@@ -1341,8 +1354,7 @@ function! s:FindSdCard()
 endfunction
 
 function! s:RefreshImage()
-  let id = s:BuildImage()
-  call init#OnTermSuccess(id, function("s:InstallImage"))
+  call s:BuildImage(function("s:InstallImage"))
 endfunction
 
 function! s:ShowSdk()
@@ -1350,13 +1362,11 @@ function! s:ShowSdk()
 endfunction
 
 function! s:RefreshSdk()
-  let id = s:BuildSdk()
-  call init#OnTermSuccess(id, function("s:InstallSdk"))
+  call s:BuildSdk(function("s:InstallSdk"))
 endfunction
 
 function! s:Refresh()
-  let id = s:RunDocker(s:BitbakeCommand(#{multi: v:true}))
-  call init#OnTermSuccess(id, function("s:InstallBoth"))
+  call s:RunDocker(s:BitbakeCommand(#{multi: v:true}), function("s:InstallBoth"))
 endfunction
 
 function! s:InstallBoth()
@@ -1666,13 +1676,11 @@ function! s:Enroll()
 endfunction
 
 function! s:Reboot()
-  let cmds = []
-  call add(cmds, printf("ssh %s reboot", g:HOST))
-  call add(cmds, "echo Waiting for reboot...")
-  call add(cmds, "ssh_wait_silent " .. g:HOST)
-  bot sp
-  enew
-  call init#Termopen(join(cmds, ";"))
+  call init#OnJobExit(printf("ssh %s reboot", g:HOST), expand("<SID>") .. "OnReboot")
+endfunction
+
+function! s:OnReboot(code)
+  call s:DetermineConfig(g:HOST, function('s:OnHostResolvedIP'))
 endfunction
 
 command! -nargs=0 Reboot call s:Reboot()
@@ -1894,8 +1902,10 @@ function! s:OpenServices()
 endfunction
 
 function s:OnSelectedService()
-  let pos = line('.')
-  let service = getline(pos)
+  if !exists('s:services_status')
+    return
+  endif
+  let service = getline('.')
   let status = get(s:services_status, service, "")
   if status == "inactive" || status == "failed"
     call init#Jobstart(["ssh", g:HOST, "systemctl start " .. service])
@@ -1982,20 +1992,17 @@ function s:OnServicesChanged(_0, d, _1)
 endfunction
 
 function! s:UpdateServicesHl(nr)
-  let services = getbufline(a:nr, 1, '$')
+  if !exists('s:services_status')
+    return
+  endif
+  let hl = #{active: 'DiagnosticOk', inactive: 'DiagnosticUnnecessary', failed: 'DiagnosticError'}
   let ns = nvim_create_namespace('services')
+  call nvim_buf_clear_namespace(a:nr, ns, 0, -1)
+  let services = getbufline(a:nr, 1, '$')
   for idx in range(len(services))
-    let activity = s:services_status[services[idx]]
-    let extmarks = nvim_buf_get_extmarks(a:nr, ns, [idx, 0], [idx, 0], #{details: 1})
-    if !empty(extmarks)
-      call nvim_buf_del_extmark(a:nr, ns, extmarks[0][0])
-    endif
-    if activity == 'active'
-      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'DiagnosticOk'})
-    elseif activity == 'inactive'
-      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'DiagnosticUnnecessary'})
-    else
-      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: 'Normal'})
+    let activity = get(s:services_status, services[idx], '')
+    if has_key(hl, activity)
+      call nvim_buf_set_extmark(a:nr, ns, idx, 0, #{line_hl_group: hl[activity]})
     endif
   endfor
 endfunction
@@ -2546,9 +2553,21 @@ function! s:GetMergeRequestURL()
   " quit
 endfunction
 
+" Only the repos in s:GetTargets() come with a path to clone from.
+function! s:MergeRequestRepo(entry)
+  if !has_key(a:entry, "repo_full")
+    call init#Warn("Unknown repo %s, add it to s:GetTargets()!", a:entry["repo"])
+    return ''
+  endif
+  return a:entry["repo_full"]
+endfunction
+
 function! s:CheckoutMergeRequest()
   let entry = qutil#GetLineData()
-  let repo = entry["repo_full"]
+  let repo = s:MergeRequestRepo(entry)
+  if empty(repo)
+    return
+  endif
   call s:ForceUpdateRepo(repo, entry["branch"])
   quit
   exe "e " .. repo
@@ -2561,7 +2580,11 @@ endfunction
 
 function! s:ShowNotesMergeRequest()
   let entry = qutil#GetLineData()
-  call s:RequestGitlabNotes(#{repo: entry["repo_full"], branch: entry["branch"],
+  let repo = s:MergeRequestRepo(entry)
+  if empty(repo)
+    return
+  endif
+  call s:RequestGitlabNotes(#{repo: repo, branch: entry["branch"],
         \ url: entry["url"],
         \ base: printf("https://gitlab.com/api/v4/projects/%s/merge_requests/%s",
         \              entry["repo_id"], entry["mr_id"])})
@@ -2575,21 +2598,24 @@ endfunction
 
 function! s:WorktreeMergeRequest()
   let entry = qutil#GetLineData()
-  let repo = entry["repo_full"]
+  let repo = s:MergeRequestRepo(entry)
+  if empty(repo)
+    return
+  endif
   let branch = entry["branch"]
   let target_branch = entry["target_branch"]
 
 
   let git_dir = FugitiveExtractGitDir(repo)
-  call git#CloseWorktree()
+  call git#CloseWorktree(repo)
   call git#ExecuteOrThrow([git_dir, "fetch", "origin", branch])
 
   call git#TrackBranch("!", branch, git_dir)
-  call git#OpenWorktree(branch, repo, #{preview: 1, on_success: function("s:OnMergeRequestWorktree", [target_branch])})
+  call git#OpenWorktree(branch, repo, #{preview: 1, on_success: function("s:OnMergeRequestWorktree", [repo, target_branch])})
 endfunction
 
-function! s:OnMergeRequestWorktree(target_branch)
-  const path = git#WorktreePath()
+function! s:OnMergeRequestWorktree(repo, target_branch)
+  const path = git#WorktreePath(a:repo)
   exe "e " .. path
   only
   call init#SystemOrThrow(["git", "fetch", "origin", a:target_branch])
