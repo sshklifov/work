@@ -1113,7 +1113,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
   endif
   let cmds = ["StopServices", "DropClients", "UpdateDocker", "RunDocker", "Bb",
         \ "BuildImage", "ShowSdk", "BuildSdk", "InstallSdk", "ShowImage", "SaveImage",
-        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh",
+        \ "InstallImage", "RefreshImage", "RefreshSdk", "Refresh", "RefreshProd",
         \ "FactoryReset", "Enroll", "HostDebugSyms", "PlotTrace", "BarfPlotTrace",
         \ "OpenCV", "MemoryMonitor", "EnableCore", "CheckHealth"]
   return filter(cmds, 'v:val =~? a:ArgLead')
@@ -1187,7 +1187,8 @@ endfunction
 
 function s:BitbakeCommand(...)
   let opts = get(a:000, 0, #{})
-  let img_cmd = "bitbake rock-image"
+  let recipe = get(opts, "prod", v:false) ? "rock-prod-image" : "rock-image"
+  let img_cmd = "bitbake " .. recipe
   let sdk_cmd = img_cmd .. " -c populate_sdk"
 
   let multi = has_key(opts, "multi") && opts["multi"]
@@ -1294,13 +1295,19 @@ function! s:InstallImage(...)
   let cmds = []
   call add(cmds, printf("echo 'Found image from %s ago'", ago))
   call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
-  call add(cmds, printf("ssh %s 'mender install /%s/image.mender && reboot'", g:HOST, g:RSYNC_DIR))
-  call add(cmds, "echo 'Waiting for device to reboot...'")
-  call add(cmds, "ssh_wait_silent " .. g:HOST)
+  call add(cmds, printf("ssh %s 'mender install /%s/image.mender'", g:HOST, g:RSYNC_DIR))
   split
   enew
-  call init#Termopen(join(cmds, " && "))
+  call init#OnTermSuccess(join(cmds, " && "), expand("<SID>") .. "OnImageInstalled")
   startinsert
+endfunction
+
+" Only reached on success: init#OnTermSuccess wipes the terminal, a failure keeps
+" it up with mender's error. Reboot through s:Reboot so the wait refreshes the
+" host config once the device answers.
+function! s:OnImageInstalled()
+  echo "Rebooting device..."
+  call s:Reboot()
 endfunction
 
 function! s:FindSdCard()
@@ -1324,8 +1331,13 @@ function! s:RefreshSdk()
   call s:BuildSdk(function("s:InstallSdk"))
 endfunction
 
-function! s:Refresh()
-  call s:RunDocker(s:BitbakeCommand(#{multi: v:true}), function("s:InstallBoth"))
+function! s:Refresh(...)
+  let prod = get(a:000, 0, v:false)
+  call s:RunDocker(s:BitbakeCommand(#{multi: v:true, prod: prod}), function("s:InstallBoth"))
+endfunction
+
+function! s:RefreshProd()
+  call s:Refresh(v:true)
 endfunction
 
 function! s:InstallBoth()
@@ -2350,7 +2362,6 @@ function s:DetermineImage()
   silent only
 endfunction
 
-command -nargs=0 Artifact call s:DetermineImage()
 command -nargs=0 Mender call s:DetermineImage()
 
 function s:DetermineRsyncDir()
@@ -3020,6 +3031,119 @@ function! s:OnSelectedBuild()
 endfunction
 
 command! -nargs=0 Builds call s:ShowBuilds()
+
+" How many of the newest builds we ask for, so a stretch of failures can't make
+" us page the whole job history.
+let s:max_fetched_artifacts = 30
+
+" The jenkins project building images for the running device, and the image it
+" archives for it. Only the obsidian rockx boards for now.
+function! s:GetImageArtifact()
+  if stridx(g:DEVICE, "rockx") >= 0
+    return ["aidistro_obsidian", printf("rock-image-%s.mender", g:DEVICE)]
+  endif
+  return ["", ""]
+endfunction
+
+" Actions without the fields we asked for come back as {}, hence the defaults.
+function! s:GetBuildParam(build, name)
+  for action in a:build["actions"]
+    for param in get(action, "parameters", [])
+      if param["name"] == a:name
+        return param["value"]
+      endif
+    endfor
+  endfor
+  return ""
+endfunction
+
+function! s:GetS3Artifacts(build)
+  let names = []
+  for action in a:build["actions"]
+    call extend(names, map(get(action, "artifacts", []), "v:val.name"))
+  endfor
+  return names
+endfunction
+
+function! s:FetchImage()
+  let [project, name] = s:GetImageArtifact()
+  if empty(project)
+    return init#Warn("No jenkins image build for " .. g:DEVICE)
+  endif
+  let req = printf(
+        \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,actions[parameters[name,value],artifacts[name]]]{,%d}",
+        \ project, s:max_fetched_artifacts)
+  call work#OnJenkinsResponse(req, function("s:OnImageBuilds", [project, name]))
+endfunction
+
+" Builds come back newest first. Images live in S3, so they are not in the
+" build's `artifacts` but in the S3 action's -- and a build can succeed for only
+" the other machine in BUILD_MACHINE, never producing ours.
+function! s:OnImageBuilds(project, name, json)
+  for build in get(a:json, "builds", [])
+    if build["building"] || build["result"] != "SUCCESS"
+      continue
+    endif
+    if s:GetBuildParam(build, "branch") != "master"
+      continue
+    endif
+    if index(s:GetS3Artifacts(build), a:name) < 0
+      continue
+    endif
+    return s:DownloadArtifact(build, a:name)
+  endfor
+  call init#Warn(printf("No master build of %s in the last %d %s builds!",
+        \ a:name, s:max_fetched_artifacts, a:project))
+endfunction
+
+" A chunk holds several \r-separated redraws, so take the last percentage in it,
+" space-padded so half a number matches nothing. Whole percents only.
+function! s:OnFetchProgress(_0, data, _1)
+  for chunk in a:data
+    let percent = matchstr(chunk, '\s\zs[0-9]\+\ze\.\?[0-9]*%[^%]*$')
+    if !empty(percent) && percent .. "%" != g:statusline_dict['jenkins']
+      let g:statusline_dict['jenkins'] = percent .. "%"
+    endif
+  endfor
+endfunction
+
+function! s:OnFetchExit(path, _0, code, _1)
+  let g:statusline_dict['jenkins'] = ''
+  if a:code != 0
+    call delete(a:path .. ".part")
+    return init#Warn("Fetching artifact failed!")
+  endif
+  call rename(a:path .. ".part", a:path)
+  call s:InstallImage(a:path)
+endfunction
+
+" The build number in the filename keeps ~/Downloads apart and lets a refetch of
+" the same build skip a gigabyte of transfer.
+function! s:DownloadArtifact(build, name)
+  let path = expand(printf("~/Downloads/%d-%s", a:build["number"], a:name))
+  let ago = init#PrettyTime(localtime() - a:build["timestamp"] / 1000)
+  if filereadable(path)
+    echo printf("Already have build %d, from %s ago.", a:build["number"], ago)
+    return s:InstallImage(path)
+  endif
+  if !empty(get(g:statusline_dict, 'jenkins', ''))
+    return init#Warn("Already fetching an artifact!")
+  endif
+
+  echo printf("Fetching build %d, from %s ago...", a:build["number"], ago)
+  let url = printf("%ss3/download/%s", a:build["url"], a:name)
+  let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
+  " Progress goes to the statusline, so download in the background. --location
+  " follows the redirect to the presigned S3 url; --fail plus the .part name keep
+  " an error page or a half transfer from passing as a finished image.
+  let cmd = ["curl", "--fail", "--location", "--progress-bar",
+        \ "--user", credentials, "--output", path .. ".part", url]
+  let g:statusline_dict['jenkins'] = "0%"
+  call init#Jobstart(cmd, #{on_stderr: function("s:OnFetchProgress"),
+        \ on_exit: function("s:OnFetchExit", [path])})
+endfunction
+
+command! -nargs=0 Artifact call s:FetchImage()
 " }}}
 
 """"""""""""""""""""""""""""Jira"""""""""""""""""""""""""" {{{
@@ -3075,23 +3199,6 @@ endfunction
 
 command! -nargs=0 Issues call s:OnAssignedIssues(function("s:ShowUnresolved"))
 
-" TODO BUILD NUMBER! it is hard coded in the url
-" function! s:DownloadArtifact()
-"   let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
-"   let req = "https://jenkins.alcatraz.ai/job/aidistro_obsidian_release/256/s3/download/rock-prod-image-rockx-dm-r10.mender"
-"   let path = expand("~/Downloads/rock-prod-image-rockx-dm-r10.mender")
-"   let cmd = ["curl", "--silent", "-L", "-o", path, "-u", credentials, req]
-"   call init#OnJobExit(cmd, function("s:InstallImage", [path]))
-" endfunction
-
-" function! s:OnDownloadArtifact(path, code)
-"   if a:code != 0 || !filereadable(path)
-"     return init#Warn("Downloading artifact failed!")
-"   endif
-"   call s:InstallImage(a:path)
-" endfunction
-
-" command! -nargs=0 Test call s:DownloadArtifact()
 " }}}
 
 function! s:OnVimEnter()
