@@ -36,14 +36,9 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
   let repo = git#SourceRepo(FugitiveWorkTree())
-  return work#GetMakeCommandFor(fnamemodify(repo, ":t"))
-endfunction
-
-function! work#GetMakeCommandFor(repo)
-  if empty(a:repo)
+  if empty(repo)
     call init#Warn("Not inside a git tracked repo!")
   endif
-  let repo = a:repo
   
   let dir = FugitiveWorkTree()
   if empty(dir)
@@ -215,58 +210,6 @@ command! -nargs=* Packages call s:ListPackages(<q-args>)
 
 """"""""""""""""""""""""""""Host commands"""""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! s:GetJournalCmd(service_name)
-  let service_path = "/usr/lib/systemd/system/" .. a:service_name
-  let output = init#SystemOrThrow(["ssh", g:HOST, 'cat ' .. service_path])
-  let service_name = fnamemodify(service_path, ':t:r')
-  let m = matchstrlist(output, 'Description=\(.*\)', #{submatches: v:true})
-  if !exists("m[0].submatches[0]")
-    echo "Failed to parse description in systemd file!"
-    return
-  endif
-  let msg = "Started " .. m[0].submatches[0] .. "."
-  let cmd = printf('journalctl MESSAGE="%s" -r -o short-unix', msg)
-  let output = init#SystemOrThrow(["ssh", g:HOST, cmd])
-
-  if stridx(output[0], "No entries") < 0
-    let timestamp = split(output[0])[0]
-  else
-    let timestamp = 0
-  endif
-  let output = init#SystemOrThrow(["ssh", g:HOST, 'date --date="@' .. timestamp .. '" "+%F %T"'])
-  let since = output[0]
-  let cmd = printf('journalctl -u %s --since="%s"', service_name, since)
-  return cmd
-endfunction
-
-function! s:Journal(bang, service_name)
-  let cmd = s:GetJournalCmd(a:service_name)
-  if !empty(a:bang)
-    sp enew
-    call init#Termopen(["ssh", g:HOST, cmd .. " -f"])
-  else
-    let lines = systemlist(["ssh", g:HOST, cmd])
-    call init#CustomBottomBuffer('Journal ' .. a:service_name, lines)
-  endif
-endfunction
-
-function! s:JournalPriority(bang, args)
-  let prio = ["err", "warning", "info"]
-  call qutil#CreateOneShotQuickfix(prio, "Priorities", function("s:OnPriority", [a:bang, a:args]))
-endfunction
-
-function! s:OnPriority(bang, args, prio)
-  let cmd = s:GetJournalCmd(a:args)
-  let cmd = printf("%s -p %s", cmd, a:prio)
-  if !empty(a:bang)
-    sp enew
-    call init#Termopen(["ssh", g:HOST, cmd .. " -f"])
-  else
-    let lines = systemlist(["ssh", g:HOST, cmd])
-    call init#CustomBottomBuffer('Journal ' .. a:args, lines)
-  endif
-endfunction
-
 function! JournalCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
@@ -274,11 +217,6 @@ function! JournalCompl(ArgLead, CmdLine, CursorPos)
   let services = s:GetServices()
   return filter(services, 'stridx(v:val, a:ArgLead) >= 0')
 endfunction
-
-command! -nargs=1 -bang -complete=customlist,JournalCompl Journal call s:Journal("<bang>", <q-args>)
-command! -nargs=1 -bang -complete=customlist,JournalCompl JP call s:JournalPriority("<bang>", <q-args>)
-
-cabbr J Journal
 
 " -u expands into its own disjunctions, which collide with an explicit "+" and
 " silently collapse the match set to empty. Expand it by hand: same result as -u
@@ -655,7 +593,7 @@ endfunction
 
 function work#SyncOne(bang, dir, exe)
   if exists('s:services_status')
-    let systemd_name = s:GetServiceName(a:exe)
+    let systemd_name = get(s:GetServiceUnits(a:exe), 0, '')
     let status = get(s:services_status, systemd_name, "inactive")
     if a:bang != "!" && status != "inactive" && status != "failed"
       return init#Warn("Service %s is %s!", systemd_name, status)
@@ -719,17 +657,17 @@ endfunction
 
 function! s:GetApps()
   let apps = #{
-        \ rtsp-server: #{user: "rtsp-server", service: "rtsp-server.service"},
-        \ badge_and_face: #{user: "badge_and_face", service: "badge-and-face.service"},
-        \ qrcode-scanner: #{user: "rock-bootstrap", service:"qrcode-scanner.service"},
-        \ device-health: #{user: "device-health", service: "device-health.service"},
+        \ rtsp-server: #{user: "rtsp-server", services: ["rtsp-server.service", "rtsp-server-noauth.service", "rtsp-server.socket"]},
+        \ badge_and_face: #{user: "badge_and_face", services: ["badge-and-face.service"]},
+        \ qrcode-scanner: #{user: "rock-bootstrap", services: ["qrcode-scanner.service"]},
+        \ device-health: #{user: "device-health", services: ["device-health.service"]},
         \ }
   if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
-    let apps["bd-video"] = #{user: "rock-video", service: "bd-video.service"}
+    let apps["bd-video"] = #{user: "rock-video", services: ["bd-video.service"]}
   elseif stridx(g:DEVICE, "rockx") >= 0
-    let apps["obsidian-video"] = #{user: "rock-video", service: "obsidian-video.service"}
+    let apps["obsidian-video"] = #{user: "rock-video", services: ["obsidian-video.service"]}
   elseif stridx(g:DEVICE, "onyx") >= 0
-    let apps["rock-video"] = #{user: "rock-video", service: "rock-video.service"}
+    let apps["rock-video"] = #{user: "rock-video", services: ["rock-video.service"]}
   endif
   return apps
 endfunction
@@ -749,29 +687,57 @@ function! s:GetUserAndFlags(exe)
   return ['', '']
 endfunction
 
-function! s:GetServiceName(exe)
+" Every unit running the executable, main service first. Empty if unsupported.
+function! s:GetServiceUnits(exe)
   let key = fnamemodify(a:exe, ':t')
-  return init#Get(s:GetApps(), key, 'service', '')
+  return init#Get(s:GetApps(), key, 'services', [])
 endfunction
 
-function! s:RunAsService(exe)
-  let remote_path = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
-  let exe_name = fnamemodify(remote_path, ":t")
-  let systemd_name = s:GetServiceName(a:exe)
-  if empty(systemd_name)
-    return "Unsupported: " .. exe_name
+" Executables from the local build directory which map to a systemd unit.
+function! s:GetSystemdTargets()
+  return filter(s:GetSyncTargets(), '!empty(s:GetServiceUnits(v:val))')
+endfunction
+
+command! -nargs=? -complete=customlist,SystemdCompl Systemd
+      \ call s:GetSystemdTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Systemd', function('s:RunAsService'))
+cabbr Sysd Systemd
+
+function! SystemdCompl(ArgLead, CmdLine, CursorPos)
+  if a:CursorPos < len(a:CmdLine)
+    return []
   endif
+  return s:GetSystemdTargets()->qutil#FileCompletionPass(a:ArgLead)
+endfunction
+
+" Rebuild, sync and then install the executable over the one the units run.
+function! s:RunAsService(exe)
+  let units = s:GetServiceUnits(a:exe)
+  if empty(units)
+    return init#Warn("Unsupported: %s", fnamemodify(a:exe, ":t"))
+  endif
+  let dir = FugitiveFind(g:BUILD_TYPE)
+  let Restart = function('s:RestartService', [a:exe, units])
+  call qutil#Make(work#GetMakeCommand(), #{on_success: { -> s:RemoteSyncExes(dir, [a:exe], Restart)}})
+endfunction
+
+function! s:RestartService(exe, units)
+  let remote_path = printf("%s/%s/%s", g:RSYNC_DIR, g:BUILD_TYPE, a:exe)
+  let all = join(a:units)
   let cmds = []
-  call add(cmds, printf("echo Stopping %s...", systemd_name))
-  call add(cmds, "systemctl stop " .. systemd_name)
+  " Only some of the units are meant to run at a time, so remember which ones
+  " were up and bring back exactly those. Fall back to the main service.
+  call add(cmds, printf('active=""; for u in %s; do if systemctl is-active -q $u; then active="$active $u"; fi; done', all))
+  call add(cmds, printf('active=${active:-%s}', a:units[0]))
+  call add(cmds, printf('echo Stopping %s...', all))
+  call add(cmds, printf("systemctl stop %s", all))
   call add(cmds, printf("rsync -a --xattrs %s /usr/bin/", remote_path))
-  call add(cmds, printf("echo Starting %s...", systemd_name))
-  call add(cmds, "systemctl start " .. systemd_name)
+  call add(cmds, 'echo Starting$active...')
+  call add(cmds, "systemctl start $active")
+  call add(cmds, "journalctl -f -u " .. join(a:units, " -u "))
 
   sp
   enew
-  call init#OnTermSuccess(["ssh", g:HOST, join(cmds, ' && ')],
-        \ function('s:Journal', ['!', systemd_name]))
+  call init#Termopen(["ssh", g:HOST, join(cmds, ' && ')])
 endfunction
 
 function! s:DetermineConfig(host, Cb)
@@ -1003,17 +969,13 @@ function! s:InstallHostCommands()
   cabbr SSfs Ssfs
 
   nnoremap <silent> <leader>rb <cmd>Sync badge_and_face<CR>
-  nnoremap <silent> <leader>sb <cmd>call <SID>RunAsService("bin/badge_and_face")<CR>
   nnoremap <silent> <leader>rs <cmd>Sync rtsp-server<CR>
   if stridx(g:DEVICE, "onyx") >= 0
     nnoremap <silent> <leader>rv <cmd>Sync rock-video<CR>
-    nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("pipeline/rock-video")<CR>
   elseif stridx(g:DEVICE, "rockx") >= 0
     nnoremap <silent> <leader>rv <cmd>Sync obsidian-video<CR>
     nnoremap <silent> <leader>rf <cmd>Sync focus-tool<CR>
     nnoremap <silent> <leader>rq <cmd>Sync qrcode-scanner<CR>
-    nnoremap <silent> <leader>sv <cmd>call <SID>RunAsService("application/obsidian-video")<CR>
-    nnoremap <silent> <leader>ss <cmd>call <SID>RunAsService("application/rtsp-server")<CR>
   endif
   nnoremap <silent> <leader>re <cmd>call <SID>Resync()<CR>
   nnoremap <silent> <leader>sdk <cmd>call <SID>FakeSdk()<CR>
@@ -1158,10 +1120,7 @@ function! DoCompl(ArgLead, CmdLine, CursorPos)
 endfunction
 
 function s:GetServices()
-  let services = map(values(s:GetApps()), 'v:val.service')
-  call add(services, "rtsp-server-noauth.service")
-  call add(services, "rtsp-server.socket")
-  return services
+  return flattennew(map(values(s:GetApps()), 'v:val.services'))
 endfunction
 
 function! s:StopServices()
