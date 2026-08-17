@@ -1230,8 +1230,8 @@ function! s:FindSdk()
   return most_recent_file
 endfunction
 
-function! s:InstallSdk()
-  let most_recent_file = s:FindSdk()
+function! s:InstallSdk(...)
+  let most_recent_file = a:0 > 0 ? a:1 : s:FindSdk()
   let most_recent_timestamp = getftime(most_recent_file)
   let ago = init#PrettyTime(localtime() - most_recent_timestamp)
 
@@ -3035,65 +3035,111 @@ command! -nargs=0 Builds call s:ShowBuilds()
 " How many of the newest builds we ask for, so a stretch of failures can't make
 " us page the whole job history.
 let s:max_fetched_artifacts = 30
+" Master commits to look at. One push can carry a merge worth of commits and only
+" its tip gets built, so the newest built commit is rarely the tip.
+let s:max_master_commits = 10
 
-" The jenkins project building images for the running device, and the image it
-" archives for it. Only the obsidian rockx boards for now.
-function! s:GetImageArtifact()
-  if stridx(g:DEVICE, "rockx") >= 0
-    return ["aidistro_obsidian", printf("rock-image-%s.mender", g:DEVICE)]
+" What a nightly fetch is after: the jenkins project, a pattern for the artifact
+" of the running device and what installs the file. The sdk name carries the
+" version, so both are matched as patterns. Only the obsidian rockx boards for
+" now. The image job builds on every push, the sdk one only nightly.
+function! s:GetNightlyTarget(sdk)
+  if stridx(g:DEVICE, "rockx") < 0
+    return #{}
   endif
-  return ["", ""]
+  if a:sdk
+    return #{project: "aidistro_sdk_rockx", label: "sdk",
+          \ pattern: printf('.*%s.*toolchain.*\.sh$', g:DEVICE),
+          \ install: expand("<SID>") .. "InstallSdk",
+          \ executable: v:true}
+  endif
+  return #{project: "aidistro_obsidian", label: "image",
+        \ pattern: printf('^rock-image-%s\.mender$', g:DEVICE),
+        \ install: expand("<SID>") .. "InstallImage"}
 endfunction
 
 " Actions without the fields we asked for come back as {}, hence the defaults.
-function! s:GetBuildParam(build, name)
+function! s:GetBuildRevision(build)
   for action in a:build["actions"]
-    for param in get(action, "parameters", [])
-      if param["name"] == a:name
-        return param["value"]
+    if has_key(action, "lastBuiltRevision")
+      return action["lastBuiltRevision"]["SHA1"]
+    endif
+  endfor
+  return ""
+endfunction
+
+" Images and sdks alike go to S3, so they are not in the build's `artifacts` but in
+" the S3 action's, under a name that doubles as the download path. Sdk names carry
+" a directory, hence matching the tail.
+function! s:FindArtifact(build, pattern)
+  for action in a:build["actions"]
+    for artifact in get(action, "artifacts", [])
+      if fnamemodify(artifact["name"], ":t") =~# a:pattern
+        return artifact["name"]
       endif
     endfor
   endfor
   return ""
 endfunction
 
-function! s:GetS3Artifacts(build)
-  let names = []
-  for action in a:build["actions"]
-    call extend(names, map(get(action, "artifacts", []), "v:val.name"))
-  endfor
-  return names
+" What jenkins says a build built cannot be trusted to be master: someone can
+" build a months old revision at any time. So ask git what master is and look the
+" commits up instead.
+function! s:FetchNightly(sdk)
+  let target = s:GetNightlyTarget(a:sdk)
+  if empty(target)
+    return init#Warn("No nightly build for " .. g:DEVICE)
+  endif
+  echo "Fetching master in " .. g:AIDISTRO .. "..."
+  let cmd = ["git", "-C", g:AIDISTRO, "fetch", "origin", "master"]
+  call init#OnJobExit(cmd, expand("<SID>") .. "OnMasterFetched", target)
 endfunction
 
-function! s:FetchImage()
-  let [project, name] = s:GetImageArtifact()
-  if empty(project)
-    return init#Warn("No jenkins image build for " .. g:DEVICE)
+" FETCH_HEAD rather than origin/master: the fetch above is the only thing we can
+" be sure moved, local refs are the user's business.
+function! s:OnMasterFetched(target, code)
+  if a:code != 0
+    return init#Warn("Cannot fetch master in " .. g:AIDISTRO)
+  endif
+  let cmd = ["git", "-C", g:AIDISTRO, "rev-list",
+        \ printf("--max-count=%d", s:max_master_commits), "FETCH_HEAD"]
+  let commits = systemlist(cmd)
+  if v:shell_error || empty(commits)
+    return init#Warn("Cannot list master commits in " .. g:AIDISTRO)
   endif
   let req = printf(
-        \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,actions[parameters[name,value],artifacts[name]]]{,%d}",
-        \ project, s:max_fetched_artifacts)
-  call work#OnJenkinsResponse(req, function("s:OnImageBuilds", [project, name]))
+        \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,actions[lastBuiltRevision[SHA1],artifacts[name]]]{,%d}",
+        \ a:target.project, s:max_fetched_artifacts)
+  call work#OnJenkinsResponse(req, function("s:OnNightlyBuilds", [a:target, commits]))
 endfunction
 
-" Builds come back newest first. Images live in S3, so they are not in the
-" build's `artifacts` but in the S3 action's -- and a build can succeed for only
-" the other machine in BUILD_MACHINE, never producing ours.
-function! s:OnImageBuilds(project, name, json)
+" Builds come back newest first, so the first build of a revision wins. Images
+" live in S3, so they are not in the build's `artifacts` but in the S3 action's --
+" and a build can succeed for only the other machine in BUILD_MACHINE, never
+" producing ours.
+function! s:OnNightlyBuilds(target, commits, json)
+  let builds = #{}
   for build in get(a:json, "builds", [])
     if build["building"] || build["result"] != "SUCCESS"
       continue
     endif
-    if s:GetBuildParam(build, "branch") != "master"
-      continue
+    let artifact = s:FindArtifact(build, a:target.pattern)
+    let sha = s:GetBuildRevision(build)
+    if !empty(artifact) && !empty(sha) && !has_key(builds, sha)
+      let builds[sha] = #{build: build, artifact: artifact}
     endif
-    if index(s:GetS3Artifacts(build), a:name) < 0
-      continue
-    endif
-    return s:DownloadArtifact(build, a:name)
   endfor
-  call init#Warn(printf("No master build of %s in the last %d %s builds!",
-        \ a:name, s:max_fetched_artifacts, a:project))
+
+  " Walk master back from the tip: jenkins builds the tip of a push, so the
+  " commits that came in under it never had a build of their own.
+  for behind in range(len(a:commits))
+    if has_key(builds, a:commits[behind])
+      let hit = builds[a:commits[behind]]
+      return s:DownloadArtifact(a:target, hit.build, hit.artifact, behind)
+    endif
+  endfor
+  call init#Warn(printf("No %s artifact built from the last %d master commits!",
+        \ a:target.project, len(a:commits)))
 endfunction
 
 " A chunk holds several \r-separated redraws, so take the last percentage in it,
@@ -3107,31 +3153,48 @@ function! s:OnFetchProgress(_0, data, _1)
   endfor
 endfunction
 
-function! s:OnFetchExit(path, _0, code, _1)
+function! s:OnFetchExit(target, path, _0, code, _1)
   let g:statusline_dict['jenkins'] = ''
   if a:code != 0
     call delete(a:path .. ".part")
     return init#Warn("Fetching artifact failed!")
   endif
   call rename(a:path .. ".part", a:path)
-  call s:InstallImage(a:path)
+  " The sdk installer arrives as a plain file, and it is what runs itself.
+  if get(a:target, "executable", v:false)
+    call setfperm(a:path, "rwxr-xr-x")
+  endif
+  call function(a:target.install)(a:path)
 endfunction
 
 " The build number in the filename keeps ~/Downloads apart and lets a refetch of
 " the same build skip a gigabyte of transfer.
-function! s:DownloadArtifact(build, name)
-  let path = expand(printf("~/Downloads/%d-%s", a:build["number"], a:name))
-  let ago = init#PrettyTime(localtime() - a:build["timestamp"] / 1000)
+" Only what is missing: master down to, but not including, the commit it was built
+" off. Fugitive resolves the repo from the buffer, and 'G log' opens a window of
+" its own, so the edit leaves a directory listing behind for `only` to clear.
+function! s:ShowBuildLog(target, behind)
+  if a:behind == 0
+    echo printf("The %s is at the tip of master, nothing missing.", a:target.label)
+    return
+  endif
+  exe "e " .. g:AIDISTRO
+  exe printf("G log -n %d FETCH_HEAD", a:behind)
+  silent only
+  echo printf("Commits not part of the %s: %d", a:target.label, a:behind)
+endfunction
+
+function! s:DownloadArtifact(target, build, artifact, behind)
+  let path = expand(printf("~/Downloads/%d-%s",
+        \ a:build["number"], fnamemodify(a:artifact, ":t")))
+  call s:ShowBuildLog(a:target, a:behind)
   if filereadable(path)
-    echo printf("Already have build %d, from %s ago.", a:build["number"], ago)
-    return s:InstallImage(path)
+    return function(a:target.install)(path)
   endif
   if !empty(get(g:statusline_dict, 'jenkins', ''))
     return init#Warn("Already fetching an artifact!")
   endif
 
-  echo printf("Fetching build %d, from %s ago...", a:build["number"], ago)
-  let url = printf("%ss3/download/%s", a:build["url"], a:name)
+  let url = printf("%ss3/download/%s", a:build["url"], a:artifact)
   let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
   " Progress goes to the statusline, so download in the background. --location
   " follows the redirect to the presigned S3 url; --fail plus the .part name keep
@@ -3140,10 +3203,11 @@ function! s:DownloadArtifact(build, name)
         \ "--user", credentials, "--output", path .. ".part", url]
   let g:statusline_dict['jenkins'] = "0%"
   call init#Jobstart(cmd, #{on_stderr: function("s:OnFetchProgress"),
-        \ on_exit: function("s:OnFetchExit", [path])})
+        \ on_exit: function("s:OnFetchExit", [a:target, path])})
 endfunction
 
-command! -nargs=0 Artifact call s:FetchImage()
+command! -nargs=0 Nightly call s:FetchNightly(v:false)
+command! -nargs=0 NightlySdk call s:FetchNightly(v:true)
 " }}}
 
 """"""""""""""""""""""""""""Jira"""""""""""""""""""""""""" {{{
@@ -3174,30 +3238,57 @@ function! work#OnJiraResponse(query, data, cb)
   return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
 endfunction
 
-function! s:OnAssignedIssues(cb)
-  let q = "jql=assignee=currentUser() ORDER BY updated DESC"
+function! s:OnIssues(cb, all, filter)
+  if a:all && empty(a:filter)
+    return init#Warn("Refusing to list every issue, pass a filter!")
+  endif
+
+  let clauses = a:all ? [] : ["assignee=currentUser()"]
+  if empty(a:filter)
+    " Plain listing - hide the finished work. statusCategory covers Released,
+    " DONE, Duplicate and friends whatever a project calls them, and being part
+    " of the query it does not eat into the 100 issues jira hands back.
+    let clauses += ["statusCategory != Done"]
+  else
+    " A search is explicit, so it looks at every status - and "text" is the
+    " widest net jira offers, matching the summary, the description, the
+    " environment, the comments and every text custom field. A single word gets
+    " a trailing wildcard so fragments match too; a phrase is searched as typed.
+    let needle = escape(a:filter, '"\')
+    let needle ..= needle =~# '[ *?]' ? "" : "*"
+    let clauses += [printf('text ~ "%s"', needle)]
+  endif
+
+  let q = printf("jql=%s ORDER BY updated DESC", join(clauses, " AND "))
   call work#OnJiraResponse(q, ['fields=status,summary'], function("s:OnIssuesResponse", [a:cb]))
 endfunction
 
 function! s:OnIssuesResponse(cb, dict)
   let issues = a:dict["issues"]
   let items = map(issues, '#{id: v:val.key, title: v:val.fields.summary, status: v:val.fields.status.name}')
-  call function(a:cb)(items)
+  " One page is all we ask for, so say when the tail was cut off.
+  let title = get(a:dict, "isLast", v:true) ? "Issues" : printf("Issues (first %d)", len(items))
+  call function(a:cb)(items, title)
 endfunction
 
-function! s:ShowUnresolved(items)
-  let done = ["Won't fix", "Released", "Duplicate", "Tech limitation", "Can't Reproduce", "DONE"]
-  let items = filter(a:items, 'index(done, v:val.status) < 0')
-  let names = map(items, 'printf("%s [%s]: %s", v:val.id, v:val.status, v:val.title)')
-  call qutil#CreateCustomQuickfix(names, "Issues", function("s:OpenUnresolved"))
+function! s:ShowIssues(items, title)
+  let names = map(a:items, 'printf("%s [%s]: %s", v:val.id, v:val.status, v:val.title)')
+  call qutil#CreateCustomQuickfix(names, a:title, function("s:OpenIssue"))
 endfunction
 
-function! s:OpenUnresolved()
-  let issue = work#ExtractIssue(getline('.'))
+function! s:OpenIssue()
+  " Take the key the line starts with - every project has its own, while
+  " work#ExtractIssue only knows the SW-1234 shape our branches carry.
+  let issue = matchstr(getline('.'), '^[A-Z][A-Z0-9]*-[0-9]\+')
+  if empty(issue)
+    return init#Warn("No issue on this line!")
+  endif
   call work#OpenJira(issue)
 endfunction
 
-command! -nargs=0 Issues call s:OnAssignedIssues(function("s:ShowUnresolved"))
+" :Issues lists your unfinished issues, :Issues foo searches yours whatever
+" their status and :Issues! foo searches everybody's.
+command! -nargs=? -bang Issues call s:OnIssues(function("s:ShowIssues"), <bang>0, <q-args>)
 
 " }}}
 
