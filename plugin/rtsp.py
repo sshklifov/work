@@ -19,8 +19,14 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 PORTS = [8554, 554]  # 8554 = noauth, 554 = Digest auth
+
+# Never let a hung ssh block the scan; also prevents an interactive password
+# prompt from stalling forever.
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=1"]
 
 STREAMS = {
     "onyx": ["ircamera", "mircamera", "depthcamera", "mdepthcamera", "rgbcamera", "mrgbcamera"],
@@ -52,41 +58,57 @@ def port_open(ip, port):
         return False
 
 
-def ssh_check(host):
-    """Dies unless an SSH connection to host can be established."""
-    r = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=1", host, "true"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        die("SSH to %s failed: %s" % (host, r.stderr.strip() or "unreachable"))
+def complete_responses(buf):
+    """Number of fully received RTSP responses at the start of buf."""
+    n = pos = 0
+    while True:
+        end = buf.find(b"\r\n\r\n", pos)
+        if end < 0:
+            return n
+        m = re.search(rb"(?im)^Content-Length:[ \t]*(\d+)", buf[pos:end])
+        pos = end + 4 + (int(m.group(1)) if m else 0)
+        if pos > len(buf):
+            return n
+        n += 1
 
 
-def rtsp_exchange(ip, port, payload, timeout=3.0):
-    """Send payload over a fresh connection and return the full text response."""
-    chunks = []
+def rtsp_exchange(ip, port, payload, expected=1, timeout=3.0):
+    """Send payload over a fresh connection and return the text response.
+
+    Returns as soon as `expected` complete responses have arrived; the timeout
+    is only a fallback for servers that answer partially. Reading until the
+    peer closes would cost the full timeout on every exchange, since RTSP
+    servers keep the control connection open."""
+    buf = b""
     with socket.create_connection((ip, port), timeout=timeout) as s:
         s.sendall(payload.encode())
-        s.settimeout(timeout)
-        try:
-            while True:
-                data = s.recv(4096)
-                if not data:
-                    break
-                chunks.append(data)
-        except socket.timeout:
-            pass
-    return b"".join(chunks).decode(errors="replace")
+        deadline = time.monotonic() + timeout
+        while complete_responses(buf) < expected:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            s.settimeout(left)
+            try:
+                data = s.recv(65536)
+            except socket.timeout:
+                break
+            if not data:
+                break
+            buf += data
+    return buf.decode(errors="replace")
 
 
 def fetch_device_type(host):
     """Returns the device type from /var/lib/mender/device_type over SSH."""
     r = subprocess.run(
-        ["ssh", host, "cat /var/lib/mender/device_type"],
+        ["ssh"] + SSH_OPTS + [host, "cat /var/lib/mender/device_type"],
         capture_output=True, text=True,
     )
     if r.returncode != 0:
-        die("Could not read device type: %s" % (r.stderr.strip() or "failed"))
+        raise RuntimeError(
+            "Could not read device type from %s: %s"
+            % (host, r.stderr.strip() or "failed")
+        )
     # File format: device_type=<value>
     return r.stdout.strip().split("=", 1)[-1]
 
@@ -103,7 +125,9 @@ def fetch_credentials(host):
         "return [[]]"
     )
     remote = "redis-cli -n 1 -s /run/redis/redis.sock EVAL '%s' 0" % lua
-    r = subprocess.run(["ssh", host, remote], capture_output=True, text=True)
+    r = subprocess.run(
+        ["ssh"] + SSH_OPTS + [host, remote], capture_output=True, text=True
+    )
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "redis fetch failed")
     line = r.stdout.strip()
@@ -134,7 +158,7 @@ def build_batch(ip, port, streams, auth=None):
     return "".join(parts)
 
 
-def collect(ip, port, streams, host):
+def collect(ip, port, streams, get_creds):
     """Returns (found, raw) for one port. found is a list of (type, name, creds);
     creds is (user, pw) for 554 or None. Raises RuntimeError on failure."""
     opts = rtsp_exchange(ip, port, "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n", timeout=1)
@@ -144,10 +168,13 @@ def collect(ip, port, streams, host):
     auth = None
     creds = None
     if port == 554:
-        user, pw = fetch_credentials(host)
+        # Unauthenticated batch first, to obtain the Digest challenge; the
+        # credential fetch runs in parallel with it.
+        chal = rtsp_exchange(
+            ip, port, build_batch(ip, port, streams), expected=len(streams)
+        )
+        user, pw = get_creds()
         creds = (user, pw)
-        # Unauthenticated batch first, to obtain the Digest challenge.
-        chal = rtsp_exchange(ip, port, build_batch(ip, port, streams))
         realm = re.search(r'realm="([^"]*)"', chal)
         nonce = re.search(r'nonce="([^"]*)"', chal)
         if not nonce:
@@ -159,7 +186,9 @@ def collect(ip, port, streams, host):
             "ha1": md5("%s:%s:%s" % (user, realm.group(1) if realm else "", pw)),
         }
 
-    raw = rtsp_exchange(ip, port, build_batch(ip, port, streams, auth))
+    raw = rtsp_exchange(
+        ip, port, build_batch(ip, port, streams, auth), expected=len(streams)
+    )
 
     # Split into individual RTSP responses and parse each on its own, so a
     # stream with extra/missing SDP lines can't desync the rest of the batch.
@@ -200,21 +229,35 @@ def main():
     args = ap.parse_args()
 
     host = args.host or "root@" + args.ip
-    ssh_check(host)
 
-    device = args.device or fetch_device_type(host)
-    streams = device_streams(device)
+    # Everything below overlaps: the two port probes, the SSH round-trips and
+    # the per-port RTSP scans all run concurrently.
+    pool = ThreadPoolExecutor(max_workers=len(PORTS) + 2)
+    probes = {p: pool.submit(port_open, args.ip, p) for p in PORTS}
+    dev_fut = None if args.device else pool.submit(fetch_device_type, host)
 
-    open_ports = [p for p in PORTS if port_open(args.ip, p)]
+    open_ports = [p for p in PORTS if probes[p].result()]
     if not open_ports:
         die("Neither 8554 nor 554 port are open!")
+    cred_fut = pool.submit(fetch_credentials, host) if 554 in open_ports else None
+
+    try:
+        device = args.device or dev_fut.result()
+    except RuntimeError as e:
+        die(str(e))
+    streams = device_streams(device)
+
+    scans = {
+        p: pool.submit(collect, args.ip, p, streams, lambda: cred_fut.result())
+        for p in open_ports
+    }
 
     all_found = []
     raw_all = []
     errors = []
     for port in open_ports:
         try:
-            found, raw = collect(args.ip, port, streams, host)
+            found, raw = scans[port].result()
         except (RuntimeError, OSError) as e:
             errors.append("port %d: %s" % (port, e))
             continue
