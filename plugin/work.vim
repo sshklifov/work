@@ -3233,62 +3233,105 @@ function! work#OnJiraResponse(query, data, cb)
     let cmd += ["--data", d]
   endfor
 
-  let url = "https://alcatrazai.atlassian.net/rest/api/3/search/jql"
+  " v2 hands text fields over as wiki markup, v3 as a tree of ADF json.
+  let url = "https://alcatrazai.atlassian.net/rest/api/2/search/jql"
   call add(cmd, url)
   return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
 endfunction
 
-function! s:OnIssues(cb, all, filter)
-  if a:all && empty(a:filter)
-    return init#Warn("Refusing to list every issue, pass a filter!")
-  endif
+" Commenting has no field of its own, but autowatch makes you a watcher of it.
+function! s:TouchedByMe()
+  let fields = ["assignee = currentUser()", "assignee WAS currentUser()",
+        \ "reporter = currentUser()", "creator = currentUser()",
+        \ "watcher = currentUser()", "voter = currentUser()",
+        \ "worklogAuthor = currentUser()"]
+  return printf("(%s)", join(fields, " OR "))
+endfunction
 
-  let clauses = a:all ? [] : ["assignee=currentUser()"]
-  if empty(a:filter)
-    " Plain listing - hide the finished work. statusCategory covers Released,
-    " DONE, Duplicate and friends whatever a project calls them, and being part
-    " of the query it does not eat into the 100 issues jira hands back.
-    let clauses += ["statusCategory != Done"]
-  else
-    " A search is explicit, so it looks at every status - and "text" is the
-    " widest net jira offers, matching the summary, the description, the
-    " environment, the comments and every text custom field. A single word gets
-    " a trailing wildcard so fragments match too; a phrase is searched as typed.
+function! s:OnIssues(cb, filter)
+  " statusCategory covers Released, DONE, Duplicate and friends.
+  let clauses = [s:TouchedByMe(), "statusCategory != Done"]
+  if !empty(a:filter)
+    " text is the widest net jira offers. A lone word gets a trailing wildcard.
     let needle = escape(a:filter, '"\')
     let needle ..= needle =~# '[ *?]' ? "" : "*"
     let clauses += [printf('text ~ "%s"', needle)]
   endif
 
   let q = printf("jql=%s ORDER BY updated DESC", join(clauses, " AND "))
-  call work#OnJiraResponse(q, ['fields=status,summary'], function("s:OnIssuesResponse", [a:cb]))
+  " renderedFields carries the description as html, which converts to markdown.
+  call work#OnJiraResponse(q, ['fields=status,summary,description', 'expand=renderedFields'],
+        \ function("s:OnIssuesResponse", [a:cb]))
 endfunction
 
 function! s:OnIssuesResponse(cb, dict)
   let issues = a:dict["issues"]
-  let items = map(issues, '#{id: v:val.key, title: v:val.fields.summary, status: v:val.fields.status.name}')
+  let items = map(issues, '#{id: v:val.key, title: v:val.fields.summary,
+        \ status: v:val.fields.status.name, body: v:val.fields.description,
+        \ html: init#Get(v:val, "renderedFields", "description", "")}')
   " One page is all we ask for, so say when the tail was cut off.
   let title = get(a:dict, "isLast", v:true) ? "Issues" : printf("Issues (first %d)", len(items))
   call function(a:cb)(items, title)
 endfunction
 
+" A native quickfix over jira://KEY buffers: <CR> reads the description into the
+" window above and the list stays where it is. The issue rides along in the
+" entry's user_data, so the buffer has everything it needs to fill itself.
 function! s:ShowIssues(items, title)
-  let names = map(a:items, 'printf("%s [%s]: %s", v:val.id, v:val.status, v:val.title)')
-  call qutil#CreateCustomQuickfix(names, a:title, function("s:OpenIssue"))
+  let entries = map(copy(a:items), '#{filename: "jira://" .. v:val.id, lnum: 1,
+        \ text: printf("[%s] %s", v:val.status, v:val.title), user_data: v:val}')
+  call qutil#SetQuickfix(entries, a:title)
 endfunction
 
-function! s:OpenIssue()
-  " Take the key the line starts with - every project has its own, while
-  " work#ExtractIssue only knows the SW-1234 shape our branches carry.
-  let issue = matchstr(getline('.'), '^[A-Z][A-Z0-9]*-[0-9]\+')
+augroup JiraIssue
+  autocmd!
+  autocmd BufReadCmd jira://* call s:ReadIssue()
+augroup END
+
+" Jira writes descriptions in its own wiki markup, which nothing highlights, so
+" the html it renders goes through html2text to come back as markdown.
+function! s:ToMarkdown(html)
+  let script = join(["import html2text, sys",
+        \ "h = html2text.HTML2Text()",
+        \ "h.body_width = 120",
+        \ "h.ignore_images = True",
+        \ "h.unicode_snob = True",
+        \ "sys.stdout.write(h.handle(sys.stdin.read()))"], "\n")
+  let lines = systemlist(["python3", "-c", script], a:html)
+  return v:shell_error ? [] : lines
+endfunction
+
+function! s:ReadIssue()
+  setlocal buftype=nofile bufhidden=hide noswapfile modifiable
+  " html2text reflows prose only, so wrap the long lines pasted into code blocks
+  " on screen rather than rewriting them.
+  setlocal wrap linebreak breakindent
+  let entries = filter(getqflist(), 'v:val.bufnr == bufnr()')
+  let issue = empty(entries) ? #{} : get(entries[0], "user_data", #{})
   if empty(issue)
-    return init#Warn("No issue on this line!")
+    call setline(1, printf("Run :Issues to load %s.", expand("<afile>")))
+    setlocal nomodified nomodifiable
+    return
   endif
-  call work#OpenJira(issue)
+
+  let markdown = s:ToMarkdown(get(issue, "html", ""))
+  if !empty(markdown)
+    let lines = markdown
+  else
+    " Nothing rendered or no html2text around: the raw wiki markup will do.
+    let body = type(issue.body) == v:t_string ? substitute(issue.body, "\r", "", "g") : "No description."
+    let lines = split(body, "\n", v:true)
+  endif
+  call setline(1, [printf("# %s [%s]: %s", issue.id, issue.status, issue.title),
+        \ "https://alcatrazai.atlassian.net/browse/" .. issue.id, ""] + lines)
+  if !empty(markdown)
+    setlocal filetype=markdown
+  endif
+  setlocal nomodified nomodifiable
 endfunction
 
-" :Issues lists your unfinished issues, :Issues foo searches yours whatever
-" their status and :Issues! foo searches everybody's.
-command! -nargs=? -bang Issues call s:OnIssues(function("s:ShowIssues"), <bang>0, <q-args>)
+" Every unfinished issue you touched, filtered down by an argument.
+command! -nargs=? Issues call s:OnIssues(function("s:ShowIssues"), <q-args>)
 
 " }}}
 
