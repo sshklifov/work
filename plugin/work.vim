@@ -3249,11 +3249,14 @@ function! s:TouchedByMe()
   return printf("(%s)", join(fields, " OR "))
 endfunction
 
-function! s:OnIssues(cb, filter)
-  " statusCategory covers Released, DONE, Duplicate and friends.
-  let clauses = [s:TouchedByMe(), "statusCategory != Done"]
-  if !empty(a:filter)
-    " text is the widest net jira offers. A lone word gets a trailing wildcard.
+function! s:RequestIssues(filter)
+  let clauses = [s:TouchedByMe()]
+  if empty(a:filter)
+    " statusCategory covers Released, DONE, Duplicate and friends.
+    let clauses += ["statusCategory != Done"]
+  else
+    " A search is explicit, so it reaches the finished work too. text is the
+    " widest net jira offers. A lone word gets a trailing wildcard.
     let needle = escape(a:filter, '"\')
     let needle ..= needle =~# '[ *?]' ? "" : "*"
     let clauses += [printf('text ~ "%s"', needle)]
@@ -3262,36 +3265,27 @@ function! s:OnIssues(cb, filter)
   let q = printf("jql=%s ORDER BY updated DESC", join(clauses, " AND "))
   " renderedFields carries the description as html, which converts to markdown.
   call work#OnJiraResponse(q, ['fields=status,summary,description', 'expand=renderedFields'],
-        \ function("s:OnIssuesResponse", [a:cb]))
+        \ function("s:ShowIssues"))
 endfunction
 
-function! s:OnIssuesResponse(cb, dict)
-  let issues = a:dict["issues"]
-  let items = map(issues, '#{id: v:val.key, title: v:val.fields.summary,
+function! s:ShowIssues(dict)
+  let items = map(copy(a:dict["issues"]), '#{id: v:val.key, title: v:val.fields.summary,
         \ status: v:val.fields.status.name, body: v:val.fields.description,
         \ html: init#Get(v:val, "renderedFields", "description", "")}')
+  let entries = map(copy(items), '#{key: v:val.id, data: v:val,
+        \ text: printf("[%s] %s", v:val.status, v:val.title)}')
   " One page is all we ask for, so say when the tail was cut off.
   let title = get(a:dict, "isLast", v:true) ? "Issues" : printf("Issues (first %d)", len(items))
-  call function(a:cb)(items, title)
+  call qutil#SetLazyQuickfix(entries, title, "jira", function("s:RenderIssue"))
 endfunction
-
-" A native quickfix over jira://KEY buffers: <CR> reads the description into the
-" window above and the list stays where it is. The issue rides along in the
-" entry's user_data, so the buffer has everything it needs to fill itself.
-function! s:ShowIssues(items, title)
-  let entries = map(copy(a:items), '#{filename: "jira://" .. v:val.id, lnum: 1,
-        \ text: printf("[%s] %s", v:val.status, v:val.title), user_data: v:val}')
-  call qutil#SetQuickfix(entries, a:title)
-endfunction
-
-augroup JiraIssue
-  autocmd!
-  autocmd BufReadCmd jira://* call s:ReadIssue()
-augroup END
 
 " Jira writes descriptions in its own wiki markup, which nothing highlights, so
 " the html it renders goes through html2text to come back as markdown.
 function! s:ToMarkdown(html)
+  if empty(a:html)
+    " html2text answers even nothing with a couple of newlines.
+    return []
+  endif
   let script = join(["import html2text, sys",
         \ "h = html2text.HTML2Text()",
         \ "h.body_width = 120",
@@ -3302,37 +3296,25 @@ function! s:ToMarkdown(html)
   return v:shell_error ? [] : lines
 endfunction
 
-function! s:ReadIssue()
-  setlocal buftype=nofile bufhidden=hide noswapfile modifiable
+function! s:RenderIssue(name, issue)
   " html2text reflows prose only, so wrap the long lines pasted into code blocks
   " on screen rather than rewriting them.
   setlocal wrap linebreak breakindent
-  let entries = filter(getqflist(), 'v:val.bufnr == bufnr()')
-  let issue = empty(entries) ? #{} : get(entries[0], "user_data", #{})
-  if empty(issue)
-    call setline(1, printf("Run :Issues to load %s.", expand("<afile>")))
-    setlocal nomodified nomodifiable
-    return
-  endif
-
-  let markdown = s:ToMarkdown(get(issue, "html", ""))
+  let markdown = s:ToMarkdown(get(a:issue, "html", ""))
   if !empty(markdown)
     let lines = markdown
+    setlocal filetype=markdown
   else
     " Nothing rendered or no html2text around: the raw wiki markup will do.
-    let body = type(issue.body) == v:t_string ? substitute(issue.body, "\r", "", "g") : "No description."
+    let body = type(a:issue.body) == v:t_string ? substitute(a:issue.body, "\r", "", "g") : "No description."
     let lines = split(body, "\n", v:true)
   endif
-  call setline(1, [printf("# %s [%s]: %s", issue.id, issue.status, issue.title),
-        \ "https://alcatrazai.atlassian.net/browse/" .. issue.id, ""] + lines)
-  if !empty(markdown)
-    setlocal filetype=markdown
-  endif
-  setlocal nomodified nomodifiable
+  return [printf("# %s [%s]: %s", a:issue.id, a:issue.status, a:issue.title),
+        \ "https://alcatrazai.atlassian.net/browse/" .. a:issue.id, ""] + lines
 endfunction
 
 " Every unfinished issue you touched, filtered down by an argument.
-command! -nargs=? Issues call s:OnIssues(function("s:ShowIssues"), <q-args>)
+command! -nargs=? Issues call s:RequestIssues(<q-args>)
 
 " }}}
 
