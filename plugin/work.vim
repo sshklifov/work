@@ -2779,23 +2779,24 @@ function! s:ShowGitlabThread()
   redraw
 
   let width = min([100, &columns - 4])
+  " Bodies are markdown, so they keep their own line breaks and the filetype does
+  " the highlighting. Headers are markdown too: extmarks would win over syntax.
   let lines = []
   for note in thread.notes
     if !empty(lines)
-      call add(lines, [["", "Normal"]])
+      call add(lines, "")
     endif
-    call add(lines, [[note["author"]["username"], "Title"],
-          \ ["  " .. substitute(note["created_at"], 'T\(\d\+:\d\+\).*', ' \1 UTC', ""), "Comment"]])
-    for line in s:WrapBody(s:FlattenBody(note["body"]), width - 2)
-      call add(lines, [[line, "Normal"]])
+    let when = substitute(note["created_at"], 'T\(\d\+:\d\+\).*', ' \1 UTC', "")
+    call add(lines, printf("### %s %s", note["author"]["username"], when))
+    for line in split(substitute(note["body"], "\r", "", "g"), "\n")
+      call extend(lines, s:WrapBody(line, width - 2))
     endfor
   endfor
 
   let nr = nvim_create_buf(v:false, v:true)
   call setbufvar(nr, "&bufhidden", "wipe")
-  for chunks in lines
-    call init#AppendChunksAtEnd(nr, chunks)
-  endfor
+  call nvim_buf_set_lines(nr, 0, -1, v:true, lines)
+  call setbufvar(nr, "&filetype", "markdown")
   call setbufvar(nr, "&modifiable", v:false)
 
   let win = nvim_open_win(nr, v:false, #{relative: "cursor", row: 1, col: 0, anchor: "NW",
