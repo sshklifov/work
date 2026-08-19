@@ -2943,10 +2943,14 @@ else
   let g:jenkins_token = ""
 endif
 
-function! work#OnJenkinsResponse(req, cb)
+" Argv, never a shell string: the token would show up in the process list.
+function! s:JenkinsCurl(req)
   let credentials = printf("%s:%s", g:alcatraz_ai_user, g:jenkins_token)
-  let cmd = ["curl", "--silent", "--globoff", "-u", credentials, a:req]
-  return init#OnJobOutput(cmd, function("s:DecodeJsonResponse", [a:cb]))
+  return ["curl", "--silent", "--globoff", "-u", credentials, a:req]
+endfunction
+
+function! work#OnJenkinsResponse(req, cb)
+  return init#OnJobOutput(s:JenkinsCurl(a:req), function("s:DecodeJsonResponse", [a:cb]))
 endfunction
 
 function s:ShowBuilds()
@@ -2954,7 +2958,8 @@ function s:ShowBuilds()
   let ns = "jenkins_builds"
   for job in jobs
     let req = printf(
-          \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,actions[causes[userId]]]{,100}",
+          \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,"
+          \ .. "actions[causes[userId],parameters[name,value],lastBuiltRevision[branch[name]]]]{,100}",
           \ job)
     let Cb = init#JoinCallbacks(ns, job, function("s:OnBuildsResponse"), len(jobs))
     call work#OnJenkinsResponse(req, Cb)
@@ -2986,6 +2991,25 @@ function! s:FindUserId(json)
   return ""
 endfunction
 
+" What was checked out, not what was asked for: the release job leaves its branch
+" parameter unexpanded, so that one is only good as a fallback.
+function! s:FindBranch(build)
+  for action in a:build["actions"]
+    let branch = init#Get(action, "lastBuiltRevision", "branch", 0, "name", "")
+    if !empty(branch)
+      return substitute(branch, '^\%(refs/remotes/\)\?origin/', "", "")
+    endif
+  endfor
+  for action in a:build["actions"]
+    for param in get(action, "parameters", [])
+      if param["name"] == "branch" && param["value"] !~# '^\${'
+        return param["value"]
+      endif
+    endfor
+  endfor
+  return ""
+endfunction
+
 function! s:OnBuildsResponse(response_list)
   let items = []
   for [job, json] in a:response_list
@@ -2995,40 +3019,32 @@ function! s:OnBuildsResponse(response_list)
         continue
       endif
       let timestamp = build["timestamp"] / 1000
-      let today = strftime("%Y-%m-%d", timestamp) == strftime("%Y-%m-%d")
-      let seconds = localtime() - timestamp
-      if today
-        let pretty_time = init#PrettyTime(seconds) .. " ago"
-      else
-        let pretty_time = strftime("%Y-%m-%d %H:%M:%S", timestamp)
-      endif
-      let name = printf("%s %s [%s]: %s", job, build["number"], build["result"], pretty_time)
-      if build["building"]
-        let hl = "DiagnosticUnnecessary"
-      elseif build["result"] == "FAILURE"
-        let hl = "DiagnosticError"
-      elseif build["result"] == "SUCCESS"
-        let hl = "DiagnosticOk"
-      else
-        let hl = "Normal"
-      endif
-      call add(items, #{name: name, timestamp: timestamp, url: build["url"], hl: hl})
+      " A running build has no result yet, so the flag names its state.
+      let status = build["building"] ? "BUILDING" : build["result"]
+      call add(items, #{job: job, number: build["number"], status: status,
+            \ branch: s:FindBranch(build), timestamp: timestamp,
+            \ when: init#PrettyDate(timestamp), url: build["url"]})
     endfor
   endfor
   call sort(items, function("s:CompareTimestamps"))
   call reverse(items)
-  let names = map(copy(items), "v:val.name")
-  let nr = qutil#CreateCustomQuickfix(names, "Builds", function("s:OnSelectedBuild"))
-  call qutil#SetLineData(nr, map(copy(items), "v:val.url"))
-  let ns = nvim_create_namespace("builds")
-  for idx in range(len(items))
-    call nvim_buf_set_extmark(nr, ns, idx, 0, #{line_hl_group: items[idx]["hl"]})
-  endfor
+  " Columns are not worth padding: the quickfix leaves the entry names ragged, so
+  " nothing after them lines up anyway.
+  let entries = map(copy(items), '#{key: printf("%s/%s", v:val.job, v:val.number), data: v:val,
+        \ text: printf("[%s]%s: %s", v:val.status,
+        \              empty(v:val.branch) ? "" : " " .. v:val.branch, v:val.when)}')
+  call qutil#SetLazyQuickfix(entries, "Builds", "jenkins", function("s:RenderBuild"))
 endfunction
 
-function! s:OnSelectedBuild()
-  let url = qutil#GetLineData()
-  call init#ToClipboard(url)
+" The whole console log: a couple of megabytes an image build, which is a second
+" over the wire, and asking for only its tail costs about as much.
+function! s:RenderBuild(name, build)
+  let log = systemlist(s:JenkinsCurl(a:build.url .. "consoleText"))
+  if v:shell_error
+    let log = ["Could not fetch the log:"] + log
+  endif
+  return [printf("# %s %s (%s) [%s]: %s", a:build.job, a:build.number, a:build.branch,
+        \ a:build.status, a:build.when), a:build.url, ""] + log
 endfunction
 
 command! -nargs=0 Builds call s:ShowBuilds()
