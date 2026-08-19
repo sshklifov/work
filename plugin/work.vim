@@ -336,12 +336,37 @@ endfunction
 command! -nargs=* -bang -complete=customlist,JournalCompl Boot call s:ChooseBootLogs("<bang>", <f-args>)
 command! -nargs=* -bang -complete=customlist,JournalCompl Uptime call s:ChooseBootLogs("<bang>", <f-args>)
 
-function! s:RemoteHistoryFile()
+function! s:HistoryDir()
   let dir = stdpath('state') .. "/history"
   if !isdirectory(dir)
     call mkdir(dir, "p")
   endif
-  return printf("%s/%s.bash_history", dir, g:DEVICE)
+  return dir
+endfunction
+
+function! s:RemoteHistoryFile()
+  return printf("%s/%s.bash_history", s:HistoryDir(), g:DEVICE)
+endfunction
+
+" Newest first, this device's commands ahead of the other devices'.
+function! s:AllHistoryCommands()
+  let current = s:RemoteHistoryFile()
+  let files = glob(s:HistoryDir() .. "/*.bash_history", 0, 1)
+  call filter(files, "v:val !=# current")
+  let seen = {}
+  let cmds = []
+  for file in [current] + files
+    if !filereadable(file)
+      continue
+    endif
+    for line in reverse(readfile(file))
+      if !empty(line) && !has_key(seen, line)
+        let seen[line] = 1
+        call add(cmds, line)
+      endif
+    endfor
+  endfor
+  return cmds
 endfunction
 
 function! s:SyncRemoteHistory()
@@ -371,9 +396,8 @@ function! s:OpenTerminal(arg)
   endif
 
   call s:SyncRemoteHistory()
-  let cmds = readfile(s:RemoteHistoryFile())
+  let cmds = s:AllHistoryCommands()
 
-  call reverse(cmds)
   call filter(cmds, "stridx(v:val, a:arg) >= 0")
   let label = 'Remote command'
   call qutil#CreateCustomQuickfix(cmds, label, function("s:ExecuteCommand"))
