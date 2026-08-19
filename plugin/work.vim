@@ -2459,7 +2459,8 @@ function! s:DecodeJsonResponse(cb, output)
     catch
       return
     endtry
-    if type(dict) != v:t_dict
+    " Gitlab answers its list endpoints with a json array.
+    if type(dict) != v:t_dict && type(dict) != v:t_list
       return
     endif
     call function(a:cb)(dict)
