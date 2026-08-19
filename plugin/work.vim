@@ -2428,7 +2428,16 @@ endfunction
 function! s:DecodeJsonResponse(cb, output)
   call assert_true(len(a:output) <= 1)
   if len(a:output) >= 1
-    let dict = empty(a:output[0]) ? #{} : json_decode(a:output[0])
+    " Anything but json means the request never reached what it was after: an
+    " expired token answers with a login page. Nothing to hand over.
+    try
+      let dict = empty(a:output[0]) ? #{} : json_decode(a:output[0])
+    catch
+      return
+    endtry
+    if type(dict) != v:t_dict
+      return
+    endif
     call function(a:cb)(dict)
   endif
 endfunction
@@ -2953,16 +2962,20 @@ function! work#OnJenkinsResponse(req, cb)
   return init#OnJobOutput(s:JenkinsCurl(a:req), function("s:DecodeJsonResponse", [a:cb]))
 endfunction
 
+let s:jenkins_jobs = ["aidistro_p1", "aidistro_obsidian", "aidistro_obsidian_release"]
+
+function s:BuildsRequest(job)
+  return printf(
+        \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,duration,building,url,"
+        \ .. "actions[causes[userId],parameters[name,value],lastBuiltRevision[branch[name]]]]{,100}",
+        \ a:job)
+endfunction
+
 function s:ShowBuilds()
-  let jobs = ["aidistro_p1", "aidistro_obsidian", "aidistro_obsidian_release"]
   let ns = "jenkins_builds"
-  for job in jobs
-    let req = printf(
-          \ "https://jenkins.alcatraz.ai/job/%s/api/json?tree=builds[number,result,timestamp,building,url,"
-          \ .. "actions[causes[userId],parameters[name,value],lastBuiltRevision[branch[name]]]]{,100}",
-          \ job)
-    let Cb = init#JoinCallbacks(ns, job, function("s:OnBuildsResponse"), len(jobs))
-    call work#OnJenkinsResponse(req, Cb)
+  for job in s:jenkins_jobs
+    let Cb = init#JoinCallbacks(ns, job, function("s:OnBuildsResponse"), len(s:jenkins_jobs))
+    call work#OnJenkinsResponse(s:BuildsRequest(job), Cb)
   endfor
 endfunction
 
@@ -3013,7 +3026,8 @@ endfunction
 function! s:OnBuildsResponse(response_list)
   let items = []
   for [job, json] in a:response_list
-    for build in json["builds"]
+    " A jenkins that is down answers with nothing, hence the default.
+    for build in get(json, "builds", [])
       let user = s:FindUserId(build)
       if user != g:alcatraz_ai_user
         continue
@@ -3048,6 +3062,65 @@ function! s:RenderBuild(name, build)
 endfunction
 
 command! -nargs=0 Builds call s:ShowBuilds()
+
+" Your newest build in each job, as of the last poll. Nothing here remembers what
+" a build used to be doing: when it ended is jenkins' own answer, so every vim
+" tells you the same thing no matter when it started.
+let s:build_status = #{}
+let g:builds_poll_secs = get(g:, "builds_poll_secs", 60)
+let g:builds_notice_secs = get(g:, "builds_notice_secs", 4 * 60 * 60)
+
+function s:PollBuilds(...)
+  for job in s:jenkins_jobs
+    call work#OnJenkinsResponse(s:BuildsRequest(job), function("s:OnPolledBuilds", [job]))
+  endfor
+endfunction
+
+" One job's answer on its own: nothing here needs the other two, so there is no
+" aggregation to keep in step. Builds come newest first.
+function! s:OnPolledBuilds(job, json)
+  let latest = #{}
+  for build in get(a:json, "builds", [])
+    if s:FindUserId(build) != g:alcatraz_ai_user
+      continue
+    endif
+    let latest = #{status: build["building"] ? "BUILDING" : build["result"],
+          \ timestamp: build["timestamp"], duration: build["duration"],
+          \ label: printf("%s#%s", substitute(a:job, '^aidistro_', "", ""), build["number"])}
+    break
+  endfor
+
+  if get(s:build_status, a:job, #{}) == latest
+    return
+  endif
+  let s:build_status[a:job] = latest
+  redrawstatus
+endfunction
+
+" Only the newest build, and only while it runs or is fresh enough to still be news.
+function! work#JenkinsStatusLine()
+  let builds = filter(values(copy(s:build_status)), '!empty(v:val)')
+  " A build still running beats a newer one that is already over.
+  let running = filter(copy(builds), 'v:val.status == "BUILDING"')
+  let builds = empty(running) ? builds : running
+  if empty(builds)
+    return ""
+  endif
+
+  let build = sort(builds, {lhs, rhs -> rhs.timestamp - lhs.timestamp})[0]
+  " The colour is the whole message: dim while it runs, then green or red.
+  if build.status == "BUILDING"
+    let hl = "DiagnosticUnnecessary"
+  else
+    " Jenkins says when it ended, so the news keeps for the same four hours in
+    " every vim, however long ago that one was started.
+    if localtime() - (build.timestamp + build.duration) / 1000 >= g:builds_notice_secs
+      return ""
+    endif
+    let hl = build.status == "SUCCESS" ? "DiagnosticOk" : "DiagnosticError"
+  endif
+  return printf("%%#%s#(%s)%%#StatusLine#", hl, build.label)
+endfunction
 
 " How many of the newest builds we ask for, so a stretch of failures can't make
 " us page the whole job history.
@@ -3337,10 +3410,20 @@ command! -nargs=? Issues call s:RequestIssues(<q-args>)
 function! s:OnVimEnter()
   " Install commands for the first time
   call s:OnHostChange()
+  let s:builds_timer = timer_start(g:builds_poll_secs * 1000,
+        \ function("s:PollBuilds"), #{repeat: -1})
+  call s:PollBuilds()
+endfunction
+
+function! s:OnVimLeave()
+  if exists("s:builds_timer")
+    call timer_stop(s:builds_timer)
+  endif
 endfunction
 
 augroup Work
   autocmd! VimEnter * ++once call s:OnVimEnter()
+  autocmd VimLeavePre * ++once call s:OnVimLeave()
 augroup END
 
 function! s:ShowShadaVars()
