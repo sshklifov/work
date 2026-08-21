@@ -35,7 +35,7 @@ autocmd FileType gitcommit call s:OnNewCommit()
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 function! work#GetMakeCommand()
-  let repo = git#SourceRepo(FugitiveWorkTree())
+  let repo = fnamemodify(git#SourceRepo(FugitiveWorkTree()), ':t')
   if empty(repo)
     call init#Warn("Not inside a git tracked repo!")
   endif
