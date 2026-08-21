@@ -1210,6 +1210,8 @@ function! s:RunDocker(...)
 endfunction
 
 function s:BitbakeCommand(...)
+  " Layers must match what aidistro records, or bitbake builds the wrong sources.
+  call git#UpdateSubmodule(g:AIDISTRO)
   let opts = get(a:000, 0, #{})
   let recipe = get(opts, "prod", v:false) ? "rock-prod-image" : "rock-image"
   let img_cmd = "bitbake " .. recipe
