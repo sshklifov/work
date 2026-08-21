@@ -886,7 +886,7 @@ function! s:OnFixedHost()
   call init#OnJobOutput(["ssh", g:HOST, "mount"], function('s:OnDeviceMounts'))
   call s:DetermineRsyncDir()
   call s:DetermineSdk()
-  call s:CheckMenderCommit()
+  call s:EnsureMenderCommit()
   let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
   call s:EnsureMaster()
 endfunction
@@ -2420,14 +2420,23 @@ function work#OnFilesystem(entry)
   endif
 endfunction
 
-function s:CheckMenderCommit()
-  call init#OnJobExit(["ssh", g:HOST, "test -f /var/lib/mender/upgrade_available"], 'work#OnCheckUpdate')
+" The flag lives in u-boot's env, not in a file. fw_printenv exits 0 even for an
+" unset variable, so match the value instead of trusting its status.
+function s:EnsureMenderCommit()
+  const pending = "fw_printenv upgrade_available | grep -qx upgrade_available=1"
+  call init#OnJobExit(["ssh", g:HOST, pending], 'work#OnCheckUpdate')
 endfunction
 
 function work#OnCheckUpdate(code)
-  if a:code == 0
-    call init#Warn("Uncommited changes with mender!")
+  if a:code != 0
+    return
   endif
+  echo "Committing mender update..."
+  call init#OnJobSuccess(["ssh", g:HOST, "mender commit"], 'work#OnMenderCommitted')
+endfunction
+
+function work#OnMenderCommitted()
+  echo "Committed the mender update."
 endfunction
 "}}}
 
