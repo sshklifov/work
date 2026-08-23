@@ -1324,7 +1324,9 @@ function! s:InstallImage(...)
   call add(cmds, printf("ssh %s 'mender install /%s/image.mender'", g:HOST, g:RSYNC_DIR))
   split
   enew
-  call init#OnTermSuccess(join(cmds, " && "), expand("<SID>") .. "OnImageInstalled")
+  " Locked: a stray :q mid-flash would otherwise lose sight of mender.
+  call init#TermLock(init#OnTermSuccess(join(cmds, " && "),
+        \ expand("<SID>") .. "OnImageInstalled"))
   startinsert
 endfunction
 
