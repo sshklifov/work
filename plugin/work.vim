@@ -2550,6 +2550,17 @@ function! work#GitlabModify(method, req)
   return init#SystemOrThrow(cmd)
 endfunction
 
+" Fields go through --data-urlencode: note bodies are markdown, so they carry
+" newlines and backticks that have no business in a query string.
+function! work#GitlabPost(req, fields)
+  let cmd = ["curl", "--silent", "--show-error", "--fail-with-body", "--request", "POST",
+        \ "--header", "PRIVATE-TOKEN:" .. g:gitlab_token]
+  for field in a:fields
+    let cmd += ["--data-urlencode", field]
+  endfor
+  return init#SystemOrThrow(cmd + [a:req])
+endfunction
+
 function! work#GitlabRequest(req)
   let cmd = ["curl", "--silent", "--header", "PRIVATE-TOKEN:" .. g:gitlab_token, a:req]
   return init#SystemOrThrow(cmd)
@@ -2830,6 +2841,7 @@ function! s:ShowGitlabNotes(mr, resp)
   call qutil#SetLineData(nr, threads)
   call setbufvar(nr, "gitlab_mr", a:mr)
   nnoremap <silent> <buffer> R :call <SID>ResolveGitlabThread()<CR>
+  nnoremap <silent> <buffer> r :call <SID>ReplyGitlabThread()<CR>
   nnoremap <silent> <buffer> w :call <SID>GetGitlabNoteURL()<CR>
   if ctx.missing > 0
     call init#Warn(printf("%d note(s) point at commits missing from %s!", ctx.missing, a:mr.branch))
@@ -2849,6 +2861,69 @@ function! s:ResolveGitlabThread()
   call work#GitlabModify("PUT", printf("%s/discussions/%s?resolved=true", mr.base, thread.id))
   echo "Resolved " .. thread.where
   " Refetch so the list matches gitlab again.
+  call s:RequestGitlabNotes(mr)
+endfunction
+
+" Compose the reply right under the thread it answers. :w posts it, :q! throws it
+" away. Replying never resolves: that stays R's job.
+function! s:ReplyGitlabThread()
+  let thread = qutil#GetLineData()
+  let mr = b:gitlab_mr
+
+  botright new
+  let compose = win_getid()
+
+  above new
+  let lines = s:ThreadLines(thread, winwidth(0) - 2)
+  let nr = nvim_create_buf(v:false, v:true)
+  call nvim_buf_set_lines(nr, 0, -1, v:true, lines)
+  call setbufvar(nr, "&bufhidden", "wipe")
+  call setbufvar(nr, "&filetype", "markdown")
+  call setbufvar(nr, "&modifiable", v:false)
+  exe "buffer " .. nr
+  exe "resize " .. min([len(lines), 10])
+  setlocal winfixheight
+  let preview = win_getid()
+
+  " Last resize wins the rows, so size the compose window after the preview.
+  call win_gotoid(compose)
+  resize 10
+  let nr = nvim_create_buf(v:false, v:true)
+  call setbufvar(nr, "&bufhidden", "wipe")
+  exe "buffer " .. nr
+  " :w on a nameless buffer fails before BufWriteCmd ever runs.
+  call nvim_buf_set_name(nr, "gitlab-reply://" .. thread.where)
+  setlocal buftype=acwrite filetype=markdown
+  let b:gitlab_mr = mr
+  let b:gitlab_thread = thread
+  let b:gitlab_preview_win = preview
+  augroup GitlabReply
+    autocmd BufWriteCmd <buffer> call s:SendGitlabReply()
+  augroup END
+  startinsert
+endfunction
+
+function! s:SendGitlabReply()
+  let body = trim(join(getline(1, "$"), "\n"))
+  if empty(body)
+    " Still modified, so :w posts once there is something to post.
+    return init#Warn("Nothing to reply with!")
+  endif
+
+  let mr = b:gitlab_mr
+  let thread = b:gitlab_thread
+  let preview = b:gitlab_preview_win
+  " A throw here leaves the text and both windows alone for another :w.
+  call work#GitlabPost(printf("%s/discussions/%s/notes", mr.base, thread.id),
+        \ ["body=" .. body])
+  setlocal nomodified
+
+  if nvim_win_is_valid(preview)
+    call nvim_win_close(preview, v:true)
+  endif
+  close
+  echo "Replied to " .. thread.where
+  " Refetch so the reply count in the list matches gitlab again.
   call s:RequestGitlabNotes(mr)
 endfunction
 
@@ -2872,6 +2947,23 @@ function! s:WrapBody(text, width)
   return lines
 endfunction
 
+" Bodies are markdown, so they keep their own line breaks and the filetype does
+" the highlighting. Headers are markdown too: extmarks would win over syntax.
+function! s:ThreadLines(thread, width)
+  let lines = []
+  for note in a:thread.notes
+    if !empty(lines)
+      call add(lines, "")
+    endif
+    let when = substitute(note["created_at"], 'T\(\d\+:\d\+\).*', ' \1 UTC', "")
+    call add(lines, printf("### %s %s", note["author"]["username"], when))
+    for line in split(substitute(note["body"], "\r", "", "g"), "\n")
+      call extend(lines, s:WrapBody(line, a:width))
+    endfor
+  endfor
+  return lines
+endfunction
+
 " Jump to the commented line like a quickfix entry, then float the thread at
 " the cursor. The cursor lands on the line, not in the float.
 function! s:ShowGitlabThread()
@@ -2890,19 +2982,7 @@ function! s:ShowGitlabThread()
   redraw
 
   let width = min([100, &columns - 4])
-  " Bodies are markdown, so they keep their own line breaks and the filetype does
-  " the highlighting. Headers are markdown too: extmarks would win over syntax.
-  let lines = []
-  for note in thread.notes
-    if !empty(lines)
-      call add(lines, "")
-    endif
-    let when = substitute(note["created_at"], 'T\(\d\+:\d\+\).*', ' \1 UTC', "")
-    call add(lines, printf("### %s %s", note["author"]["username"], when))
-    for line in split(substitute(note["body"], "\r", "", "g"), "\n")
-      call extend(lines, s:WrapBody(line, width - 2))
-    endfor
-  endfor
+  let lines = s:ThreadLines(thread, width - 2)
 
   let nr = nvim_create_buf(v:false, v:true)
   call setbufvar(nr, "&bufhidden", "wipe")
