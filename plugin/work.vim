@@ -1663,6 +1663,7 @@ function s:GetTargets()
   call add(targets, ["/home/stef/obsidian-video", "main", "obsidian-video_git.bb"])
   call add(targets, ["/home/stef/bd-video", "main", "bd-video_git.bb"])
   call add(targets, ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face_git.bb"])
+  call add(targets, ["/home/stef/mcu_manager", "alpha", "mcu_git.bb"])
   return targets
 endfunction
 
@@ -2888,19 +2889,12 @@ function! s:ReplyGitlabThread()
   " Last resize wins the rows, so size the compose window after the preview.
   call win_gotoid(compose)
   resize 10
-  let nr = nvim_create_buf(v:false, v:true)
-  call setbufvar(nr, "&bufhidden", "wipe")
-  exe "buffer " .. nr
-  " :w on a nameless buffer fails before BufWriteCmd ever runs.
-  call nvim_buf_set_name(nr, "gitlab-reply://" .. thread.where)
-  setlocal buftype=acwrite filetype=markdown
+  call init#BufInput("gitlab-reply://" .. thread.where,
+        \ #{filetype: 'markdown', tied: [preview],
+        \ msg: "Reply not posted; :w posts it, :q! drops it"},
+        \ expand("<SID>") .. "SendGitlabReply")
   let b:gitlab_mr = mr
   let b:gitlab_thread = thread
-  let b:gitlab_preview_win = preview
-  augroup GitlabReply
-    autocmd BufWriteCmd <buffer> call s:SendGitlabReply()
-  augroup END
-  startinsert
 endfunction
 
 function! s:SendGitlabReply()
@@ -2912,15 +2906,11 @@ function! s:SendGitlabReply()
 
   let mr = b:gitlab_mr
   let thread = b:gitlab_thread
-  let preview = b:gitlab_preview_win
   " A throw here leaves the text and both windows alone for another :w.
   call work#GitlabPost(printf("%s/discussions/%s/notes", mr.base, thread.id),
         \ ["body=" .. body])
   setlocal nomodified
-
-  if nvim_win_is_valid(preview)
-    call nvim_win_close(preview, v:true)
-  endif
+  " The preview is tied to this buffer, so closing here takes it along.
   close
   echo "Replied to " .. thread.where
   " Refetch so the reply count in the list matches gitlab again.
