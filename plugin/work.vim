@@ -1088,13 +1088,65 @@ function! s:OnScanResult(res)
     return init#ShowErrors(a:res.stderr)
   endif
 
-  call qutil#CreateCustomQuickfix(rows, "Devices", expand("<SID>") .. 'OnScannedDevice')
+  let mine = s:MenderArtifactName()
+  call qutil#CreateCustomQuickfix(s:AnnotateArtifacts(rows), "Devices",
+        \ expand("<SID>") .. 'OnScannedDevice')
+  if !empty(mine)
+    echo printf("Matching against %s", mine)
+  endif
+endfunction
+
+" plugin/mender_artifact.py against the aidistro checkout for the current
+" device. Returns [] when the script is missing, so callers can skip the
+" artifact matching rather than fail the scan over it.
+function! s:MenderArtifactCmd(args)
+  let script = globpath(&runtimepath, 'plugin/mender_artifact.py')
+  if empty(script)
+    return []
+  endif
+  let layer = get(g:, "AIDISTRO", expand("~/aidistro-bd")) .. "/layers/meta-ai"
+  return ["python3", script, "-l", layer] + a:args
+endfunction
+
+" The artifact name a build off the current checkout would carry.
+function! s:MenderArtifactName()
+  let cmd = s:MenderArtifactCmd([])
+  if empty(cmd)
+    return ""
+  endif
+  let out = systemlist(cmd)
+  return v:shell_error ? "" : get(out, 0, "")
+endfunction
+
+" Score what each device is running against what the checkout would build, so
+" the device already carrying your build stands out in the list. Rows come in
+" as "<ip>  <device_type>  <uptime>  <artifact>"; the artifact is "-" when
+" mender could not be read. Any failure leaves the rows as they were.
+function! s:AnnotateArtifacts(rows)
+  let cmd = s:MenderArtifactCmd(["--tsv", "-c", "-"])
+  if empty(cmd)
+    return a:rows
+  endif
+
+  let names = map(copy(a:rows), "split(v:val)[-1]")
+  let lines = systemlist(cmd, join(names, "\n"))
+  if v:shell_error || len(lines) != len(a:rows)
+    return a:rows
+  endif
+
+  let width = max(map(copy(a:rows), "len(v:val)"))
+  let out = []
+  for idx in range(len(a:rows))
+    let [pct, verdict] = split(lines[idx], "\t")
+    call add(out, printf("%-*s  %4s  %s", width, a:rows[idx], pct .. "%", verdict))
+  endfor
+  return out
 endfunction
 
 function! s:OnScannedDevice()
   let entry = getline('.')
   quit
-  " Rows are <ip>  <device_type>  <artifact>
+  " Rows are <ip>  <device_type>  <uptime>  <artifact>[  <score>  <verdict>]
   let ip = split(entry)[0]
   call s:UpdateHostIP(ip)
   echo printf("alt is now %s", ip)
