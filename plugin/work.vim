@@ -1073,15 +1073,23 @@ endfunction
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
 
 " Find the device again after its ip changed
-function! s:ScanDevices(machine)
+function! s:ScanDevices(machine, bang)
+  " A bang points the scan at the host being worked on; without one the picked
+  " device lands on alt, the side device.
+  let host = empty(a:bang) ? "alt" : get(g:, "HOST", "")
+  if empty(host)
+    return init#Warn("No current host to rewrite")
+  endif
+
   let machine = empty(a:machine) ? g:DEVICE : a:machine
   echo printf("Scanning for %s...", machine)
   let opts = #{stdout: 1, stderr: 1, exit_code: 1}
   let scan_exe = expand("~/.local/bin/ssh-scan")
-  call init#OnJobResult([scan_exe, "--script", machine], opts, expand("<SID>") .. 'OnScanResult')
+  call init#OnJobResult([scan_exe, "--script", machine], opts,
+        \ expand("<SID>") .. 'OnScanResult', host)
 endfunction
 
-function! s:OnScanResult(res)
+function! s:OnScanResult(host, res)
   let rows = filter(copy(a:res.stdout), "!empty(v:val)")
   if a:res.exit_code != 0 || empty(rows)
     echo "Scan failed!"
@@ -1090,7 +1098,7 @@ function! s:OnScanResult(res)
 
   let mine = s:MenderArtifactName()
   call qutil#CreateCustomQuickfix(s:AnnotateArtifacts(rows), "Devices",
-        \ expand("<SID>") .. 'OnScannedDevice')
+        \ expand("<SID>") .. 'OnScannedDevice', a:host)
   if !empty(mine)
     echo printf("Matching against %s", mine)
   endif
@@ -1143,25 +1151,29 @@ function! s:AnnotateArtifacts(rows)
   return out
 endfunction
 
-function! s:OnScannedDevice()
+function! s:OnScannedDevice(host)
   let entry = getline('.')
   quit
   " Rows are <ip>  <device_type>  <uptime>  <artifact>[  <score>  <verdict>]
   let ip = split(entry)[0]
-  call s:UpdateHostIP(ip)
-  echo printf("alt is now %s", ip)
-  call s:ChangeHost("alt")
+  call s:UpdateHostIP(a:host, ip)
+  echo printf("%s is now %s", a:host, ip)
+  call s:ChangeHost(a:host)
 endfunction
 
-" Rewrite the address of the alt stanza in .ssh/config, leaving the rest of the
-" file as the user wrote it. A scanned device is never the main host: it lands
-" on alt, reused for whichever device is being worked on on the side.
-function! s:UpdateHostIP(ip)
+" Rewrite the address of a stanza in .ssh/config, leaving the rest of the file
+" as the user wrote it. A scanned device lands on alt, reused for whichever
+" device is being worked on on the side, unless :Scan! aimed it at the host
+" being worked on.
+function! s:UpdateHostIP(host, ip)
   let file = expand("~/.ssh/config")
   let lines = readfile(file)
-  let start = indexof(lines, 'v:val =~? "^\\s*Host\\s\\+alt\\s*$"')
+  " Matched with a lambda, not an expression string: the host name is
+  " interpolated, and this way it needs escaping once instead of twice.
+  let pattern = '^\s*Host\s\+' .. escape(a:host, '\.*$^~[]') .. '\s*$'
+  let start = indexof(lines, {_, line -> line =~? pattern})
   if start < 0
-    throw printf("No 'Host alt' entry in %s", file)
+    throw printf("No 'Host %s' entry in %s", a:host, file)
   endif
 
   " The stanza ends where the next one begins.
@@ -1178,7 +1190,8 @@ function! s:UpdateHostIP(ip)
   call writefile(lines, file)
 endfunction
 
-command! -nargs=? -complete=customlist,SimulateCompl Scan call s:ScanDevices(<q-args>)
+command! -bang -nargs=? -complete=customlist,SimulateCompl Scan
+      \ call s:ScanDevices(<q-args>, "<bang>")
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
