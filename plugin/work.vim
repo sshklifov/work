@@ -1173,7 +1173,7 @@ function! s:UpdateDocker()
   enew
   lcd ~/aidocker
   let cmd = printf("sudo docker-compose -f %s build ubuntu22", g:DOCKER_COMPOSE)
-  call init#Termopen(cmd)
+  call init#Termopen(cmd, #{lock_mode: v:true})
   startinsert
 endfunction
 
@@ -1203,7 +1203,7 @@ function! s:RunDocker(...)
   if Cb is v:null
     let id = init#Termopen(join(cmds))
   else
-    let id = init#OnTermSuccess(join(cmds), Cb)
+    let id = init#TermLock(init#OnTermSuccess(join(cmds), Cb))
   endif
   startinsert
   return id
@@ -1267,7 +1267,7 @@ function! s:InstallSdk(...)
   call add(cmds, printf("echo 'Found sdk from %s ago'", ago))
   call add(cmds, "rm -rf " .. g:SDK_DIR .. "/*")
   call add(cmds, printf("%s -d %s -y", most_recent_file, g:SDK_DIR))
-  call init#Termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"), #{lock_mode: v:true})
   startinsert
 endfunction
 
@@ -1412,7 +1412,7 @@ function! s:FakeSdk()
 
   split
   enew
-  call init#Termopen(join(cmds, ";"))
+  call init#Termopen(join(cmds, ";"), #{lock_mode: v:true})
   startinsert
 endfunction
 
