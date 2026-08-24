@@ -2284,60 +2284,237 @@ endfunction
 
 """"""""""""""""""""""""""""Check"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function s:GetRepoStatus(repo, ...)
-  let repo = FugitiveExtractGitDir(a:repo)
-  if !git#IsClean(repo)
-    return "Dirty."
+" What :Check knows about one repo: where it is, what shape the worktree is in,
+" and how far it drifted from the branch it should be tracking.
+function s:NewRepoState(repo, want)
+  return #{repo: a:repo, short: fnamemodify(a:repo, ':t'), want: a:want,
+        \ dir: "", branch: "", base: "", files: 0, ahead: 0, behind: 0, error: ""}
+endfunction
+
+function s:GetRepoState(repo, want)
+  let st = s:NewRepoState(a:repo, a:want)
+  let st.dir = FugitiveExtractGitDir(a:repo)
+  if empty(st.dir)
+    let st.error = "not cloned"
+    return st
   endif
 
-  let branch = git#GetBranch(repo)
-  if empty(branch)
-    return "Detached HEAD."
-  endif
-  if a:0 > 0 && branch != a:1
-    return printf("Checked out wrong branch '%s'.", branch)
-  endif
-
-  call git#ExecuteOrThrow([repo, "fetch", "origin", branch])
-
-  let dict = git#ExecuteOrThrow([repo, "rev-list", "--left-right", "--count", printf("%s...origin/%s", branch, branch)])
-  if dict['exit_status'] != 0
-    return "Unknown remote branch!"
+  let dict = FugitiveExecute([st.dir, "status", "--porcelain"])
+  let st.files = len(filter(dict['stdout'], '!empty(v:val)'))
+  let st.branch = git#GetBranch(st.dir)
+  if empty(st.branch)
+    let st.error = "detached HEAD"
+    return st
   endif
 
-  let output = dict['stdout']
-  if type(output) == v:t_list
-    let output = join(output)
-  endif
-  let [ahead, behind] = split(output)
-  if ahead != 0 || behind != 0
-    if ahead == 0
-      return printf("Branch is %d commits behind.", behind)
-    elseif behind == 0
-      return printf("Branch is %d commits ahead.", ahead)
-    else
-      return printf("Branch is %d ahead and %d behind.", ahead, behind)
+  " Compare against our own remote branch, falling back to the mainline for a
+  " topic branch that was never pushed.
+  for base in uniq([st.branch, st.want])
+    if empty(base) || FugitiveExecute([st.dir, "fetch", "origin", base])['exit_status'] != 0
+      continue
     endif
+    let st.base = "origin/" .. base
+    break
+  endfor
+  if empty(st.base)
+    let st.error = "no such branch on origin"
+    return st
   endif
-  return v:null
+
+  let range = printf("%s...%s", st.branch, st.base)
+  let dict = FugitiveExecute([st.dir, "rev-list", "--left-right", "--count", range])
+  if dict['exit_status'] != 0
+    let st.error = "cannot count commits against " .. st.base
+    return st
+  endif
+  let counts = split(dict['stdout'][0])
+  let st.ahead = str2nr(counts[0])
+  let st.behind = str2nr(counts[1])
+  return st
 endfunction
 
-function s:CheckRepo(repo, ...)
-  if a:0 > 0 && !empty(a:1)
-    let status = s:GetRepoStatus(a:repo, a:1)
-  else
-    let status = s:GetRepoStatus(a:repo)
+function s:Files(n)
+  return printf("%d file%s", a:n, a:n == 1 ? "" : "s")
+endfunction
+
+function s:StatusText(st)
+  let parts = []
+  if a:st.files > 0
+    call add(parts, printf("dirty (%s)", s:Files(a:st.files)))
   endif
-  if !empty(status)
-    call nvim_echo([[status, "Normal"]], v:false, #{})
+  if !empty(a:st.error)
+    call add(parts, a:st.error)
+  elseif a:st.branch != a:st.want
+    call add(parts, "on " .. a:st.branch)
+  endif
+  if a:st.ahead > 0 && a:st.behind > 0
+    call add(parts, printf("%d ahead %d behind %s", a:st.ahead, a:st.behind, a:st.base))
+  elseif a:st.ahead > 0
+    call add(parts, printf("%d ahead of %s", a:st.ahead, a:st.base))
+  elseif a:st.behind > 0
+    call add(parts, printf("%d behind %s", a:st.behind, a:st.base))
+  endif
+  return empty(parts) ? "up to date" : join(parts, ", ")
+endfunction
+
+" Nothing on offer: clean, on the mainline, level with origin.
+function s:IsSynced(st)
+  return empty(a:st.error) && a:st.files == 0 && a:st.ahead == 0
+        \ && a:st.behind == 0 && a:st.branch == a:st.want
+endfunction
+
+" Everything we could do about a state, best first. Each one becomes its own
+" entry under the repo, so a fix is picked off the list, not out of a menu.
+function s:StateActions(st)
+  let st = a:st
+  if st.error == "not cloned"
+    return []
+  endif
+  let actions = []
+  if st.files > 0
+    call add(actions, #{id: "stash", label: "stash the changes"})
+  endif
+  if st.behind > 0 && st.ahead == 0
+    call add(actions, #{id: "ff", label: "fast-forward to " .. st.base})
+  elseif st.behind > 0
+    call add(actions, #{id: "rebase", label: "rebase onto " .. st.base})
+  endif
+  if st.ahead > 0
+    call add(actions, #{id: "push", label: "push to origin/" .. st.branch})
+    call add(actions, #{id: "log", label: "log what is unpushed"})
+  endif
+  if st.files > 0
+    call add(actions, #{id: "discard", label: "discard the changes"})
+  endif
+  if !empty(st.base)
+    call add(actions, #{id: "reset", label: "reset --hard to " .. st.base})
+  endif
+  " Leaving a topic branch is rarely what you meant, so it comes last.
+  if st.branch != st.want
+    call add(actions, #{id: "checkout", label: "checkout " .. st.want, branch: st.want})
+  endif
+  call add(actions, #{id: "recheck", label: "recheck"})
+  return actions
+endfunction
+
+function s:ConfirmDestructive(msg)
+  return confirm(a:msg, "&Yes\n&No", 2, "Question") == 1
+endfunction
+
+" The list lives in a wipe-on-hide bottom window, so never edit over it.
+function s:OpenRepo(repo)
+  let here = win_getid()
+  wincmd p
+  if win_getid() == here
+    exe "split " .. a:repo
   else
-    let branch = git#GetBranch(a:repo)
-    echo printf("%s is clean and up to date!", branch)
+    exe "e " .. a:repo
   endif
 endfunction
 
+function s:RunAction(action, st)
+  let st = a:st
+  let id = a:action.id
+  if id == "stash"
+    " Staged first: fugitive runs git --literal-pathspecs, under which
+    " `stash push -u` quietly leaves the untracked files behind.
+    call git#ExecuteOrThrow([st.dir, "add", "-A"])
+    call git#ExecuteOrThrow([st.dir, "stash", "push"])
+    echo "Stashed, recover it with :G stash pop"
+  elseif id == "discard"
+    if s:ConfirmDestructive(printf("Discard %s of changes in %s?", s:Files(st.files), st.short))
+      call git#ExecuteOrThrow([st.dir, "reset", "--hard"])
+      call git#ExecuteOrThrow([st.dir, "clean", "-fd"])
+    endif
+  elseif id == "checkout"
+    " Land on it up to date, which is the only reason to go there.
+    let branch = a:action.branch
+    let fetched = FugitiveExecute([st.dir, "fetch", "origin", branch])['exit_status'] == 0
+    call git#ExecuteOrThrow([st.dir, "checkout", branch])
+    if fetched && FugitiveExecute([st.dir, "merge", "--ff-only", "origin/" .. branch])['exit_status'] != 0
+      call init#Warn("%s has diverged from origin/%s", branch, branch)
+    endif
+    call git#UpdateSubmodule(st.dir)
+  elseif id == "ff"
+    call git#ExecuteOrThrow([st.dir, "merge", "--ff-only", st.base])
+    call git#UpdateSubmodule(st.dir)
+  elseif id == "rebase"
+    call git#ExecuteOrThrow([st.dir, "rebase", st.base])
+    call git#UpdateSubmodule(st.dir)
+  elseif id == "push"
+    call git#ExecuteOrThrow([st.dir, "push", "origin", st.branch])
+  elseif id == "reset"
+    if s:ConfirmDestructive(printf("Reset %s --hard to %s?", st.short, st.base))
+      call git#ExecuteOrThrow([st.dir, "reset", "--hard", st.base])
+      call git#UpdateSubmodule(st.dir)
+    endif
+  elseif id == "log"
+    call s:OpenRepo(st.repo)
+    exe printf("G log %s..%s", st.base, st.branch)
+  endif
+endfunction
+
+" One entry per thing to do: the repo's status, then a line per fix. A repo
+" with nothing wrong is just the one line, and <CR> on any status opens it.
+function s:RepoEntries(st, width)
+  let entries = [#{st: a:st,
+        \ line: printf("%-*s  %s", a:width, a:st.short, s:StatusText(a:st))}]
+  if s:IsSynced(a:st)
+    return entries
+  endif
+  for action in s:StateActions(a:st)
+    call add(entries, #{st: a:st, action: action, line: "  " .. action.label})
+  endfor
+  return entries
+endfunction
+
+" An action changes what else is on offer, so redraw the repo's whole block.
+function s:RefreshCheckBlock(winid, lnum, st)
+  let nr = winbufnr(a:winid)
+  let entries = getbufvar(nr, 'qutil_line_data', [])
+  let first = a:lnum - 1
+  while first > 0 && entries[first - 1].st.repo == a:st.repo
+    let first -= 1
+  endwhile
+  let last = a:lnum - 1
+  while last + 1 < len(entries) && entries[last + 1].st.repo == a:st.repo
+    let last += 1
+  endwhile
+
+  let width = getbufvar(nr, 'check_width', len(a:st.short))
+  let fresh = s:RepoEntries(s:GetRepoState(a:st.repo, a:st.want), width)
+  " Append before deleting: emptying the buffer would leave a blank line.
+  call appendbufline(nr, last + 1, map(copy(fresh), 'v:val.line'))
+  call deletebufline(nr, first + 1, last + 1)
+  let head = first > 0 ? entries[0 : first - 1] : []
+  call qutil#SetLineData(nr, head + fresh + entries[last + 1 :])
+  call win_execute(a:winid, printf("call cursor(%d, 1)", first + 1))
+endfunction
+
+function s:OnCheckLine()
+  let entry = qutil#GetLineData()
+  if !has_key(entry, 'action')
+    return s:OpenRepo(entry.st.repo)
+  endif
+  let winid = win_getid()
+  let lnum = line('.')
+  try
+    call s:RunAction(entry.action, entry.st)
+  catch
+    call init#Warn("%s: %s", entry.st.short, v:exception)
+  endtry
+  call s:RefreshCheckBlock(winid, lnum, entry.st)
+endfunction
+
+" TODO: :Unmerged is the last caller left, and it still force-updates in one
+" blunt step. Probably wants the same treatment as :Check: derive the state
+" first, then offer the fixes as entries instead of picking one for you.
 function! s:ForceUpdateRepo(repo, ...)
   let repo = FugitiveExtractGitDir(a:repo)
+  if !git#IsClean(repo) &&
+        \ !s:ConfirmDestructive("Throw away local changes in " .. fnamemodify(a:repo, ':t') .. "?")
+    return
+  endif
   if a:0 > 0
     let branch = a:1
     call git#ExecuteOrThrow([repo, "reset", "--hard"])
@@ -2370,67 +2547,79 @@ function! s:ForceUpdateRepo(repo, ...)
   endif
 endfunction
 
-function! s:CheckAidistro(bang, branch)
-  let repo = g:AIDISTRO
-  if empty(a:bang)
-    call s:CheckRepo(repo, a:branch)
-  elseif empty(a:branch)
-    call s:ForceUpdateRepo(repo)
-  else
-    call s:ForceUpdateRepo(repo, a:branch)
+" :Check takes a repo by its directory name, no argument checks all of them.
+function s:CheckTargets(pat)
+  let targets = map(s:GetTargets(), '[v:val[0], v:val[1]]')
+  call add(targets, [get(g:, "AIDISTRO", expand("~/aidistro")), "master"])
+  if empty(a:pat)
+    return targets
   endif
+  return filter(targets, 'stridx(fnamemodify(v:val[0], ":t"), a:pat) >= 0')
 endfunction
 
-function! AidistroCompl(ArgLead, CmdLine, CursorPos)
-  if a:CursorPos < len(a:CmdLine)
+" No argument means the repo we are sitting in, if that is one at all.
+function s:CurrentTarget()
+  let worktree = FugitiveWorkTree()
+  if empty(worktree)
     return []
   endif
-  return git#GetRefs('refs/heads/', a:ArgLead, g:AIDISTRO)
-endfunction
-
-command! -bang -nargs=? -complete=customlist,AidistroCompl Aidistro call s:CheckAidistro("<bang>", <q-args>)
-
-function! s:ShowRepoStatus(pat)
-  let list = []
-  let targets = add(s:GetTargets(), [g:AIDISTRO, "master", ""])
-  let targets = filter(targets, "stridx(v:val[0], a:pat) >= 0")
-  for [repo, branch, _] in targets
-    let status = s:GetRepoStatus(repo, branch)
-    if empty(status)
-      let status = "OK"
+  let dir = FugitiveExtractGitDir(worktree)
+  for [repo, want] in s:CheckTargets("")
+    if FugitiveExtractGitDir(repo) == dir
+      return [[repo, want]]
     endif
-    let short_repo = fnamemodify(repo, ':t')
-    call add(list, printf("%s: %s", short_repo, status))
   endfor
-  call qutil#CreateCustomQuickfix(list, "Check", "work#FixRepoStatus")
+  " Not one of ours, so it has no mainline to hold it to.
+  return [[worktree, git#GetBranch(dir)]]
 endfunction
 
-function work#FixRepoStatus()
-  let line = line('.')
-  let short_repo = split(getline('.'), ":")[0]
-  let targets = add(s:GetTargets(), [g:AIDISTRO, "master", ""])
-  let targets = filter(targets, "stridx(v:val[0], short_repo) >= 0")
-  call assert_true(len(targets) == 1)
-  let [repo, branch; _] = targets[0]
-  call s:ForceUpdateRepo(repo, branch)
-  " Update status
-  let status = s:GetRepoStatus(repo, branch)
-  if empty(status)
-    let status = "OK"
+function! s:ShowRepoStatus(bang, pat)
+  let targets = empty(a:bang) && empty(a:pat) ? s:CurrentTarget() : []
+  if empty(targets)
+    let targets = s:CheckTargets(a:pat)
   endif
-  call setline(line, printf("%s: %s", short_repo, status))
+  if empty(targets)
+    return init#Warn("No repo matches '%s'", a:pat)
+  endif
+
+  let states = []
+  for [repo, branch] in targets
+    echo printf("Checking %s...", fnamemodify(repo, ':t'))
+    redraw
+    try
+      call add(states, s:GetRepoState(repo, branch))
+    catch
+      " One unreachable remote must not cost us the whole list.
+      let st = s:NewRepoState(repo, branch)
+      let st.error = v:exception
+      call add(states, st)
+    endtry
+  endfor
+
+  let width = max(map(copy(states), 'len(v:val.short)'))
+  let entries = []
+  for st in states
+    call extend(entries, s:RepoEntries(st, width))
+  endfor
+  let lines = map(copy(entries), 'v:val.line')
+  let nr = qutil#CreateCustomQuickfix(lines, "Check", function("s:OnCheckLine"))
+  if nr < 0
+    return
+  endif
+  call qutil#SetLineData(nr, entries)
+  call setbufvar(nr, 'check_width', width)
 endfunction
 
-command! -nargs=? -complete=customlist,CheckCompl Check call s:ShowRepoStatus(<q-args>)
+command! -bang -nargs=? -complete=customlist,CheckCompl Check call s:ShowRepoStatus("<bang>", <q-args>)
 
 function! CheckCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let repos = map(s:GetTargets(), "v:val[0]")
-  call add(repos, g:AIDISTRO)
-  let repos = filter(repos, 'stridx(v:val, a:ArgLead) >= 0')
-  return map(repos, 'fnamemodify(v:val, ":t")')
+  let repos = map(s:CheckTargets(""), 'fnamemodify(v:val[0], ":t")')
+  " Prefixes first, then whatever merely contains the lead.
+  let prefix = filter(copy(repos), 'stridx(v:val, a:ArgLead) == 0')
+  return prefix + filter(repos, 'stridx(v:val, a:ArgLead) > 0')
 endfunction
 "}}}
 
@@ -2629,15 +2818,14 @@ function! s:OnMergeRequestDict(req, dict)
   let lines = map(copy(list), "printf('[%s] %s', v:val.repo, v:val.title)")
   let nr = qutil#CreateCustomQuickfix(lines, "Gitlab", function("s:ShowMergeRequestHelp"))
   call qutil#SetLineData(nr, list)
-  nnoremap <silent> <buffer> B :call <SID>CheckoutMergeRequest()<CR>
+  nnoremap <silent> <buffer> T :call <SID>WorktreeMergeRequest()<CR>
+  nnoremap <silent> <buffer> n :call <SID>ShowNotesMergeRequest()<CR>
   nnoremap <silent> <buffer> b :call <SID>GetBranchMergeRequest()<CR>
   nnoremap <silent> <buffer> w :call <SID>GetMergeRequestURL()<CR>
-  nnoremap <silent> <buffer> n :call <SID>ShowNotesMergeRequest()<CR>
-  nnoremap <silent> <buffer> T :call <SID>WorktreeMergeRequest()<CR>
 endfunction
 
 function s:ShowMergeRequestHelp()
-  echo "(B) Reset repo to branch locally (T) Edit in worktree (b) Copy branch (w) Open URL (n) Show notes"
+  echo "(T) Edit in worktree (n) Show notes (b) Copy branch (w) Open URL"
 endfunction
 
 function! s:GetMergeRequestURL()
@@ -2653,17 +2841,6 @@ function! s:MergeRequestRepo(entry)
     return ''
   endif
   return a:entry["repo_full"]
-endfunction
-
-function! s:CheckoutMergeRequest()
-  let entry = qutil#GetLineData()
-  let repo = s:MergeRequestRepo(entry)
-  if empty(repo)
-    return
-  endif
-  call s:ForceUpdateRepo(repo, entry["branch"])
-  quit
-  exe "e " .. repo
 endfunction
 
 function! s:GetBranchMergeRequest()
