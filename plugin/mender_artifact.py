@@ -281,31 +281,45 @@ def compare(got, base, repo, image):
         if not repo.has_tag("release-" + got.version):
             notes.append("tag release-%s not in this checkout" % got.version)
 
-    # --- which commit
+    # --- which commit, and the tree it was built from
+    # The tree state rides inside the commit note instead of trailing as its
+    # own: it is often the only field keeping a name off 100, and it used to be
+    # the note --tsv dropped.
+    if got.dirty:
+        state = "dirty tree, like yours" if base.dirty else "dirty tree"
+    elif base.dirty and (got.basename == image and got.version == base.version
+                         and got.count == base.count and got.user == base.user
+                         and relation == "same"):
+        # Past the 100 branch with every other field matching, so a dirty tree
+        # of your own is the one thing keeping this off an exact match. Any
+        # other row it says nothing about, so it stays quiet there.
+        state = "yours is dirty"
+    else:
+        state = ""
+
     if relation == "none":
-        notes.append("built straight off tag release-%s, no commits on top" % got.version)
+        note = "built straight off tag release-%s, no commits on top" % got.version
     elif relation == "same":
-        notes.append("same commit")
+        note = "same commit"
     elif relation == "unknown":
-        notes.append("commit %s not in this checkout" % got.commit)
+        note = "commit %s not in this checkout" % got.commit
     elif relation == "behind":
-        notes.append("%d commit%s behind your HEAD" % (behind, "s" if behind > 1 else ""))
+        note = "%d commit%s behind your HEAD" % (behind, "s" if behind > 1 else "")
     elif relation == "ahead":
-        notes.append("%d commit%s ahead of your HEAD" % (ahead, "s" if ahead > 1 else ""))
+        note = "%d commit%s ahead of your HEAD" % (ahead, "s" if ahead > 1 else "")
     else:
         brs = [b for b in repo.branches_containing(got.commit) if b != repo.branch()]
-        notes.append("diverged from your HEAD (+%d/-%d), on %s"
-                     % (ahead, behind, ", ".join(brs[:3]) if brs else "no local branch"))
+        # Folded into the distance rather than trailing the branch list, where
+        # it would read as the branch being dirty.
+        note = "diverged from your HEAD (+%d/-%d%s), on %s" % (
+            ahead, behind, ", " + state if state else "",
+            ", ".join(brs[:3]) if brs else "no local branch")
+        state = ""
+    notes.append(note + (" (%s)" % state if state else ""))
 
     # --- the rest, in descending usefulness
     if got.bare_hash:
         notes.append("no reachable tag, describe fell back to a bare hash")
-    if got.dirty and not base.dirty:
-        notes.append("dirty tree")
-    elif base.dirty and not got.dirty:
-        notes.append("clean tree, yours is dirty")
-    elif got.dirty:
-        notes.append("dirty tree, like yours")
     if got.basename != image:
         notes.append("different image (%s)" % got.basename)
     if got.count is not None and not got.bare_hash and repo.has_tag("release-" + got.version):

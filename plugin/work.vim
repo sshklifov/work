@@ -1073,11 +1073,8 @@ endfunction
 command! -nargs=? -complete=customlist,HostCompl Host call s:ChangeHost(<q-args>)
 
 " Find the device again after its ip changed
-function! s:ScanDevices(machine, bang)
-  " A bang points the scan at the host being worked on; without one the picked
-  " device lands on alt, the side device.
-  let host = empty(a:bang) ? "alt" : get(g:, "HOST", "")
-  if empty(host)
+function! s:ScanDevices(machine, host)
+  if empty(a:host)
     return init#Warn("No current host to rewrite")
   endif
 
@@ -1086,7 +1083,7 @@ function! s:ScanDevices(machine, bang)
   let opts = #{stdout: 1, stderr: 1, exit_code: 1}
   let scan_exe = expand("~/.local/bin/ssh-scan")
   call init#OnJobResult([scan_exe, "--script", machine], opts,
-        \ expand("<SID>") .. 'OnScanResult', host)
+        \ expand("<SID>") .. 'OnScanResult', a:host)
 endfunction
 
 function! s:OnScanResult(host, res)
@@ -1190,8 +1187,10 @@ function! s:UpdateHostIP(host, ip)
   call writefile(lines, file)
 endfunction
 
-command! -bang -nargs=? -complete=customlist,SimulateCompl Scan
-      \ call s:ScanDevices(<q-args>, "<bang>")
+command! -nargs=? -complete=customlist,SimulateCompl Scan
+      \ call s:ScanDevices(<q-args>, "alt")
+
+command! -nargs=? -complete=customlist,SimulateCompl Bd call s:ScanDevices("bd-pre-evt-devkit", "bd")
 "}}}
 
 """"""""""""""""""""""""""""Do"""""""""""""""""""""""""""" {{{
