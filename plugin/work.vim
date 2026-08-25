@@ -3017,6 +3017,7 @@ function! s:ShowGitlabNotes(mr, resp)
     return
   endif
   call qutil#SetLineData(nr, threads)
+  call qutil#AllowStep(nr)
   call setbufvar(nr, "gitlab_mr", a:mr)
   nnoremap <silent> <buffer> R :call <SID>ResolveGitlabThread()<CR>
   nnoremap <silent> <buffer> r :call <SID>ReplyGitlabThread()<CR>
@@ -3434,11 +3435,16 @@ function! s:OnPolledBuilds(job, json)
       continue
     endif
     let latest = #{status: build["building"] ? "BUILDING" : build["result"],
-          \ timestamp: build["timestamp"], duration: build["duration"],
+          \ timestamp: build["timestamp"], duration: build["duration"], url: build["url"],
           \ label: printf("%s#%s", substitute(a:job, '^aidistro_', "", ""), build["number"])}
     break
   endfor
 
+  " Dismissing a build says nothing about the next one, so the flag rides along
+  " only while the job's newest build is still the same one.
+  if !empty(latest) && get(get(s:build_status, a:job, #{}), "label", "") == latest.label
+    let latest.dismissed = get(s:build_status[a:job], "dismissed", v:false)
+  endif
   if get(s:build_status, a:job, #{}) == latest
     return
   endif
@@ -3446,17 +3452,21 @@ function! s:OnPolledBuilds(job, json)
   redrawstatus
 endfunction
 
-" Only the newest build, and only while it runs or is fresh enough to still be news.
-function! work#JenkinsStatusLine()
+" The one build worth talking about, as of the last poll.
+function! s:NewestBuild()
   let builds = filter(values(copy(s:build_status)), '!empty(v:val)')
   " A build still running beats a newer one that is already over.
   let running = filter(copy(builds), 'v:val.status == "BUILDING"')
   let builds = empty(running) ? builds : running
-  if empty(builds)
+  return empty(builds) ? #{} : sort(builds, {lhs, rhs -> rhs.timestamp - lhs.timestamp})[0]
+endfunction
+
+" Only the newest build, and only while it runs or is fresh enough to still be news.
+function! work#JenkinsStatusLine()
+  let build = s:NewestBuild()
+  if empty(build) || get(build, "dismissed", v:false)
     return ""
   endif
-
-  let build = sort(builds, {lhs, rhs -> rhs.timestamp - lhs.timestamp})[0]
   " The colour is the whole message: dim while it runs, then green or red.
   if build.status == "BUILDING"
     let hl = "DiagnosticUnnecessary"
@@ -3468,8 +3478,28 @@ function! work#JenkinsStatusLine()
     endif
     let hl = build.status == "SUCCESS" ? "DiagnosticOk" : "DiagnosticError"
   endif
-  return printf("%%#%s#(%s)%%#StatusLine#", hl, build.label)
+  return printf(" %%#%s#[%s]%%#StatusLine#", hl, build.label)
 endfunction
+
+" The link to the build the statusline is showing you: it says when the build is
+" green, this is how you grab it. A running build's page is just as fetchable, so
+" nothing here waits for anything. Bang for a build you are done with: the url is
+" all you wanted, so the statusline drops it and stops colouring at you.
+function! s:CopyBuildUrl(bang)
+  let build = s:NewestBuild()
+  if empty(build)
+    return init#Warn("Jenkins has no build of yours")
+  endif
+  call init#ToClipboard(build.url)
+  if !empty(a:bang)
+    " The polled dicts are shared, not copied, so this lands where the statusline
+    " and the next poll both look.
+    let build.dismissed = v:true
+    redrawstatus
+  endif
+endfunction
+
+command! -nargs=0 -bang B call s:CopyBuildUrl("<bang>")
 
 " How many of the newest builds we ask for, so a stretch of failures can't make
 " us page the whole job history.
