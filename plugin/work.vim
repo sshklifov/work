@@ -34,13 +34,15 @@ autocmd FileType gitcommit call s:OnNewCommit()
 
 """"""""""""""""""""""""""""Building"""""""""""""""""""""""""""" {{{
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-function! work#GetMakeCommand()
-  let repo = fnamemodify(git#SourceRepo(FugitiveWorkTree()), ':t')
+" The tree defaults to the one being edited, but can be given, to build a repo other than
+" the current buffer's.
+function! work#GetMakeCommand(...)
+  let dir = get(a:000, 0, FugitiveWorkTree())
+  let repo = fnamemodify(git#SourceRepo(dir), ':t')
   if empty(repo)
     call init#Warn("Not inside a git tracked repo!")
   endif
-  
-  let dir = FugitiveWorkTree()
+
   if empty(dir)
     let dir = getcwd()
   endif
@@ -95,7 +97,7 @@ function! work#GetMakeCommand()
 
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
 
-  let build_dir = printf("%s/%s", FugitiveWorkTree(), g:BUILD_TYPE)
+  let build_dir = printf("%s/%s", dir, g:BUILD_TYPE)
   if !isdirectory(build_dir)
     call add(cmds, cmake)
   endif
@@ -683,12 +685,16 @@ function! s:GetApps()
   let apps = #{
         \ rtsp-server: #{user: "rtsp-server", services: ["rtsp-server.service", "rtsp-server-noauth.service", "rtsp-server.socket"]},
         \ badge_and_face: #{user: "badge_and_face", services: ["badge-and-face.service"]},
-        \ qrcode-scanner: #{user: "rock-bootstrap", services: ["qrcode-scanner.service"]},
-        \ device-health: #{user: "device-health", services: ["device-health.service"]},
         \ }
   if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
     let apps["bd-video"] = #{user: "rock-video", services: ["bd-video.service"]}
-  elseif stridx(g:DEVICE, "rockx") >= 0
+    return apps
+  endif
+
+  let apps["qrcode-scanner"] = #{user: "rock-bootstrap", services: ["qrcode-scanner.service"]}
+  let apps["device-health"] = #{user: "device-health", services: ["device-health.service"]}
+
+  if stridx(g:DEVICE, "rockx") >= 0
     let apps["obsidian-video"] = #{user: "rock-video", services: ["obsidian-video.service"]}
   elseif stridx(g:DEVICE, "onyx") >= 0
     let apps["rock-video"] = #{user: "rock-video", services: ["rock-video.service"]}
@@ -1688,7 +1694,8 @@ function! s:OpenBitbake(repo)
     throw "Multiple results for : " .. bitbake
   endif
   exe "e " .. files[0]
-  if search("SRCREV") == 0
+  " Anchored: recipes mention ${SRCBRANCH} in SRC_URI too, and not all use ?=
+  if search('^SRCREV\s*[?:]\?=', 'w') == 0
     throw "Failed to find SRCREV"
   endif
 endfunction
@@ -1712,11 +1719,11 @@ function! s:AddRepo(repo)
 
   call s:OpenBitbake(a:repo)
 
-  call setline('.', 'SRCREV ?= "' .. new_src_rev .. '"')
-  if search("SRCBRANCH") == 0
+  call setline('.', substitute(getline('.'), '"[^"]*"', '"' .. new_src_rev .. '"', ''))
+  if search('^SRCBRANCH\s*[?:]\?=', 'w') == 0
     throw "Failed to find SRCBRANCH"
   endif
-  call setline('.', 'SRCBRANCH ?= "' .. new_src_branch .. '"')
+  call setline('.', substitute(getline('.'), '"[^"]*"', '"' .. new_src_branch .. '"', ''))
   write
 endfunction
 
@@ -3440,11 +3447,6 @@ function! s:OnPolledBuilds(job, json)
     break
   endfor
 
-  " Dismissing a build says nothing about the next one, so the flag rides along
-  " only while the job's newest build is still the same one.
-  if !empty(latest) && get(get(s:build_status, a:job, #{}), "label", "") == latest.label
-    let latest.dismissed = get(s:build_status[a:job], "dismissed", v:false)
-  endif
   if get(s:build_status, a:job, #{}) == latest
     return
   endif
@@ -3464,7 +3466,8 @@ endfunction
 " Only the newest build, and only while it runs or is fresh enough to still be news.
 function! work#JenkinsStatusLine()
   let build = s:NewestBuild()
-  if empty(build) || get(build, "dismissed", v:false)
+  " A build you dismissed is not news in any vim, this one or the next.
+  if empty(build) || build.label == get(g:, "JENKINS_DISMISSED_BUILD", "")
     return ""
   endif
   " The colour is the whole message: dim while it runs, then green or red.
@@ -3492,9 +3495,7 @@ function! s:CopyBuildUrl(bang)
   endif
   call init#ToClipboard(build.url)
   if !empty(a:bang)
-    " The polled dicts are shared, not copied, so this lands where the statusline
-    " and the next poll both look.
-    let build.dismissed = v:true
+    let g:JENKINS_DISMISSED_BUILD = build.label
     redrawstatus
   endif
 endfunction
