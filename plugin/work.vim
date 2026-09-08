@@ -2430,8 +2430,10 @@ function s:RunAction(action, st)
     echo "Stashed, recover it with :G stash pop"
   elseif id == "discard"
     if s:ConfirmDestructive(printf("Discard %s of changes in %s?", s:Files(st.files), st.short))
-      call git#ExecuteOrThrow([st.dir, "reset", "--hard"])
+      " A plain reset/clean stops at the gitlink, leaving the submodule dirty.
+      call git#ExecuteOrThrow([st.dir, "reset", "--hard", "--recurse-submodules"])
       call git#ExecuteOrThrow([st.dir, "clean", "-fd"])
+      call git#ExecuteOrThrow([st.dir, "submodule", "foreach", "--recursive", "git", "clean", "-fd"])
     endif
   elseif id == "checkout"
     " Land on it up to date, which is the only reason to go there.
@@ -3644,7 +3646,7 @@ endfunction
 " its own, so the edit leaves a directory listing behind for `only` to clear.
 function! s:ShowBuildLog(target, behind)
   if a:behind == 0
-    echo printf("The %s is at the tip of master, nothing missing.", a:target.label)
+    echo printf("The %s is at the tip of master.", a:target.label)
     return
   endif
   exe "e " .. g:AIDISTRO
