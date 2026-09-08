@@ -31,6 +31,7 @@ SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=1"]
 STREAMS = {
     "onyx": ["ircamera", "mircamera", "depthcamera", "mdepthcamera", "rgbcamera", "mrgbcamera"],
     "rockx": ["adaptive_h264", "adaptive_mjpeg", "near-rtsp", "far-rtsp", "center-rtsp", "intercom"],
+    "bd-pre-evt-devkit": ["cam0"],
 }
 
 
@@ -210,10 +211,13 @@ def collect(ip, port, streams, get_creds):
 
 
 def gst_command(type_, ip, port, name, creds):
+    # sync=false: the sink renders on arrival instead of waiting on the clock,
+    # which a high-bitrate stream can never catch up with once it falls behind.
+    sink = "videoconvert ! fpsdisplaysink sync=false video-sink=autovideosink"
     if type_ == "H264":
-        pipe = "latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! fpsdisplaysink video-sink=autovideosink"
+        pipe = "protocols=tcp latency=100 ! rtph264depay ! h264parse ! avdec_h264 ! " + sink
     else:
-        pipe = "latency=0 ! rtpjpegdepay ! jpegparse ! avdec_mjpeg ! fpsdisplaysink video-sink=autovideosink"
+        pipe = "protocols=tcp latency=100 ! rtpjpegdepay ! jpegdec ! " + sink
     auth = ""
     if creds:
         auth = " user-id=%s user-pw=%s" % (shlex.quote(creds[0]), shlex.quote(creds[1]))
