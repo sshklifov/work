@@ -1670,6 +1670,7 @@ function s:GetTargets()
   call add(targets, ["/home/stef/bd-video", "main", "bd-video_git.bb"])
   call add(targets, ["/home/stef/badge-and-face", "obsidian-master", "badge-and-face_git.bb"])
   call add(targets, ["/home/stef/mcu_manager", "alpha", "mcu_git.bb"])
+  call add(targets, ["/home/stef/control-system", "master", "control-system_git.bb"])
   return targets
 endfunction
 
