@@ -2391,10 +2391,12 @@ function s:StateActions(st)
     call add(actions, #{id: "log", label: "log what is unpushed"})
   endif
   if st.files > 0
-    call add(actions, #{id: "discard", label: "discard the changes"})
+    call add(actions, #{id: "discard", label: "discard the changes",
+          \ confirm: printf("discard %s", s:Files(st.files))})
   endif
   if !empty(st.base)
-    call add(actions, #{id: "reset", label: "reset --hard to " .. st.base})
+    call add(actions, #{id: "reset", label: "reset --hard to " .. st.base,
+          \ confirm: "reset --hard to " .. st.base})
   endif
   " Leaving a topic branch is rarely what you meant, so it comes last.
   if st.branch != st.want
@@ -2429,12 +2431,11 @@ function s:RunAction(action, st)
     call git#ExecuteOrThrow([st.dir, "stash", "push"])
     echo "Stashed, recover it with :G stash pop"
   elseif id == "discard"
-    if s:ConfirmDestructive(printf("Discard %s of changes in %s?", s:Files(st.files), st.short))
-      " A plain reset/clean stops at the gitlink, leaving the submodule dirty.
-      call git#ExecuteOrThrow([st.dir, "reset", "--hard", "--recurse-submodules"])
-      call git#ExecuteOrThrow([st.dir, "clean", "-fd"])
-      call git#ExecuteOrThrow([st.dir, "submodule", "foreach", "--recursive", "git", "clean", "-fd"])
-    endif
+    " A plain reset/clean stops at the gitlink, leaving the submodule dirty,
+    " and single -f skips untracked dirs that are git repos of their own.
+    call git#ExecuteOrThrow([st.dir, "reset", "--hard", "--recurse-submodules"])
+    call git#ExecuteOrThrow([st.dir, "clean", "-ffd"])
+    call git#ExecuteOrThrow([st.dir, "submodule", "foreach", "--recursive", "git", "clean", "-ffd"])
   elseif id == "checkout"
     " Land on it up to date, which is the only reason to go there.
     let branch = a:action.branch
@@ -2453,10 +2454,8 @@ function s:RunAction(action, st)
   elseif id == "push"
     call git#ExecuteOrThrow([st.dir, "push", "origin", st.branch])
   elseif id == "reset"
-    if s:ConfirmDestructive(printf("Reset %s --hard to %s?", st.short, st.base))
-      call git#ExecuteOrThrow([st.dir, "reset", "--hard", st.base])
-      call git#UpdateSubmodule(st.dir)
-    endif
+    call git#ExecuteOrThrow([st.dir, "reset", "--hard", st.base])
+    call git#UpdateSubmodule(st.dir)
   elseif id == "log"
     call s:OpenRepo(st.repo)
     exe printf("G log %s..%s", st.base, st.branch)
@@ -2505,6 +2504,14 @@ function s:OnCheckLine()
   if !has_key(entry, 'action')
     return s:OpenRepo(entry.st.repo)
   endif
+  " Destructive fixes arm on the first <CR> and run on the second, so the
+  " confirmation stays on the line you are already aiming at.
+  let armed = entry.st.repo .. " " .. entry.action.id
+  if has_key(entry.action, 'confirm') && get(b:, 'check_armed', '') != armed
+    let b:check_armed = armed
+    return init#Warn("%s: <CR> again to %s", entry.st.short, entry.action.confirm)
+  endif
+  unlet! b:check_armed
   let winid = win_getid()
   let lnum = line('.')
   try
