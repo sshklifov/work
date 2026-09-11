@@ -1258,7 +1258,13 @@ function! s:RunDocker(...)
   lcd ~/aidocker
   let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
+  " Prefer the machine's "-dev" variant when aidistro carries one: same image,
+  " but with a writable /usr, so an rsync into /usr/bin works.
   let machine = g:DEVICE
+  let dev_conf = printf("%s/layers/meta-ai/conf/machine/%s-dev.conf", g:AIDISTRO, machine)
+  if !empty(getftype(dev_conf))
+    let machine ..= "-dev"
+  endif
   let bash_cmd = ["export USE_S3_BUCKET=1",
         \ printf("export MACHINE=%s", machine),
         \ printf("source %s/setup-environment %s", g:AIDISTRO, g:DOCKER_CACHE)]
