@@ -3215,12 +3215,14 @@ endfunction
 command! -nargs=? -bang -complete=customlist,qutil#ReposCompl Mr call s:MrCommand("<bang>", <q-args>)
 cabbr MR Mr
 
-function! s:CollectEveryUnmergedMr()
+function! s:CollectEveryUnmergedMr(repo)
   let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=all&&per_page=100", g:gitlab_user)
-  call work#OnGitlabResponse(req, function("s:OnEveryUnmergedMr"))
+  call work#OnGitlabResponse(req, function("s:OnEveryUnmergedMr", [a:repo]))
 endfunction
 
-function! s:OnEveryUnmergedMr(dict)
+" An empty repo walks every target that has a merge request; a repo scopes the
+" walk to it, so branches in a repo without a single merge request show up too.
+function! s:OnEveryUnmergedMr(repo, dict)
   let repo_to_branch = #{}
   for entry in a:dict
     let repo = matchstr(entry["web_url"], '/\zs[^/]\+\ze/-/merge_requests')
@@ -3239,34 +3241,74 @@ function! s:OnEveryUnmergedMr(dict)
   endfor
   let list = []
   let current_author = git#ExecuteOrThrow(["config", "user.name"])[0]
-  for repo in keys(repo_to_branch)
+  for repo in empty(a:repo) ? keys(repo_to_branch) : [a:repo]
     let git_dir = FugitiveExtractGitDir(repo)
+    if empty(git_dir)
+      " A target that isn't cloned locally has no branches to report on.
+      if !empty(a:repo)
+        return init#Warn("%s is not a git repository!", repo)
+      endif
+      continue
+    endif
     let cmd = [git_dir, "for-each-ref", "--sort=-committerdate", "refs/heads/", "--format=%(refname:short)"]
     let local_branches = git#ExecuteOrThrow(cmd)
-    let remote_branches = repo_to_branch[repo]
+    let remote_branches = get(repo_to_branch, repo, #{})
     for branch in local_branches
       let targets = filter(s:GetTargets(), "stridx(v:val[0], repo) >= 0")
       let master_branch = len(targets) >= 1 ? targets[0][1] : ""
       if !has_key(remote_branches, branch) && branch != master_branch
         let author = git#ExecuteOrThrow([git_dir, "log", branch, "-1", "--pretty=%an"])[0]
         if author == current_author
-          call add(list, printf("%s: %s", repo, branch))
+          call add(list, #{repo: repo, branch: branch, main: master_branch})
         endif
       endif
     endfor
   endfor
-  call qutil#CreateCustomQuickfix(list, "Unmerged", function("s:OnUnmergedBranch"))
+  " Scoped to one repo every line carries the same prefix, so leave it out.
+  let lines = map(copy(list), empty(a:repo)
+        \ ? "printf('%s: %s', v:val.repo, v:val.branch)" : "v:val.branch")
+  let nr = qutil#CreateCustomQuickfix(lines, "Unmerged", function("s:OnUnmergedBranch"))
+  if nr > 0
+    call qutil#SetLineData(nr, list)
+    call qutil#AllowStep(nr)
+  endif
 endfunction
 
+" What the branch carries: its commits over the mainline, in a fugitive log.
+" The log lands next to the list and the cursor goes back to it, so the next
+" branch is one press away.
 function! s:OnUnmergedBranch()
-  let line = getline('.')
-  let [repo, branch] = split(line, ": ")
-  call s:ForceUpdateRepo(repo, branch)
-  quit
-  exe "e " .. repo
+  let entry = qutil#GetLineData()
+  call s:OpenRepo(entry.repo)
+
+  let main = empty(entry.main) ? git#GetMasterOrThrow(v:false) : entry.main
+  let commits = git#BranchCommitsOrThrow(entry.branch, main)
+  if empty(commits)
+    echo printf("%s has no commits over %s!", entry.branch, main)
+  else
+    " '++curwin' keeps the log in the window OpenRepo just used: fugitive
+    " splits a second one otherwise, over the list.
+    exe printf("G ++curwin log -n %d %s", len(commits), commits[0])
+  endif
 endfunction
 
-command! -nargs=0 Unmerged call work#OnGitlabUser(function("s:CollectEveryUnmergedMr"))
+" The repo being edited, unless a bang asks for every target at once.
+function! s:UnmergedCommand(bang, arg)
+  if !empty(a:arg)
+    let repo = substitute(fnamemodify(a:arg, ":p"), '/\+$', "", "")
+  elseif !empty(a:bang)
+    let repo = ""
+  else
+    let repo = FugitiveWorkTree()
+    if empty(repo)
+      return init#Warn("Not in a git repository!")
+    endif
+  endif
+  call work#OnGitlabUser(function("s:CollectEveryUnmergedMr", [repo]))
+endfunction
+
+command! -nargs=? -bang -complete=customlist,qutil#ReposCompl Unmerged
+      \ call s:UnmergedCommand("<bang>", <q-args>)
 
 function! s:CollectEveryMergedMr()
   let req = printf("https://gitlab.com/api/v4/merge_requests?assignee_id=%s&state=merged&&per_page=100", g:gitlab_user)
