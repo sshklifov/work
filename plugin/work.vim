@@ -1400,7 +1400,7 @@ function! s:InstallImage(...)
   let ago = init#PrettyTime(localtime() - most_recent_timestamp)
   let cmds = []
   call add(cmds, printf("echo 'Found image from %s ago'", ago))
-  call add(cmds, printf("scp %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
+  call add(cmds, printf("rsync -tL --progress %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
   call add(cmds, printf("ssh %s 'mender install /%s/image.mender'", g:HOST, g:RSYNC_DIR))
   split
   enew
