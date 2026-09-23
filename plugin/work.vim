@@ -962,6 +962,11 @@ endfunction
 
 " TODO: Kind of hacky and might need updating, but I think it's going to be worth it!
 function! s:SimulateHost(simulated_sdk)
+  let matches = SimulateCompl(a:simulated_sdk, "", 0)
+  if len(matches) != 1
+    echo printf("Cannot simulate '%s'", a:simulated_sdk)
+    return
+  endif
   if !work#IsHostSimulated()
     let g:HOST .= ".invalid"
     let g:HOST_IP = g:HOST
@@ -969,12 +974,11 @@ function! s:SimulateHost(simulated_sdk)
     let g:RSYNC_DIR = "/dev/null"
     call s:OnControlFileEvent()
   endif
-  call s:OnSdkOutput([a:simulated_sdk])
+  call s:OnSdkOutput(matches)
 endfunction
 
 command! -nargs=1 -complete=customlist,SimulateCompl Simulate call s:SimulateHost(<q-args>)
 cabbr Sim Simulate
-cabbr Sym Simulate
 
 function! SimulateCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
