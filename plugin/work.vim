@@ -765,8 +765,7 @@ function! s:RestartService(exe, units)
   call add(cmds, "systemctl start $active")
   call add(cmds, "journalctl -f -u " .. join(a:units, " -u "))
 
-  sp
-  enew
+  call init#SmartSplit()
   call init#Termopen(["ssh", g:HOST, join(cmds, ' && ')])
 endfunction
 
@@ -1074,8 +1073,7 @@ function! s:OnHostResolvedIP()
   call add(cmds, "echo 'Waiting for connection...'")
   call add(cmds, "ssh_wait " .. g:HOST)
 
-  botr split
-  enew
+  call init#SmartSplit('botr')
   let id = init#OnTermExit(join(cmds, ";"), expand("<SID>") .. "OnHostChange")
   call init#TermHide(id)
 endfunction
@@ -1243,8 +1241,7 @@ function! s:DropClients()
 endfunction
 
 function! s:UpdateDocker()
-  sp
-  enew
+  call init#SmartSplit()
   lcd ~/aidocker
   let cmd = printf("sudo docker-compose -f %s build ubuntu22", g:DOCKER_COMPOSE)
   call init#Termopen(cmd, #{lock_mode: v:true})
@@ -1257,8 +1254,7 @@ function! s:RunDocker(...)
   let args = copy(a:000)
   let Cb = !empty(args) && type(args[-1]) == v:t_func ? remove(args, -1) : v:null
   let cmd = join(args)
-  sp
-  enew
+  call init#SmartSplit()
   lcd ~/aidocker
   let cmds = ["sudo", "docker-compose", "-f", g:DOCKER_COMPOSE, "run", "--rm", "ubuntu22"]
 
@@ -1341,8 +1337,7 @@ function! s:InstallSdk(...)
   let most_recent_timestamp = getftime(most_recent_file)
   let ago = init#PrettyTime(localtime() - most_recent_timestamp)
 
-  split
-  enew
+  call init#SmartSplit()
   let cmds = []
   call add(cmds, printf("echo 'Found sdk from %s ago'", ago))
   call add(cmds, "rm -rf " .. g:SDK_DIR .. "/*")
@@ -1402,8 +1397,7 @@ function! s:InstallImage(...)
   call add(cmds, printf("echo 'Found image from %s ago'", ago))
   call add(cmds, printf("rsync -tL --progress %s %s:%s/image.mender", most_recent_image, g:HOST, g:RSYNC_DIR))
   call add(cmds, printf("ssh %s 'mender install /%s/image.mender'", g:HOST, g:RSYNC_DIR))
-  split
-  enew
+  call init#SmartSplit()
   " Locked: a stray :q mid-flash would otherwise lose sight of mender.
   call init#TermLock(init#OnTermSuccess(join(cmds, " && "),
         \ expand("<SID>") .. "OnImageInstalled"))
@@ -1490,8 +1484,7 @@ function! s:FakeSdk()
   call add(cmds, printf("rsync -Ltv %s %s/sysroots/armv8a-aisys-linux/usr/share/pkgconfig", pc, g:SDK_DIR))
   call add(cmds, printf("rsync -Ltv %s/%s* %s:/usr/lib", so_dir, so_name, g:HOST))
 
-  split
-  enew
+  call init#SmartSplit()
   call init#Termopen(join(cmds, ";"), #{lock_mode: v:true})
   startinsert
 endfunction
@@ -1564,9 +1557,8 @@ function! s:PlotTrace(name)
   call add(cmds, "source ~/tracing_venv/bin/activate")
   call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
   call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
-  botr split
+  call init#SmartSplit('botr')
   lcd ~/libalcatraz/tracing/scripts
-  enew
   throw string(cmds)
   " call init#Termopen(join(cmds, " && "))
 endfunction
@@ -1606,9 +1598,8 @@ function! s:BarfPlotTrace(name)
   call add(cmds, "source ~/tracing_venv/bin/activate")
   call add(cmds, printf("python3 parse.py -i %s -o %s", parse_input, parse_output))
   call add(cmds, printf("python3 plot_benchmark.py %s %s", plot_output, plot_input))
-  botr split
+  call init#SmartSplit('botr')
   lcd ~/libalcatraz/tracing/scripts
-  enew
   call init#Termopen(join(cmds, " && "))
 endfunction
 
@@ -1625,8 +1616,7 @@ function! s:OpenCV()
   call add(cmds, printf("cp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s/sysroots/armv8a-aisys-linux/usr/lib", g:BUILD_TYPE, g:SDK_DIR))
   call add(cmds, printf("scp ~/libalcatraz/%s/memory/libalcatraz_opencv_mat.so* %s:/usr/lib", g:BUILD_TYPE, g:HOST))
   call add(cmds, printf("ssh %s chmod +s /usr/lib/libalcatraz_opencv_mat.so*", g:HOST))
-  bot sp
-  enew
+  call init#SmartSplit('bot')
   call init#Termopen(join(cmds, ";"))
 endfunction
 
@@ -1739,8 +1729,7 @@ function! s:AddRepo(repo)
 endfunction
 
 function! s:FactoryReset()
-  botr split
-  enew
+  call init#SmartSplit('botr')
   call init#Termopen("ssh " .. g:HOST .. " touch /run/factory-reset/initiate-reset")
 endfunction
 
