@@ -1758,6 +1758,7 @@ function! s:Enroll()
 endfunction
 
 function! s:Reboot()
+  call s:SyncRemoteHistory()
   call init#OnJobExit(printf("ssh %s reboot", g:HOST), expand("<SID>") .. "OnReboot")
 endfunction
 
