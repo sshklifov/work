@@ -894,6 +894,22 @@ function! s:OnFixedHost()
   call s:EnsureMenderCommit()
   let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
   call s:EnsureMaster()
+  call s:EnsurePort()
+endfunction
+
+function! s:EnsurePort()
+  if empty(g:HOST_IP)
+    return
+  endif
+  call init#OnPortCheck(g:HOST_IP, 8555, function('s:OnOverlayPort'))
+endfunction
+
+function! s:OnOverlayPort(port, open)
+  if a:open
+    return
+  endif
+  let cmd = printf("firewall-cmd --permanent --zone=devel --add-port=%d/tcp && firewall-cmd --reload", a:port)
+  call init#Jobstart(["ssh", g:HOST, cmd])
 endfunction
 
 function! s:OnDeviceMounts(mnt)
