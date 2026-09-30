@@ -38,6 +38,7 @@ autocmd FileType gitcommit call s:OnNewCommit()
 " the current buffer's.
 function! work#GetMakeCommand(...)
   let dir = get(a:000, 0, FugitiveWorkTree())
+  let target = get(a:000, 1, '')
   let repo = fnamemodify(git#SourceRepo(dir), ':t')
   if empty(repo)
     call init#Warn("Not inside a git tracked repo!")
@@ -96,6 +97,9 @@ function! work#GetMakeCommand(...)
   endif
 
   let build = printf("cmake --build %s -j 10", g:BUILD_TYPE)
+  if !empty(target)
+    let build .= " --target " . target
+  endif
 
   let build_dir = printf("%s/%s", dir, g:BUILD_TYPE)
   if !isdirectory(build_dir)
@@ -636,7 +640,10 @@ function work#SyncOne(bang, dir, exe)
   if !empty(flags)
     let cmd = printf("%s %s", cmd, flags)
   endif
-  call s:RemoteSyncExes(a:dir, [a:exe], function("init#ToClipboard", [cmd]))
+  " libfoo.so is built by target foo
+  let target = substitute(fnamemodify(a:exe, ':t'), '^lib\(.*\)\.so$', '\1', '')
+  let Sync = { -> s:RemoteSyncExes(a:dir, [a:exe], function("init#ToClipboard", [cmd]))}
+  call qutil#Make(work#GetMakeCommand(fnamemodify(a:dir, ':p:h:h'), target), #{on_success: Sync})
 endfunction
 
 command! -bang -nargs=? -complete=customlist,SyncCompl Sync
