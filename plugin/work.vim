@@ -990,6 +990,7 @@ function! s:SimulateHost(simulated_sdk)
     return
   endif
   if !work#IsHostSimulated()
+    call s:StopServiceMonitor()
     let g:HOST .= ".invalid"
     let g:HOST_IP = g:HOST
     let g:HOST_CONTROL .= ".invalid"
@@ -1086,6 +1087,7 @@ function! s:ChangeHost(host)
       call s:DetermineConfig(g:HOST, function('s:OnHostResolvedIP'))
     endif
   else
+    call s:StopServiceMonitor()
     call s:DetermineConfig(a:host, function('s:OnHostResolvedIP'))
   endif
 endfunction
@@ -2022,6 +2024,7 @@ function! s:StopServiceMonitor()
     endif
     unlet s:services_job
   endif
+  unlet! s:services_status
 endfunction
 
 function! s:StartServiceMonitor(initial_activity)
