@@ -1111,11 +1111,14 @@ function! s:ScanDevices(machine, host)
     return init#Warn("No current host to rewrite")
   endif
 
-  let machine = empty(a:machine) ? g:DEVICE : a:machine
-  echo printf("Scanning for %s...", machine)
+  " No machine lists every device on the subnet.
+  echo empty(a:machine) ? "Scanning for devices..." : printf("Scanning for %s...", a:machine)
   let opts = #{stdout: 1, stderr: 1, exit_code: 1}
-  let scan_exe = expand("~/.local/bin/ssh-scan")
-  call init#OnJobResult([scan_exe, "--script", machine], opts,
+  let cmd = [expand("~/.local/bin/ssh-scan"), "--script"]
+  if !empty(a:machine)
+    call add(cmd, a:machine)
+  endif
+  call init#OnJobResult(cmd, opts,
         \ expand("<SID>") .. 'OnScanResult', a:host)
 endfunction
 
