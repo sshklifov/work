@@ -340,7 +340,6 @@ function! work#OnBootColoredLog(bufnr, hl, output)
 endfunction
 
 command! -nargs=* -bang -complete=customlist,JournalCompl Boot call s:ChooseBootLogs("<bang>", <f-args>)
-command! -nargs=* -bang -complete=customlist,JournalCompl Uptime call s:ChooseBootLogs("<bang>", <f-args>)
 
 function! s:HistoryDir()
   let dir = stdpath('state') .. "/history"
@@ -736,6 +735,8 @@ function! s:GetSystemdTargets()
 endfunction
 
 command! -nargs=? -complete=customlist,SystemdCompl Systemd
+      \ call s:GetSystemdTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Systemd', function('s:RunAsService'))
+command! -nargs=? -complete=customlist,SystemdCompl Journal
       \ call s:GetSystemdTargets()->qutil#CommandPass(<q-args>)->qutil#CreateOneShotQuickfix('Systemd', function('s:RunAsService'))
 cabbr Sysd Systemd
 
