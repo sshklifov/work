@@ -3868,8 +3868,9 @@ command! -nargs=? Issues call s:RequestIssues(<q-args>)
 " }}}
 
 function! s:OnVimEnter()
-  " Install commands for the first time
-  call s:OnHostChange()
+  " Install commands for the first time. g:HOST_IP comes back from shada and may
+  " be stale, so resolve the host again first.
+  call s:DetermineConfig(g:HOST, function('s:OnHostChange'))
   let s:builds_timer = timer_start(g:builds_poll_secs * 1000,
         \ function("s:PollBuilds"), #{repeat: -1})
   call s:PollBuilds()
