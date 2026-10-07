@@ -1764,13 +1764,11 @@ endfunction
 
 function! s:Enroll()
   let cmds = []
-  call add(cmds, 'redis-cli SET config:device.role "\"one-fa\""' )
-  call add(cmds, 'redis-cli SET config:enrollment.enabled true' )
-  call add(cmds, 'redis-cli SET config:enrollment.min_time 5' )
-  call add(cmds, 'redis-cli SET config:enrollment.respect_acs false' )
+  call add(cmds, 'redis-cli -s /run/redis/redis.sock SET config:device.role "\"enrollment\""' )
+  call add(cmds, 'redis-cli -s /run/redis/redis.sock SET config:enrollment.respect_acs false' )
   call systemlist(["ssh", g:HOST, join(cmds, ";")])
   if !v:shell_error
-    call s:SshTerminal()
+    call init#SshTerminal()
     echo "Please run mcu-inject-badge!"
   endif
 endfunction
