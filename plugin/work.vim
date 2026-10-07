@@ -1789,18 +1789,33 @@ command -nargs=* -complete=customlist,DoCompl Do call init#Dispatch("Do", expand
 
 """"""""""""""""""""""""""""AI"""""""""""""""""""""""""" {{{
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+function! s:GetBitbakeVar(lines, var)
+  let value = matchstr(join(a:lines, "\n"), '\%(^\|\n\)' .. a:var .. '\s*?\?=\s*"\zs[^"]\+')
+  if empty(value)
+    throw printf("No %s in the staged recipe!", a:var)
+  endif
+  return value
+endfunction
+
 function! work#CommitAI()
   exe "e " .. g:AIDISTRO
   let cmd = ["diff", "--name-only", "--cached"]
   let staged = git#ExecuteOrThrow(cmd, "Cannot determine what changed in " .. g:AIDISTRO)
-  for [repo, branch, bitbake] in reverse(s:GetTargets())
+  for [repo, _, bitbake] in reverse(s:GetTargets())
     let staged_bitbake = filter(copy(staged), 'stridx(v:val, bitbake) >= 0')
     if empty(staged_bitbake)
       continue
     endif
-    " Get commit message. This is needed to create the branch and the commit
+    " The staged recipe says which commit is being pulled in, and from which branch
     exe "e " .. g:AIDISTRO
-    let cmd = [FugitiveExtractGitDir(repo), "log", "-1", "--format=%B", "origin/" .. branch]
+    let cmd = ["show", ":" .. staged_bitbake[0]]
+    let recipe = git#ExecuteOrThrow(cmd, "Cannot read staged " .. staged_bitbake[0])
+    let srcbranch = s:GetBitbakeVar(recipe, "SRCBRANCH")
+    let srcrev = s:GetBitbakeVar(recipe, "SRCREV")
+    " Get commit message. This is needed to create the branch and the commit
+    let gitdir = FugitiveExtractGitDir(repo)
+    call git#ExecuteOrThrow([gitdir, "fetch", "origin", srcbranch], "Cannot fetch " .. srcbranch .. " in " .. repo)
+    let cmd = [gitdir, "log", "-1", "--format=%B", srcrev]
     let msg = git#ExecuteOrThrow(cmd, "Cannot determine commit message for " .. repo)[0]
     let issue = matchstr(msg, 'SW-[0-9]\{4\}')
     " Create branch
