@@ -3513,7 +3513,7 @@ function! s:RenderBuild(name, build)
         \ a:build.status, a:build.when), a:build.url, ""] + log
 endfunction
 
-command! -nargs=0 Builds call s:ShowBuilds()
+command! -nargs=0 -bang Builds if <bang>0 | call s:CopyBuildUrl() | else | call s:ShowBuilds() | endif
 
 " Your newest build in each job, as of the last poll. Nothing here remembers what
 " a build used to be doing: when it ended is jenkins' own answer, so every vim
@@ -3581,21 +3581,17 @@ endfunction
 
 " The link to the build the statusline is showing you: it says when the build is
 " green, this is how you grab it. A running build's page is just as fetchable, so
-" nothing here waits for anything. Bang for a build you are done with: the url is
-" all you wanted, so the statusline drops it and stops colouring at you.
-function! s:CopyBuildUrl(bang)
+" nothing here waits for anything. The url is all you wanted, so the statusline
+" drops the build and stops colouring at you.
+function! s:CopyBuildUrl()
   let build = s:NewestBuild()
   if empty(build)
     return init#Warn("Jenkins has no build of yours")
   endif
   call init#ToClipboard(build.url)
-  if !empty(a:bang)
-    let g:JENKINS_DISMISSED_BUILD = build.label
-    redrawstatus
-  endif
+  let g:JENKINS_DISMISSED_BUILD = build.label
+  redrawstatus
 endfunction
-
-command! -nargs=0 -bang B call s:CopyBuildUrl("<bang>")
 
 " How many of the newest builds we ask for, so a stretch of failures can't make
 " us page the whole job history.
