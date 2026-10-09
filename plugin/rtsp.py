@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """RTSP stream discovery for work.vim.
 
-Scans the noauth (8554) and authenticated (554) RTSP services on a device,
+Scans the noauth (8554) and authenticated (554) RTSP services on a device, plus
+badge-and-face's face overlay stream (8555, noauth),
 performs Digest auth for 554 (credentials fetched from redis over SSH), issues
 a DESCRIBE for each known stream and prints, per discovered stream, a line of
 
@@ -22,7 +23,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-PORTS = [8554, 554]  # 8554 = noauth, 554 = Digest auth
+PORTS = [8554, 554, 8555]  # 8554 = noauth, 554 = Digest auth, 8555 = face overlay
+
+# badge-and-face's own RTSP server (RtspFrameServer) serves a fixed set of
+# streams whatever the device, so its port is not scanned for STREAMS.
+PORT_STREAMS = {8555: ["overlay"]}
 
 # Never let a hung ssh block the scan; also prevents an interactive password
 # prompt from stalling forever.
@@ -242,7 +247,7 @@ def main():
 
     open_ports = [p for p in PORTS if probes[p].result()]
     if not open_ports:
-        die("Neither 8554 nor 554 port are open!")
+        die("None of ports %s are open!" % ", ".join(str(p) for p in PORTS))
     cred_fut = pool.submit(fetch_credentials, host) if 554 in open_ports else None
 
     try:
@@ -252,7 +257,9 @@ def main():
     streams = device_streams(device)
 
     scans = {
-        p: pool.submit(collect, args.ip, p, streams, lambda: cred_fut.result())
+        p: pool.submit(
+            collect, args.ip, p, PORT_STREAMS.get(p, streams), lambda: cred_fut.result()
+        )
         for p in open_ports
     }
 
