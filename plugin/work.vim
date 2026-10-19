@@ -1741,8 +1741,13 @@ function! s:AddRepo(repo)
   if empty(new_src_branch)
     throw "Failed to determine branch!"
   endif
-  let remote_rev = git#HashOrThrow("origin/" .. new_src_branch)
-  let new_src_rev = git#HashOrThrow(new_src_branch)
+  let remote_branch = "origin/" .. new_src_branch
+  let check = FugitiveExecute([FugitiveExtractGitDir(repo), "rev-parse", "--verify", "--quiet", remote_branch])
+  if check['exit_status'] != 0
+    throw "Branch not pushed: " .. remote_branch
+  endif
+  let remote_rev = git#HashOrThrow(remote_branch, repo)
+  let new_src_rev = git#HashOrThrow(new_src_branch, repo)
   if remote_rev != new_src_rev
     throw "Unpushed changes!"
   endif
