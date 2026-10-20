@@ -859,8 +859,7 @@ function! s:OnMasterRunning(code)
   endif
 
   call s:MonitorControlFile()
-  let cmd = "systemctl is-active " .. join(s:GetServices(), " ")
-  call init#OnJobOutput(["ssh", g:HOST, cmd], function('s:StartServiceMonitor'))
+  call s:StartServiceMonitor()
 endfunction
 
 function! s:AddBackdoor()
@@ -2049,25 +2048,11 @@ function! s:StopServiceMonitor()
   unlet! s:services_status
 endfunction
 
-function! s:StartServiceMonitor(initial_activity)
+function! s:StartServiceMonitor()
   call s:StopServiceMonitor()
-  " XXX: Potential race condition but it makes the code look nicer so it's okay.
-  let services = s:GetServices()
-  let activity = filter(a:initial_activity, '!empty(v:val)')
-  if len(activity) != len(services)
-    " Possible if device is down.
-    return init#Warn("Unknown state of some services!")
-  endif
-  let s:services_status = #{}
-  for idx in range(len(services))
-    let s:services_status[services[idx]] = activity[idx]
-  endfor
-
-  let cmd = [
-        \ "dbus-monitor",
-        \ "--system",
-        \ string("type='signal',interface='org.freedesktop.DBus.Properties',member='PropertiesChanged',arg0='org.freedesktop.systemd1.Unit'")]
-  let s:services_job = init#Jobstart(["ssh", g:HOST, join(cmd)], #{on_stdout: expand("<SID>") .. 'OnServicesChanged'})
+  let script = globpath(&runtimepath, 'plugin/services.py')
+  let cmd = ["python3", script, g:HOST] + s:GetServices()
+  let s:services_job = init#Jobstart(cmd, #{on_stdout: expand("<SID>") .. 'OnServicesChanged'})
 endfunction
 
 function! work#ServicesStatus()
@@ -2084,29 +2069,24 @@ function! work#ServicesStatus()
   let nr = init#CustomBottomBuffer('Services', lines)
 endfunction
 
+" Each line is "<unit>\t<ActiveState>"; the first one per unit is its initial state.
 function s:OnServicesChanged(_0, d, _1)
-  for idx in range(len(a:d))
-    let line = a:d[idx]
-    if stridx(line, "path=/org/freedesktop/systemd1/unit/") >= 0
-      let dbus_name = matchstr(line, 'unit/\zs[^;]*')
-      let service_name = substitute(dbus_name, '_2d', '-', 'g')
-      let service_name = substitute(service_name, '_2e', '.', 'g')
-      let s:services_last = service_name
-    elseif stridx(line, 'string "ActiveState"') >= 0
-      let next_line = get(a:d, idx + 1, '')
-      let activity = matchstr(next_line, 'string "\zs[^"]\+\ze"')
-      if exists('s:services_last') && has_key(s:services_status, s:services_last)
-        let changed = s:services_status[s:services_last] != activity
-        if changed
-          let s:services_status[s:services_last] = activity
-          let nr = bufnr("Services")
-          if init#IsVisible(nr)
-            call s:UpdateServicesHl(nr)
-          else
-            call init#Warn("Service %s is %s!", s:services_last, activity)
-          endif
-        endif
-      endif
+  for line in a:d
+    let parts = split(line, "\t")
+    if len(parts) != 2
+      continue
+    endif
+    let [service, activity] = parts
+    if !exists('s:services_status')
+      let s:services_status = #{}
+    endif
+    let known = has_key(s:services_status, service)
+    let s:services_status[service] = activity
+    let nr = bufnr("Services")
+    if init#IsVisible(nr)
+      call s:UpdateServicesHl(nr)
+    elseif known
+      call init#Warn("Service %s is %s!", service, activity)
     endif
   endfor
 endfunction
