@@ -800,6 +800,7 @@ function! s:OnConfig(host, Cb, output)
   endif
 
   let g:HOST = a:host
+  call s:FlushShada()
   call a:Cb()
 endfunction
 
@@ -814,6 +815,13 @@ endfunction
 function! work#IsHostSimulated()
   const is_invalid = stridx(g:HOST, ".invalid") >= 0
   return is_invalid
+endfunction
+
+" Neither a simulated host nor another instance's newer globals get written
+function! s:FlushShada()
+  if !work#IsHostSimulated() && !init#IsShadaStale()
+    call init#FlushShada()
+  endif
 endfunction
 
 function! s:MonitorControlFile()
@@ -981,6 +989,7 @@ function! s:OnLibstdVersions(output)
   else
     let g:LIBSTD_CPP = versions[-1]
   endif
+  call s:FlushShada()
 endfunction
 
 " TODO: Kind of hacky and might need updating, but I think it's going to be worth it!
@@ -2717,6 +2726,7 @@ endfunction
 function work#OnFilesystem(entry)
   let [source, avail, target] = split(a:entry)
   let g:RSYNC_DIR = target
+  call s:FlushShada()
   if stridx(avail, "G") < 0
     call init#Warn("Have for %s g:RSYNC_DIR", avail)
   endif
