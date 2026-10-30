@@ -3797,7 +3797,13 @@ endfunction
 
 function! s:RequestIssues(filter)
   let clauses = [s:TouchedByMe()]
-  if empty(a:filter)
+  if a:filter =~? '^\(SW-\)\=\d\+$'
+    " A key names one issue, whoever it belongs to.
+    let clauses = [printf("key = SW-%s", matchstr(a:filter, '\d\+$'))]
+  elseif a:filter =~? '^\(epic\|bug\|story\|task\|sub-task\)$'
+    " A type is a look across the whole project, still only the open ones.
+    let clauses = [printf('issuetype = "%s"', a:filter), "statusCategory != Done"]
+  elseif empty(a:filter)
     " statusCategory covers Released, DONE, Duplicate and friends.
     let clauses += ["statusCategory != Done"]
   else
