@@ -691,6 +691,7 @@ function! s:GetApps()
   let apps = #{
         \ rtsp-server: #{user: "rtsp-server", services: ["rtsp-server.service", "rtsp-server-noauth.service", "rtsp-server.socket"]},
         \ badge_and_face: #{user: "badge_and_face", services: ["badge-and-face.service"]},
+        \ qrcode-scanner: #{user: "rock-bootstrap", services: ["qrcode-scanner.service"]}
         \ }
   if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
     let apps["bd-video"] = #{user: "rock-video", services: ["bd-video.service"]}
