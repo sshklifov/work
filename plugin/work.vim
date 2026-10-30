@@ -800,7 +800,6 @@ function! s:OnConfig(host, Cb, output)
   endif
 
   let g:HOST = a:host
-  call s:FlushShada()
   call a:Cb()
 endfunction
 
@@ -817,9 +816,9 @@ function! work#IsHostSimulated()
   return is_invalid
 endfunction
 
-" Neither a simulated host nor another instance's newer globals get written
+" A simulated host never gets written
 function! s:FlushShada()
-  if !work#IsHostSimulated() && !init#IsShadaStale()
+  if !work#IsHostSimulated()
     call init#FlushShada()
   endif
 endfunction
