@@ -36,7 +36,8 @@ SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=1"]
 STREAMS = {
     "onyx": ["ircamera", "mircamera", "depthcamera", "mdepthcamera", "rgbcamera", "mrgbcamera"],
     "rockx": ["adaptive_h264", "adaptive_mjpeg", "near-rtsp", "far-rtsp", "center-rtsp", "intercom"],
-    "bd-pre-evt-devkit": ["cam0"],
+    "bd-pre-evt-devkit": ["adaptive_mjpeg"],
+    "rock-mini-p10": ["adaptive_mjpeg"],
 }
 
 

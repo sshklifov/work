@@ -78,7 +78,7 @@ function! work#GetMakeCommand(...)
       let cmake .= " -DDEVICE=onyx -DPLATFORM=obsidian"
     elseif stridx(g:DEVICE, "rockx") >= 0
       let cmake .= " -DDEVICE=obsidian -DPLATFORM=obsidian"
-    elseif stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
+    elseif stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0 || stridx(g:DEVICE, "rock-mini-p10") >= 0
       let cmake .= " -DDEVICE=bd -DPLATFORM=bd"
     endif
   endif
@@ -693,7 +693,7 @@ function! s:GetApps()
         \ badge_and_face: #{user: "badge_and_face", services: ["badge-and-face.service"]},
         \ qrcode-scanner: #{user: "rock-bootstrap", services: ["qrcode-scanner.service"]}
         \ }
-  if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0
+  if stridx(g:DEVICE, "bd-pre-evt-devkit") >= 0 || stridx(g:DEVICE, "rock-mini-p10") >= 0
     let apps["bd-video"] = #{user: "rock-video", services: ["bd-video.service"]}
     return apps
   endif
@@ -953,6 +953,12 @@ function! s:OnSdkOutput(output)
     let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
     let g:DOCKER_CACHE = printf("/home/%s/aicache-bd", $USER)
     let g:AIDISTRO = expand("~/aidistro-bd")
+  elseif stridx(a:output[0], "rock-mini-p10") >=0 
+    let g:DEVICE = "rock-mini-p10"
+    let g:SDK_DIR = "/opt/aisys/rock-mini-p10"
+    let g:DOCKER_COMPOSE = "docker-compose.bd.yaml"
+    let g:DOCKER_CACHE = printf("/home/%s/aicache-bd", $USER)
+    let g:AIDISTRO = expand("~/aidistro-bd")
   elseif stridx(a:output[0], "rockx-dm-p15") >= 0
     let g:DEVICE = "rockx-dm-p15"
     let g:SDK_DIR = "/opt/aisys/obsidian_p15"
@@ -1016,7 +1022,7 @@ function! SimulateCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let options = ["bd-pre-evt-devkit", "rockx-dm-p15", "rockx-dm-r10", "onyx-p1", "onyx-cr"]
+  let options = ["rock-mini-p10", "bd-pre-evt-devkit", "rockx-dm-p15", "rockx-dm-r10", "onyx-p1", "onyx-cr"]
   return filter(options, "stridx(v:val, a:ArgLead) >= 0")
 endfunction
 
@@ -1791,8 +1797,24 @@ function! s:Reboot()
   call init#OnJobExit(printf("ssh %s reboot", g:HOST), expand("<SID>") .. "OnReboot")
 endfunction
 
+" `ssh reboot` returns while the device is still up, wait for its ip to go down.
 function! s:OnReboot(code)
-  call s:DetermineConfig(g:HOST, function('s:OnHostResolvedIP'))
+  call s:PingUntilDown(30)
+endfunction
+
+function! s:PingUntilDown(attempts)
+  let cmd = ["ping", "-c1", "-W1", g:HOST_IP]
+  call init#OnJobExit(cmd, expand("<SID>") .. "OnRebootPing", a:attempts)
+endfunction
+
+function! s:OnRebootPing(attempts, code)
+  if a:code != 0
+    call s:DetermineConfig(g:HOST, function('s:OnHostResolvedIP'))
+  elseif a:attempts <= 1
+    call init#Warn("%s still up after reboot!", g:HOST_IP)
+  else
+    call init#Timerstart('1s', #{}, expand("<SID>") .. "PingUntilDown", a:attempts - 1)
+  endif
 endfunction
 
 command! -nargs=0 Reboot call s:Reboot()
@@ -1920,7 +1942,7 @@ function! work#GenerateMergeRequestURL(repo)
   call init#ToClipboard(url)
 endfunction
 
-function! s:CopyJira()
+function! s:CopyDashboard()
   call init#ToClipboard("https://alcatrazai.atlassian.net/jira/your-work")
 endfunction
 
@@ -1961,7 +1983,7 @@ function CopyCompl(ArgLead, CmdLine, CursorPos)
   if a:CursorPos < len(a:CmdLine)
     return []
   endif
-  let cmds = ["Jira", "Jenkins", "Slack", "Branch", "Hash", "Filename", "Basename", "Directory", "Ip"]
+  let cmds = ["Dashboard", "Jenkins", "Slack", "Branch", "Hash", "Filename", "Basename", "Directory", "Ip"]
   return filter(cmds, 'v:val =~? a:ArgLead')
 endfunction
 
@@ -2727,7 +2749,7 @@ function work#OnFilesystem(entry)
   let g:RSYNC_DIR = target
   call s:FlushShada()
   if stridx(avail, "G") < 0
-    call init#Warn("Have for %s g:RSYNC_DIR", avail)
+    call init#Warn("Have %s available in %s", avail, g:RSYNC_DIR)
   endif
 endfunction
 
